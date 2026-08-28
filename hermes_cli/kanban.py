@@ -562,6 +562,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_claim.add_argument("task_id")
     p_claim.add_argument("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
                          help="Claim TTL in seconds (default: 900)")
+    p_claim.add_argument("--force", action="store_true",
+                         help="Claim even when the claim guard would defer "
+                              "(branch shared with another live card, scope overlap). "
+                              "Hard blocks (branch policy, protected paths) cannot be forced.")
 
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
@@ -757,10 +761,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         help="Don't actually spawn processes; just print what would happen")
     p_disp.add_argument("--max", type=int, default=None,
                         help="Cap number of spawns this pass")
-    p_disp.add_argument("--failure-limit", type=int,
-                        default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
+    p_disp.add_argument("--failure-limit", type=int, default=None,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
-                             f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
+                             f"(spawn_failed, timed_out, or crashed; default: kanban.failure_limit "
+                             f"from config, else {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
     p_disp.add_argument("--json", action="store_true")
 
     # --- daemon (deprecated) ---
@@ -2083,8 +2087,33 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
     return 0
 
 
+def _claim_guard_refusal(reason: Optional[str], *, force: bool) -> Optional[str]:
+    """Decide whether a claim-guard reason must stop an interactive claim.
+
+    Protects against a terminal pulling a card onto a branch or file scope
+    that another live worker already owns. Block reasons (branch policy,
+    protected paths) always refuse; defer reasons refuse unless ``--force``.
+    Returns the message to print, or ``None`` when the claim may proceed.
+    """
+    if not reason:
+        return None
+    block_reasons = set(getattr(kb, "CLAIM_GUARD_BLOCK_REASONS", ()) or ())
+    head = reason.split(":", 1)[0]
+    if reason in block_reasons or head in block_reasons:
+        return f"claim blocked by guard ({reason}); this cannot be forced"
+    if force:
+        return None
+    return f"claim deferred by guard ({reason}); re-run with --force to override"
+
+
 def _cmd_claim(args: argparse.Namespace) -> int:
+    force = bool(getattr(args, "force", False))
     with kb.connect_closing() as conn:
+        guard_reason = kb.check_claim_guard(conn, args.task_id)
+        refusal = _claim_guard_refusal(guard_reason, force=force)
+        if refusal:
+            print(f"cannot claim {args.task_id}: {refusal}", file=sys.stderr)
+            return 1
         task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
         if task is None:
             # Report why
@@ -2617,57 +2646,29 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
-    # Honour kanban.default_assignee as the fallback for unassigned ready
-    # tasks (#27145), kanban.max_in_progress as the global concurrency cap
-    # (#33488), kanban.max_in_progress_per_profile as the per-profile
-    # cap (#21582), and kanban.max_spawn as the per-tick spawn limit
-    # (#28805). Same semantics as the gateway dispatch path so behavior
-    # matches whether the user runs the CLI directly or relies on the
-    # gateway-embedded dispatcher.
+    # Every dispatch entry point (CLI, gateway tick, dashboard nudge) reads
+    # the same cap resolver so kanban.max_in_progress / max_spawn /
+    # max_in_progress_per_profile / default_assignee / failure_limit can
+    # never drift between paths (that drift is how an uncapped dashboard
+    # nudge once piled workers onto one host). Explicit CLI flags win over
+    # config because they are the more deliberate operator signal.
     try:
-        from hermes_cli.config import load_config
-        _cfg = load_config()
-        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
-        default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-
-        def _coerce_positive_int(value):
-            if value is None:
-                return None
-            try:
-                ival = int(value)
-            except (TypeError, ValueError):
-                return None
-            return ival if ival >= 1 else None
-
-        max_in_progress_per_profile = _coerce_positive_int(
-            _kanban_cfg.get("max_in_progress_per_profile")
-        )
-        max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
-        # Memory-derived default when unset (OOF-30/OOF-77) — same
-        # fallback the gateway-embedded dispatcher applies, so behaviour
-        # matches regardless of which path runs the tick.
-        max_in_progress = kb.resolve_max_in_progress(max_in_progress)
-        # CLI --max overrides config kanban.max_spawn when both are present;
-        # CLI is the more explicit signal so it wins.
-        cli_max = getattr(args, "max", None)
-        max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
-            _kanban_cfg.get("max_spawn")
-        )
+        kw = dict(kb.dispatch_kwargs_from_config())
     except Exception:
-        default_assignee = None
-        max_in_progress_per_profile = None
-        max_in_progress = None
-        max_spawn = getattr(args, "max", None)
+        kw = {}
+    kw.pop("board", None)
+    cli_max = getattr(args, "max", None)
+    if cli_max is not None:
+        kw["max_spawn"] = cli_max
+    cli_failure_limit = getattr(args, "failure_limit", None)
+    if cli_failure_limit is not None:
+        kw["failure_limit"] = cli_failure_limit
+    kw.setdefault("failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT)
+    default_assignee = kw.get("default_assignee")
     with kb.connect_closing() as conn:
-        res = kb.dispatch_once(
-            conn,
-            dry_run=args.dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-        )
+        res = kb.dispatch_once(conn, dry_run=args.dry_run, **kw)
+    respawn_guarded = list(getattr(res, "respawn_guarded", []) or [])
+    claim_guarded = list(getattr(res, "claim_guarded", []) or [])
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
@@ -2687,6 +2688,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in respawn_guarded
+            ],
+            "claim_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in claim_guarded
+            ],
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2724,6 +2733,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    for tid, reason in respawn_guarded:
+        print(f"Deferred (respawn guard: {reason}): {tid}")
+    for tid, reason in claim_guarded:
+        print(f"Deferred (claim guard: {reason}): {tid}")
     return 0
 
 

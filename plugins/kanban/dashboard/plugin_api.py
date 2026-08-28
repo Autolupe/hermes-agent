@@ -2278,23 +2278,51 @@ def get_task_log(
 # Dispatch nudge (optional quick-path so the UI doesn't wait 60 s)
 # ---------------------------------------------------------------------------
 
+def _clamp_max_spawn(requested: Optional[int], configured: Optional[int]) -> Optional[int]:
+    """Never let a dashboard click spawn more than the configured cap.
+
+    Protects against the "nudge" button fanning out past
+    ``kanban.max_spawn``: the request may only lower the cap, never raise it.
+    """
+    if requested is not None and requested < 1:
+        requested = None
+    if requested is None:
+        return configured
+    if configured is None:
+        return requested
+    return min(requested, configured)
+
+
 @router.post("/dispatch")
 def dispatch(
     dry_run: bool = Query(False),
-    max_n: int = Query(8, alias="max"),
+    max_n: Optional[int] = Query(None, alias="max"),
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
+    # A real (non-dry) nudge must honour the shared-root pause sentinel the
+    # same way the CLI and gateway do; the UI must not be a pause bypass.
+    if not dry_run and kanban_db.dispatch_is_paused():
+        raise HTTPException(
+            status_code=409,
+            detail=f"dispatch paused: {kanban_db.dispatch_pause_path()}",
+        )
+    kw = dict(kanban_db.dispatch_kwargs_from_config(board=board))
+    kw.pop("board", None)
+    kw.pop("dry_run", None)
+    kw["max_spawn"] = _clamp_max_spawn(max_n, kw.get("max_spawn"))
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn, dry_run=dry_run, board=board, **kw,
         )
         # DispatchResult is a dataclass.
         try:
-            return asdict(result)
+            payload = asdict(result)
         except TypeError:
             return {"result": str(result)}
+        payload.setdefault("claim_guarded", list(getattr(result, "claim_guarded", []) or []))
+        return payload
     finally:
         conn.close()
 

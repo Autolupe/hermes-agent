@@ -144,3 +144,22 @@ def test_per_profile_isolation(tmp_path):
         b.close()
 
 
+
+
+def test_branch_name_for_uses_hermes_namespace(conn):
+    """Task branches must live under ``hermes/<slug>/<task-id>`` so the merge
+    gate and branch-ownership hooks can tell Hermes work apart from human
+    or OpenClaw branches (and two cards never share a bare ``<slug>/..``)."""
+    project_id = pdb.create_project(conn, name="Web App", folders=["/www/app"])
+    project = pdb.get_project(conn, project_id)
+
+    assert pdb.branch_name_for(project, "t_0123abcd") == f"hermes/{project.slug}/t_0123abcd"
+    assert (
+        pdb.branch_name_for(project, "t_0123abcd", title="Add Login!!")
+        == f"hermes/{project.slug}/t_0123abcd-add-login"
+    )
+    # Title slug is still capped at 40 chars and never ends in a dash.
+    long_title = "x" * 39 + " y" + "z" * 20
+    name = pdb.branch_name_for(project, "t_0123abcd", title=long_title)
+    suffix = name.split("t_0123abcd-", 1)[1]
+    assert len(suffix) <= 40 and not suffix.endswith("-")

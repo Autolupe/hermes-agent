@@ -45,8 +45,9 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
             "max_in_progress_per_profile": 2,
         }
     }
+    # The shared resolver reads the read-only loader, so patch that one.
     monkeypatch.setattr(
-        "hermes_cli.config.load_config", lambda: fake_config
+        "hermes_cli.config.load_config_readonly", lambda: fake_config
     )
 
     captured = {}
@@ -78,7 +79,7 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     from hermes_cli import kanban_db
 
     fake_config = {"kanban": {"max_spawn": 10}}
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: fake_config)
 
     captured = {}
     monkeypatch.setattr(
@@ -94,3 +95,54 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     )
 
 
+
+
+def _install_cap_resolver(monkeypatch, kanban_db, caps):
+    """Point the CLI at a known cap set so the merge-with-flags contract
+    can be asserted independently of the on-disk config."""
+    monkeypatch.setattr(
+        kanban_db, "dispatch_kwargs_from_config",
+        lambda board=None: dict(caps),
+    )
+
+
+def test_cli_dispatch_uses_shared_cap_resolver(isolated_kanban_home, monkeypatch, capsys):
+    """The CLI reads caps through kanban_db.dispatch_kwargs_from_config and
+    surfaces respawn/claim guard deferrals so operators can see them."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    _install_cap_resolver(monkeypatch, kanban_db, {
+        "max_spawn": 5, "max_in_progress": 3, "failure_limit": 7,
+        "default_assignee": "planner", "max_in_progress_per_profile": 2,
+    })
+    captured = {}
+
+    def fake_dispatch_once(conn, **kwargs):
+        captured.update(kwargs)
+        res = kanban_db.DispatchResult()
+        res.respawn_guarded = [("t_aaaaaaaa", "cooldown")]
+        res.claim_guarded = [("t_bbbbbbbb", "branch_conflict:t_cccccccc")]
+        return res
+
+    monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
+
+    args = argparse.Namespace(dry_run=True, max=None, failure_limit=None, json=True)
+    assert kb_cli._cmd_dispatch(args) == 0
+    assert captured["max_spawn"] == 5
+    assert captured["max_in_progress"] == 3
+    assert captured["failure_limit"] == 7, "config failure_limit wins when the flag is absent"
+    assert captured["default_assignee"] == "planner"
+    assert captured["max_in_progress_per_profile"] == 2
+    import json as _json
+    out = _json.loads(capsys.readouterr().out)
+    assert out["claim_guarded"] == [{"task_id": "t_bbbbbbbb", "reason": "branch_conflict:t_cccccccc"}]
+    assert out["respawn_guarded"] == [{"task_id": "t_aaaaaaaa", "reason": "cooldown"}]
+
+    args = argparse.Namespace(dry_run=True, max=1, failure_limit=2, json=False)
+    assert kb_cli._cmd_dispatch(args) == 0
+    assert captured["max_spawn"] == 1, "explicit --max wins over config"
+    assert captured["failure_limit"] == 2, "explicit --failure-limit wins over config"
+    text = capsys.readouterr().out
+    assert "Deferred (claim guard: branch_conflict:t_cccccccc): t_bbbbbbbb" in text
+    assert "Deferred (respawn guard: cooldown): t_aaaaaaaa" in text

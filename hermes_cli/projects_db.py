@@ -807,14 +807,21 @@ def project_for_path(
 _BRANCH_SAFE_RE = re.compile(r"[^a-z0-9._-]+")
 
 
+#: Namespace every Hermes-created task branch lives under (``hermes/<slug>/<id>``).
+BRANCH_PREFIX = "hermes/"
+
+
 def branch_name_for(project: Project, task_id: str, *, title: str = "") -> str:
     """Deterministic branch name for a project-linked kanban task.
 
-    Shape: ``<project-slug>/<task-id>`` (optionally ``-<title-slug>``). Stable
-    and human-meaningful, replacing the random ``wt/<task-id>`` fallback.
+    Shape: ``hermes/<project-slug>/<task-id>`` (optionally ``-<title-slug>``).
+    Stable and human-meaningful, replacing the random ``wt/<task-id>``
+    fallback. The ``hermes/`` prefix is what the repo's merge gate and the
+    branch-ownership hooks key on, so a Hermes card can never land on a
+    branch that looks like (or collides with) a human or OpenClaw branch.
     """
     slug = project.slug or _slugify(project.name)
-    base = f"{slug}/{task_id}"
+    base = f"{BRANCH_PREFIX}{slug}/{task_id}"
     if title:
         tslug = _BRANCH_SAFE_RE.sub("-", str(title).strip().lower()).strip("-")
         tslug = tslug[:40].strip("-")
