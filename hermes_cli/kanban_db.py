@@ -139,6 +139,31 @@ class DispatchPausedError(RuntimeError):
     """Raised when a manual pause closes the final worker-spawn edge."""
 
 
+class WorkspaceBusyError(RuntimeError):
+    """Raised when a task's worktree is locked by another live process.
+
+    Protects against two workers writing one checkout: the dispatcher
+    treats this as "defer, try next tick", never as a task failure.
+    """
+
+    def __init__(self, pid: int, path: str, reason: str = ""):
+        self.pid = int(pid)
+        self.path = str(path)
+        self.reason = str(reason or "")
+        if self.pid > 0:
+            super().__init__(f"worktree {path} is locked by live hermes pid={pid}")
+        else:
+            super().__init__(
+                f"worktree {path} is locked by another tool ({self.reason or 'no reason'})"
+            )
+
+
+# Reasons from ``check_claim_guard`` that auto-block the card instead of
+# deferring it: the card itself is wrong (bad branch, protected files), so
+# waiting a tick will never help.
+CLAIM_GUARD_BLOCK_REASONS = frozenset({"branch_policy", "protected_path"})
+
+
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
 
@@ -345,6 +370,7 @@ def _fire_dispatch_tick_hook(
             result.rate_limited,
             result.auto_assigned_default,
             result.respawn_guarded,
+            result.claim_guarded,
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
@@ -5111,6 +5137,8 @@ def release_stale_claims(
                 run_id=run_id,
             )
             reclaimed += 1
+        # The reclaimed worker is gone (or never local): drop a dead lock.
+        _unlock_task_worktree(conn, row["id"])
         # Worker-lifecycle observer (RFC #58548): the reclaim txn above has
         # committed. The ``continue`` branches (rowcount mismatch, claim
         # extension, deferred reclaim) never reach this point, so only a
@@ -5200,6 +5228,9 @@ def reclaim_task(
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
     # so it runs after the enclosing one commits.)
     _clear_failure_counter(conn, task_id)
+    # Release the worktree lock only if the worker really died; a survivor
+    # keeps its lock so the retry defers as ``workspace_busy``.
+    _unlock_task_worktree(conn, task_id)
     return True
 
 
@@ -5449,6 +5480,10 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    # Captured before the txn clears it: the completing worker owns the
+    # worktree lock that ``_cleanup_workspace`` must release first.
+    # A still-running foreign worker keeps its lock (see _releasable_worker_pid).
+    _prior_pid = _releasable_worker_pid(conn, task_id)
     with write_txn(conn):
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
@@ -5598,7 +5633,9 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
-    # Clean up the scratch workspace and any stale tmux session for the worker.
+    # Release the finished worker's worktree lock, then clean up the
+    # scratch workspace and any stale tmux session for the worker.
+    _unlock_task_worktree(conn, task_id, _prior_pid)
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
@@ -5940,8 +5977,10 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         if kind == "worktree":
             # Kill the (dead) tmux worker session BEFORE removing the
             # worktree so a lingering worker never has its cwd deleted out
-            # from under it. Both steps stay best-effort.
+            # from under it. Both steps stay best-effort. A dead-pid lock
+            # is dropped here too — git refuses to remove a locked tree.
             _cleanup_worker_tmux(conn, task_id)
+            _unlock_task_worktree(conn, task_id)
             _cleanup_worktree_workspace(task_id, path, row["branch_name"])
             _try_cleanup_parent_workspaces(conn, task_id)
             return
@@ -6304,6 +6343,10 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+    # Captured before the txn clears it: the blocking worker (usually the
+    # caller itself) owns the worktree lock we release after the transition.
+    # A still-running foreign worker keeps its lock (see _releasable_worker_pid).
+    _prior_pid = _releasable_worker_pid(conn, task_id)
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -6481,6 +6524,7 @@ def block_task(
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
+    _unlock_task_worktree(conn, task_id, _prior_pid)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,
@@ -7424,6 +7468,11 @@ def decompose_triage_task(
             child_ws_kind = child.get("workspace_kind") or root_ws_kind
             if child.get("workspace_path"):
                 child_ws_path = child.get("workspace_path")
+            elif root_ws_kind not in ("dir", "worktree"):
+                # Scratch roots never hand their dir to children: every
+                # child gets its own scratch dir at dispatch, so ~30
+                # siblings can't pile into one shared directory.
+                child_ws_path = None
             elif child_ws_kind == "worktree":
                 # Never share one worktree checkout between siblings: the
                 # root's literal path would put every child in the same
@@ -7731,21 +7780,320 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+_WORKTREE_LOCK_PID_RE = re.compile(r"hermes pid=(\d+)(?: start=(\d+))?")
+
+
+def _pid_start_time(pid: Optional[int]) -> Optional[int]:
+    """Return the kernel start time (clock ticks) of ``pid`` from ``/proc``.
+
+    Protects a worktree lock against pid recycling: a lock that records
+    ``pid=N start=S`` only counts as held while the live process N still
+    has start time S. Returns ``None`` where ``/proc`` is unavailable
+    (non-Linux, or the pid is gone), which callers treat as "unknown".
+    """
+    if not pid:
+        return None
+    try:
+        raw = Path(f"/proc/{int(pid)}/stat").read_text(encoding="utf-8", errors="replace")
+        # Field 2 (comm) may contain spaces; everything after the last ')'
+        # is positional. Field 22 (starttime) is index 19 after the comm.
+        tail = raw.rsplit(")", 1)[1].split()
+        return int(tail[19])
+    except Exception:
+        return None
+
+
+def _lock_holder_alive(pid: Optional[int], start: Optional[int]) -> bool:
+    """True when the process a worktree lock names is still the same one.
+
+    Protects against treating a recycled pid as a live worker: when the
+    lock recorded a start time and the live pid's start time differs, the
+    original holder is gone. Without a recorded (or readable) start time
+    this falls back to plain pid liveness.
+    """
+    if not pid or not _pid_alive(pid):
+        return False
+    if start is None:
+        return True
+    current = _pid_start_time(pid)
+    if current is None:
+        return True
+    return current == start
+
+
+def _worktree_lock_state(
+    repo_root: Path | str, worktree_path: Path | str,
+) -> Optional[tuple[Optional[int], Optional[int], str]]:
+    """Return ``(pid, start, reason)`` for a locked worktree, or ``None``.
+
+    Parses ``git worktree list --porcelain``. ``pid``/``start`` come from
+    a ``hermes pid=<n> [start=<s>]`` reason; a lock left by any other tool
+    (a plain ``git worktree lock``, a human, a Claude/Codex session) is
+    returned with ``pid=None`` so callers can refuse to enter it rather
+    than mistake it for "unlocked". An unreadable list returns ``None``.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        target = Path(worktree_path).expanduser().resolve(strict=False)
+    except Exception:
+        return None
+    current: Optional[Path] = None
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            try:
+                current = Path(line[len("worktree "):].strip()).resolve(strict=False)
+            except Exception:
+                current = None
+        elif line == "locked" or line.startswith("locked "):
+            if current != target:
+                continue
+            reason = line[len("locked"):].strip()
+            m = _WORKTREE_LOCK_PID_RE.search(reason)
+            if not m:
+                return (None, None, reason)
+            try:
+                pid = int(m.group(1))
+            except ValueError:
+                return (None, None, reason)
+            start = int(m.group(2)) if m.group(2) else None
+            return (pid, start, reason)
+    return None
+
+
+def _git_worktree_env() -> dict[str, str]:
+    """Env for ``git worktree add``: opts out of the primary's branch guard.
+
+    Protects a new task worktree from the repo's ``post-checkout`` hook,
+    which pins the primary checkout to ``main`` and — via a shared
+    ``core.hooksPath`` — used to fire inside freshly-added worktrees too.
+    """
+    return {**os.environ, "ALLOW_BRANCH_SWITCH": "1"}
+
+
+def _worktree_lock_pid(repo_root: Path | str, worktree_path: Path | str) -> Optional[int]:
+    """Return the hermes pid recorded in ``worktree_path``'s git lock, if any.
+
+    Thin wrapper over :func:`_worktree_lock_state`; an unlocked tree or a
+    lock that is not ``hermes pid=<n>`` returns ``None``.
+    """
+    state = _worktree_lock_state(repo_root, worktree_path)
+    return None if state is None else state[0]
+
+
+def _lock_worktree_for_pid(worktree_path: Path | str, pid: int) -> bool:
+    """Lock a worktree with ``hermes pid=<pid>`` so no second worker enters it.
+
+    Fail-soft: a lock that cannot be taken is logged, not raised — the
+    dispatcher already holds the card claim, and the next resolve will
+    re-check liveness anyway.
+    """
+    reason = f"hermes pid={int(pid)}"
+    start = _pid_start_time(pid)
+    if start is not None:
+        reason += f" start={start}"
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(worktree_path), "worktree", "lock",
+                "--reason", reason, str(worktree_path),
+            ],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        _log.debug("worktree lock failed for %s", worktree_path, exc_info=True)
+        return False
+    if result.returncode != 0:
+        _log.warning(
+            "worktree lock failed for %s (pid %s): %s",
+            worktree_path, pid, (result.stderr or result.stdout or "").strip(),
+        )
+        return False
+    return True
+
+
+def _unlock_worktree_if_ours(
+    repo_root: Path | str, worktree_path: Path | str, pid: Optional[int],
+) -> bool:
+    """Unlock a worktree only when the lock names ``pid`` or a dead pid.
+
+    Protects a live foreign worker from having its lock stolen: any lock
+    held by another running process is left alone, and a lock that is not
+    a ``hermes pid=`` lock (another tool or a human) is never touched.
+    Fail-soft on git errors.
+    """
+    state = _worktree_lock_state(repo_root, worktree_path)
+    if state is None:
+        return False
+    lock_pid, lock_start, _reason = state
+    if lock_pid is None:
+        return False
+    if not (pid is not None and lock_pid == int(pid)) and _lock_holder_alive(lock_pid, lock_start):
+        return False
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "unlock", str(worktree_path)],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        _log.debug("worktree unlock failed for %s", worktree_path, exc_info=True)
+        return False
+    if result.returncode != 0:
+        _log.warning(
+            "worktree unlock failed for %s: %s",
+            worktree_path, (result.stderr or result.stdout or "").strip(),
+        )
+        return False
+    return True
+
+
+def _unlock_task_worktree(
+    conn: sqlite3.Connection, task_id: str, pid: Optional[int] = None,
+) -> bool:
+    """Release the git lock on a task's worktree at any exit path.
+
+    Reads the row's workspace and delegates to ``_unlock_worktree_if_ours``
+    with the worker pid the caller knows (or ``None`` — then only a dead
+    lock holder is released). Never raises: the exit transition itself has
+    already committed and must not be undone by lock bookkeeping.
+    """
+    try:
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["workspace_kind"] != "worktree" or not row["workspace_path"]:
+            return False
+        path = Path(row["workspace_path"]).expanduser()
+        if not path.is_dir():
+            return False
+        return _unlock_worktree_if_ours(path, path, pid)
+    except Exception:
+        _log.debug("worktree unlock skipped for %s", task_id, exc_info=True)
+        return False
+
+
+def _assert_worktree_not_busy(repo_root: Path | str, worktree_path: Path | str) -> None:
+    """Refuse an existing worktree that a live hermes process still holds.
+
+    Protects against two workers sharing one checkout (the 867/869
+    incident): a live foreign pid raises ``WorkspaceBusyError``; a lock
+    held by something that is not a hermes worker (plain ``git worktree
+    lock``, a human, another tool) is busy too — only hermes locks with a
+    dead (or recycled) pid are released so the tree can be reused.
+    """
+    state = _worktree_lock_state(repo_root, worktree_path)
+    if state is None:
+        return
+    lock_pid, lock_start, reason = state
+    if lock_pid is None:
+        raise WorkspaceBusyError(0, str(worktree_path), reason=reason)
+    if lock_pid == os.getpid():
+        return
+    if _lock_holder_alive(lock_pid, lock_start):
+        raise WorkspaceBusyError(lock_pid, str(worktree_path), reason=reason)
+    _unlock_worktree_if_ours(repo_root, worktree_path, lock_pid)
+
+
+# repo root -> monotonic time of the last ``git fetch origin main`` attempt.
+_ORIGIN_MAIN_FETCHED_AT: dict[str, float] = {}
+_ORIGIN_MAIN_FETCH_INTERVAL_SECONDS = 60.0
+_ORIGIN_MAIN_FETCH_TIMEOUT_SECONDS = 15
+
+
+def _fetch_origin_main(repo_root: Path) -> None:
+    """Best-effort ``git fetch origin main``, at most once a minute per repo.
+
+    Protects the dispatch tick (which runs under the board lock) from
+    stalling on the network: no terminal prompt for credentials, a short
+    timeout, and one fetch per repo per interval instead of one per new
+    worktree. Any failure is logged and ignored — the caller falls back to
+    the local ``origin/main`` ref.
+    """
+    key = str(repo_root)
+    now = time.monotonic()
+    last = _ORIGIN_MAIN_FETCHED_AT.get(key)
+    if last is not None and now - last < _ORIGIN_MAIN_FETCH_INTERVAL_SECONDS:
+        return
+    _ORIGIN_MAIN_FETCHED_AT[key] = now
+    try:
+        subprocess.run(
+            ["git", "-C", key, "fetch", "origin", "main"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=_ORIGIN_MAIN_FETCH_TIMEOUT_SECONDS,
+            check=False,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except Exception:
+        _log.debug("git fetch origin main failed in %s", repo_root, exc_info=True)
+
+
+def _worktree_base_ref(repo_root: Path) -> tuple[str, bool]:
+    """Pick the start point for a new task branch: ``origin/main`` or ``HEAD``.
+
+    Protects new task branches from being cut from whatever branch the
+    primary checkout happens to be on. Fetches ``origin main`` best-effort
+    (no token → fail-soft), then verifies the local ``origin/main`` ref.
+    Returns ``(ref, fell_back)``.
+    """
+    _fetch_origin_main(repo_root)
+    try:
+        verify = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
+             "refs/remotes/origin/main"],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return "HEAD", True
+    if verify.returncode == 0 and (verify.stdout or "").strip():
+        return "origin/main", False
+    return "HEAD", True
+
+
+def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> bool:
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    Returns True when a NEW branch had to be based on ``HEAD`` because no
+    ``origin/main`` ref was available (the caller records that as a
+    ``worktree_base_fallback`` event). Raises ``WorkspaceBusyError`` when
+    the tree already exists and a live hermes process holds its lock.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
-            return
+            _assert_worktree_not_busy(repo_root, target)
+            return False
     target.parent.mkdir(parents=True, exist_ok=True)
+    fell_back = False
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
+        base_ref, fell_back = _worktree_base_ref(repo_root)
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), base_ref,
         ]
     result = subprocess.run(
         cmd,
@@ -7753,16 +8101,34 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         text=True, encoding='utf-8', errors='replace',
         timeout=60,
         check=False,
+        env=_git_worktree_env(),
     )
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    return fell_back
+
+
+def _note_worktree_base_fallback(
+    conn: Optional[sqlite3.Connection], task_id: str, branch_name: str,
+) -> None:
+    """Record that a task branch was cut from HEAD, not origin/main."""
+    if conn is None:
+        return
+    try:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "worktree_base_fallback",
+                {"branch": branch_name, "base": "HEAD"},
+            )
+    except Exception:
+        _log.debug("could not record worktree_base_fallback for %s", task_id, exc_info=True)
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None
+    task: Task, *, board: Optional[str] = None, conn: Optional[sqlite3.Connection] = None,
 ) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``.
 
@@ -7774,7 +8140,7 @@ def _resolve_worktree_workspace(
     launched from, e.g. the Hermes checkout). If no anchor is configured
     anywhere, we fail loudly rather than guess.
     """
-    branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    branch_name = (task.branch_name or "").strip() or default_task_branch_name(task.id, board=board)
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -7801,7 +8167,8 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        if _ensure_git_worktree(repo_root, target, branch_name):
+            _note_worktree_base_fallback(conn, task.id, branch_name)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -7815,6 +8182,8 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            # Another live hermes process may still own this checkout.
+            _assert_worktree_not_busy(requested, requested)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -7827,17 +8196,20 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                if _ensure_git_worktree(fallback_root, fallback, branch_name):
+                    _note_worktree_base_fallback(conn, task.id, branch_name)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
         # than failing dispatch.
+        _assert_worktree_not_busy(requested, requested)
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        if _ensure_git_worktree(repo_root, target, branch_name):
+            _note_worktree_base_fallback(conn, task.id, branch_name)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -7846,7 +8218,8 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    if _ensure_git_worktree(repo_root, requested, branch_name):
+        _note_worktree_base_fallback(conn, task.id, branch_name)
     return requested, branch_name
 
 
@@ -8085,6 +8458,13 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    claim_guarded: list[tuple[str, str]] = field(default_factory=list)
+    """Tasks deferred by the claim guard, as ``(task_id, reason)`` pairs.
+
+    Reasons: ``"branch_conflict:<id>"`` (another live card holds the same
+    branch), ``"scope_overlap:<id>:<path>"`` (declared scope-paths intersect
+    a running card), ``"workspace_busy:<pid>"`` (the worktree is locked by
+    a live process). None of these count as a failure."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -8511,6 +8891,30 @@ def enforce_max_runtime(
                     killed = True
                 except (ProcessLookupError, OSError):
                     pass
+                # SIGKILL is not instant (zombie until reaped, D-state
+                # under I/O). Poll up to ~5 s before trusting it.
+                for _ in range(10):
+                    if not _pid_alive(pid):
+                        break
+                    time.sleep(0.5)
+        # Kill the tmux pane BEFORE flipping the row so a respawn can never
+        # run beside a still-attached predecessor in the same checkout.
+        _cleanup_worker_tmux(conn, tid)
+        if _pid_alive(pid):
+            # The worker outlived SIGKILL. Leave the row ``running`` so the
+            # slot stays occupied and retry next tick (never release a
+            # claim while its worker is alive — that spawns a duplicate).
+            with write_txn(conn):
+                _append_event(
+                    conn, tid, "kill_pending",
+                    {
+                        "pid": pid,
+                        "elapsed_seconds": int(elapsed),
+                        "limit_seconds": int(row["max_runtime_seconds"]),
+                        "sigkill": killed,
+                    },
+                )
+            continue
 
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
@@ -8546,6 +8950,9 @@ def enforce_max_runtime(
         # emits a ``gave_up`` event on top of the ``timed_out`` we
         # already emitted.
         if cur.rowcount == 1:
+            # The worker is confirmed dead: release its worktree lock so
+            # the retry (or a cleanup) can enter the checkout.
+            _unlock_task_worktree(conn, tid, pid)
             _record_task_failure(
                 conn, tid,
                 error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
@@ -9062,6 +9469,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text)
                     )
+    # Dead workers hold no worktree: release each reclaimed card's lock so
+    # the retry can enter the checkout (dead-pid locks only — never a live one).
+    for _tid in (*crashed, *rate_limited):
+        _unlock_task_worktree(conn, _tid)
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
     # on top of the event we already emitted).
@@ -9230,11 +9641,15 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, "
+            "       workspace_kind, workspace_path, branch_name "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
+        _ws_kind, _ws_path, _ws_branch = (
+            row["workspace_kind"], row["workspace_path"], row["branch_name"],
+        )
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -9343,6 +9758,17 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+    if blocked:
+        # The card is parked for a human: reap the worker's leftovers so a
+        # gave-up task never keeps a tmux pane, a lock, or a clean worktree
+        # around. The worktree predicates still preserve dirty/unpushed work.
+        try:
+            _cleanup_worker_tmux(conn, task_id)
+            _unlock_task_worktree(conn, task_id)
+            if _ws_kind == "worktree" and _ws_path:
+                _cleanup_worktree_workspace(task_id, _ws_path, _ws_branch)
+        except Exception:
+            _log.debug("post-trip cleanup failed for %s", task_id, exc_info=True)
     return blocked
 
 
@@ -9364,8 +9790,40 @@ def _record_spawn_failure(
     )
 
 
-def _release_paused_claim(conn: sqlite3.Connection, task_id: str) -> None:
-    """Return a claimed task to its source lane without counting a failure."""
+_BRANCH_SLUG_RE = re.compile(r"[^a-z0-9-]+")
+
+
+def default_task_branch_name(task_id: str, *, board: Optional[str] = None) -> str:
+    """Branch a worktree card gets when it was created without ``--branch``.
+
+    Shape: ``hermes/<board-slug>/<task-id>`` — the same namespace
+    ``projects_db.branch_name_for`` uses for project-linked cards, so it
+    satisfies the ``kanban.branch_pattern`` this host enforces. Protects
+    plain ``hermes kanban add --workspace worktree`` cards from being
+    auto-blocked as a branch-policy violation (the old ``wt/<id>`` fallback
+    never matched) while keeping one unique branch per card.
+    """
+    try:
+        slug = board if board else get_current_board()
+    except Exception:
+        slug = ""
+    slug = _BRANCH_SLUG_RE.sub("-", str(slug or "").strip().lower()).strip("-") or "default"
+    return f"hermes/{slug}/{task_id}"
+
+
+def _release_paused_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    event_kind: str = "dispatch_paused",
+    summary: str = "dispatch paused before worker spawn",
+    payload_extra: Optional[dict] = None,
+) -> None:
+    """Return a claimed task to its source lane without counting a failure.
+
+    Shared by the pause edge and the busy-worktree edge: both are "not now",
+    never "this card is broken", so ``consecutive_failures`` stays untouched.
+    """
     now = int(time.time())
     with write_txn(conn):
         row = conn.execute(
@@ -9379,23 +9837,20 @@ def _release_paused_claim(conn: sqlite3.Connection, task_id: str) -> None:
         if run_id is not None:
             conn.execute(
                 "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
-                "summary = 'dispatch paused before worker spawn', ended_at = ?, "
+                "summary = ?, ended_at = ?, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND ended_at IS NULL",
-                (now, run_id),
+                (summary, now, run_id),
             )
         conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
             "worker_pid = NULL, current_run_id = NULL WHERE id = ? AND status = 'running'",
             (retry_status, task_id),
         )
-        _append_event(
-            conn,
-            task_id,
-            "dispatch_paused",
-            {"retry_status": retry_status, "failure_counted": False},
-            run_id=run_id,
-        )
+        payload = {"retry_status": retry_status, "failure_counted": False}
+        if payload_extra:
+            payload.update(payload_extra)
+        _append_event(conn, task_id, event_kind, payload, run_id=run_id)
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
@@ -9439,6 +9894,147 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 
 # Legacy alias for test-code and anything else that still imports it.
 _clear_spawn_failures = _clear_failure_counter
+
+
+def _task_worker_pid(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Read a task's recorded worker pid, or None. Never raises."""
+    try:
+        row = conn.execute(
+            "SELECT worker_pid FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+    except Exception:
+        return None
+    if not row or row["worker_pid"] is None:
+        return None
+    try:
+        return int(row["worker_pid"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _releasable_worker_pid(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Return the task's worker pid only if this process may release its lock.
+
+    Protects against a human or reviewer running ``kanban block``/``complete``
+    on a card whose worker is still alive: handing that live pid to the
+    unlock path would drop the worktree lock under a running process, and
+    the next dispatch would spawn a second worker into the same checkout.
+    The pid is returned only when it is this very process or already dead;
+    otherwise ``None`` (then only a dead lock holder can be released).
+    """
+    pid = _task_worker_pid(conn, task_id)
+    if pid is None:
+        return None
+    if pid == os.getpid() or not _pid_alive(pid):
+        return pid
+    return None
+
+
+def check_claim_guard(
+    conn: sqlite3.Connection, task_id: str, *, board: Optional[str] = None,
+) -> Optional[str]:
+    """Return a reason ``task_id`` must not be claimed right now, else None.
+
+    Protects against workers working on each other's work. Checked in
+    order; the first hit wins:
+
+    ``"branch_conflict:<other_id>"`` (defer)
+        Another card that is actually working (``running``/``review``)
+        holds the same ``branch_name``, or an older card that is also
+        ``ready`` does. Cards parked in triage/todo/scheduled/blocked never
+        defer a ready card (they may never run), and a card never conflicts
+        with its own parent or child so a REDO card can reuse its parent's
+        branch.
+    ``"branch_policy"`` (block)
+        A worktree card whose ``branch_name`` does not match
+        ``kanban.branch_pattern``. Only enforced when the pattern is
+        configured. An empty branch is not a violation: the name the
+        dispatcher will derive (``default_task_branch_name``) is checked
+        instead.
+    ``"protected_path:<prefix>"`` (block)
+        A declared scope path reaches a protected prefix (CI, deploy,
+        instruction files) from ``ops/autonomy/path-claims.json``.
+    ``"scope_overlap:<other_id>:<path>"`` (defer)
+        Declared scope paths intersect a card that is ``running`` on this
+        board.
+
+    Block-type reasons are listed in :data:`CLAIM_GUARD_BLOCK_REASONS`; a
+    malformed ``scope-paths`` block is reported as ``branch_policy``-style
+    block ``"protected_path:invalid-scope"`` so it never silently passes.
+    """
+    from hermes_cli.kanban_scope import (
+        extract_scope_paths, load_protected_prefixes, paths_overlap,
+        protected_path_hit,
+    )
+
+    row = conn.execute(
+        "SELECT id, body, branch_name, workspace_kind, status FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    branch = (row["branch_name"] or "").strip()
+    ws_kind = row["workspace_kind"] or "scratch"
+
+    # 1. One branch, one live card. A card that is actually working
+    # (running/review) always wins; between two dispatchable (ready) cards
+    # the older one goes first so a shared branch never deadlocks both of
+    # them forever. Cards that cannot run on their own (triage, todo,
+    # scheduled, blocked) never hold a ready card back, and a parent/child
+    # pair is exempt so a REDO card can reuse its parent's branch.
+    if branch:
+        other = conn.execute(
+            "SELECT id FROM tasks WHERE branch_name = ? AND id != ? "
+            "  AND (status IN ('running', 'review') "
+            "       OR (status = 'ready' AND ("
+            "           created_at < (SELECT created_at FROM tasks WHERE id = ?) "
+            "           OR (created_at = (SELECT created_at FROM tasks WHERE id = ?) "
+            "               AND id < ?)))) "
+            "  AND NOT EXISTS (SELECT 1 FROM task_links "
+            "       WHERE (parent_id = tasks.id AND child_id = ?) "
+            "          OR (parent_id = ? AND child_id = tasks.id)) "
+            "ORDER BY created_at LIMIT 1",
+            (branch, task_id, task_id, task_id, task_id, task_id, task_id),
+        ).fetchone()
+        if other is not None:
+            return f"branch_conflict:{other['id']}"
+
+    # 2. Branch naming policy for worktree cards (only when configured).
+    if ws_kind == "worktree":
+        pattern = configured_branch_pattern()
+        effective = branch or default_task_branch_name(task_id, board=board)
+        if pattern is not None and re.search(pattern, effective) is None:
+            return "branch_policy"
+
+    # 3/4. Declared file scope vs protected prefixes and running cards.
+    try:
+        scope = extract_scope_paths(row["body"])
+    except ValueError:
+        return "protected_path:invalid-scope"
+    if not scope:
+        return None
+    try:
+        board_slug = board if board else get_current_board()
+        default_workdir = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
+    except Exception:
+        default_workdir = ""
+    hit = protected_path_hit(scope, load_protected_prefixes(default_workdir or None))
+    if hit is not None:
+        return f"protected_path:{hit}"
+    running = conn.execute(
+        "SELECT id, body FROM tasks WHERE status = 'running' AND id != ? "
+        "ORDER BY created_at",
+        (task_id,),
+    ).fetchall()
+    for other in running:
+        try:
+            other_scope = extract_scope_paths(other["body"])
+        except ValueError:
+            continue
+        overlap = paths_overlap(scope, other_scope)
+        if overlap is not None:
+            return f"scope_overlap:{other['id']}:{overlap}"
+    return None
 
 
 def check_respawn_guard(
@@ -9771,6 +10367,77 @@ def configured_max_in_progress() -> Optional[int]:
     except (TypeError, ValueError):
         return None
     return ival if ival >= 1 else None
+
+
+def _coerce_positive_int(value: Any) -> Optional[int]:
+    """Parse a config value as a positive int, or None when unset/invalid."""
+    if value is None:
+        return None
+    try:
+        ival = int(value)
+    except (TypeError, ValueError):
+        return None
+    return ival if ival >= 1 else None
+
+
+def configured_branch_pattern() -> Optional[str]:
+    """Read ``kanban.branch_pattern`` (a regex) from config, or None when unset.
+
+    Same idiom as :func:`configured_max_in_progress`. An unset or invalid
+    pattern disables the branch-name check rather than blocking every card.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("branch_pattern")
+    except Exception:
+        return None
+    pattern = str(raw or "").strip()
+    if not pattern:
+        return None
+    try:
+        re.compile(pattern)
+    except re.error:
+        _log.warning("kanban.branch_pattern %r is not a valid regex; ignoring", pattern)
+        return None
+    return pattern
+
+
+def dispatch_kwargs_from_config(board: Optional[str] = None) -> dict:
+    """Return the ``dispatch_once`` kwargs every entry point should pass.
+
+    One cap resolver for the CLI, the gateway watcher, and the dashboard,
+    so no dispatch path can skip ``max_in_progress`` or the per-profile cap
+    by reading config on its own. ``board`` is accepted for symmetry with
+    the callers; the keys are host-wide today. Fails soft to defaults.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(kanban_cfg, dict):
+            kanban_cfg = {}
+    except Exception:
+        kanban_cfg = {}
+    failure_limit = _coerce_positive_int(
+        kanban_cfg.get("failure_limit", DEFAULT_FAILURE_LIMIT)
+    ) or DEFAULT_FAILURE_LIMIT
+    try:
+        stale_timeout_seconds = int(kanban_cfg.get("dispatch_stale_timeout_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        stale_timeout_seconds = 0
+    return {
+        "max_spawn": _coerce_positive_int(kanban_cfg.get("max_spawn")),
+        "max_in_progress": resolve_max_in_progress(
+            _coerce_positive_int(kanban_cfg.get("max_in_progress"))
+        ),
+        "failure_limit": failure_limit,
+        "stale_timeout_seconds": max(0, stale_timeout_seconds),
+        "default_assignee": (kanban_cfg.get("default_assignee") or "").strip() or None,
+        "max_in_progress_per_profile": _coerce_positive_int(
+            kanban_cfg.get("max_in_progress_per_profile")
+        ),
+        "reconcile_orphans": bool(kanban_cfg.get("reconcile_orphans", True)),
+    }
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
@@ -10274,6 +10941,27 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        # Claim guard: never let two workers share a branch or a file
+        # scope. Defer-type reasons wait for the other card; block-type
+        # reasons (bad branch name, protected files) park the card for a
+        # human because no later tick can fix the card itself.
+        claim_reason = check_claim_guard(conn, row["id"], board=board)
+        if claim_reason is not None:
+            if claim_reason.split(":", 1)[0] in CLAIM_GUARD_BLOCK_REASONS and not dry_run:
+                if block_task(
+                    conn, row["id"], kind="capability",
+                    reason=f"claim guard: {claim_reason}",
+                ):
+                    result.auto_blocked.append(row["id"])
+                continue
+            result.claim_guarded.append((row["id"], claim_reason))
+            if not dry_run:
+                with write_txn(conn):
+                    _append_event(
+                        conn, row["id"], "claim_guarded",
+                        {"reason": claim_reason},
+                    )
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             spawned += 1
@@ -10292,11 +10980,25 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(
+                    claimed, board=board, conn=conn,
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except DispatchPausedError:
             _release_paused_claim(conn, claimed.id)
+            continue
+        except WorkspaceBusyError as busy:
+            # Another live process owns the checkout. Hand the card back
+            # without counting a failure; the next tick re-checks liveness.
+            _release_paused_claim(
+                conn, claimed.id,
+                event_kind="workspace_busy",
+                summary=f"worktree locked by live pid {busy.pid}",
+                payload_extra={"pid": busy.pid, "path": busy.path, "reason": busy.reason},
+            )
+            result.claim_guarded.append((claimed.id, f"workspace_busy:{busy.pid}"))
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -10308,7 +11010,7 @@ def _dispatch_once_locked(
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            _persist_resolved_branch(conn, claimed, resolved_branch_name, board=board)
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -10423,9 +11125,25 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(
+                    claimed, board=board, conn=conn,
+                )
             else:
                 workspace = resolve_workspace(claimed, board=board)
+        except DispatchPausedError:
+            _release_paused_claim(conn, claimed.id)
+            continue
+        except WorkspaceBusyError as busy:
+            # The builder that opened this review may still hold the
+            # checkout — the normal case, not a failure. Defer, no count.
+            _release_paused_claim(
+                conn, claimed.id,
+                event_kind="workspace_busy",
+                summary=f"worktree locked by live pid {busy.pid}",
+                payload_extra={"pid": busy.pid, "path": busy.path, "reason": busy.reason},
+            )
+            result.claim_guarded.append((claimed.id, f"workspace_busy:{busy.pid}"))
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -10437,7 +11155,7 @@ def _dispatch_once_locked(
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            _persist_resolved_branch(conn, claimed, resolved_branch_name, board=board)
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
@@ -10481,6 +11199,23 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
     return result
+
+
+def _persist_resolved_branch(
+    conn: sqlite3.Connection, claimed: Task, resolved: Optional[str], *, board: Optional[str],
+) -> None:
+    """Store the branch the dispatcher settled on and mirror it onto ``claimed``.
+
+    Protects the worker from starting without ``HERMES_KANBAN_BRANCH``: the
+    in-memory Task handed to ``_default_spawn`` must carry the same branch
+    that was just written to the row, otherwise the pre-push hook refuses
+    every push from a card whose branch was derived at dispatch.
+    """
+    name = (resolved or (claimed.branch_name or "")).strip() or default_task_branch_name(
+        claimed.id, board=board,
+    )
+    set_branch_name(conn, claimed.id, name)
+    claimed.branch_name = name
 
 
 def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
@@ -10898,6 +11633,14 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    # Per-profile git attribution: every commit a worker makes names the
+    # profile, so a shared repo can tell which worker touched what. Set
+    # unconditionally — attribution must win over an inherited identity.
+    _git_ident = f"hermes-{profile_arg}"
+    env["GIT_AUTHOR_NAME"] = _git_ident
+    env["GIT_COMMITTER_NAME"] = _git_ident
+    env["GIT_AUTHOR_EMAIL"] = f"{_git_ident}@clauseye.local"
+    env["GIT_COMMITTER_EMAIL"] = f"{_git_ident}@clauseye.local"
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
@@ -10987,6 +11730,10 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    if (task.workspace_kind or "scratch") == "worktree" and os.path.isdir(workspace):
+        # Lock the tree to the child's pid so a second dispatcher tick (or
+        # a manual claim) sees "busy" instead of entering the same checkout.
+        _lock_worktree_for_pid(workspace, proc.pid)
     return proc.pid
 
 

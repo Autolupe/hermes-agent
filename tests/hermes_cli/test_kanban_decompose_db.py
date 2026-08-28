@@ -90,3 +90,51 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
 
 
 
+
+
+def test_decompose_scratch_children_get_their_own_dir(kanban_home):
+    """A scratch root never hands its directory to its children."""
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="scratch root")
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='scratch', workspace_path=? WHERE id = ?",
+            (str(kanban_home / "shared-scratch"), tid),
+        )
+        conn.commit()
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "one", "assignee": "alice", "parents": []},
+                {"title": "two", "assignee": "bob", "parents": []},
+            ],
+            author="decomposer",
+        )
+        assert child_ids is not None and len(child_ids) == 2
+        for cid in child_ids:
+            row = conn.execute(
+                "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?", (cid,),
+            ).fetchone()
+            assert row["workspace_kind"] == "scratch"
+            assert row["workspace_path"] is None
+
+
+def test_decompose_dir_children_inherit_root_dir(kanban_home):
+    """A dir root is a real project checkout; children share it by design."""
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="dir root")
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='dir', workspace_path='/srv/project' WHERE id = ?",
+            (tid,),
+        )
+        conn.commit()
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[{"title": "one", "assignee": "alice", "parents": []}],
+            author="decomposer",
+        )
+        row = conn.execute(
+            "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?", (child_ids[0],),
+        ).fetchone()
+        assert (row["workspace_kind"], row["workspace_path"]) == ("dir", "/srv/project")
