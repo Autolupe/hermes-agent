@@ -268,23 +268,6 @@ def _normalize_assignee_choice(
     return chosen
 
 
-def _new_work_is_blocked() -> bool:
-    """Return True unless every new-work brake is definitely absent."""
-    try:
-        from agent.estop import check_paused
-    except Exception:
-        return True
-    try:
-        if check_paused("kanban", logger):
-            return True
-    except Exception:
-        return True
-    try:
-        return kb.dispatch_is_paused()
-    except Exception:
-        return True
-
-
 def decompose_task(
     task_id: str,
     *,
@@ -306,8 +289,6 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
-    if _new_work_is_blocked():
-        return DecomposeOutcome(task_id, False, "dispatch is paused or halted")
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -330,12 +311,6 @@ def decompose_task(
         default_assignee=default_assignee,
     )
 
-    # Config and roster discovery above can take time or trigger plugins. A
-    # pause/halt that lands during that setup must still stop the model request,
-    # even when a gateway wrapper already checked the brake before calling us.
-    if _new_work_is_blocked():
-        return DecomposeOutcome(task_id, False, "dispatch is paused or halted")
-
     try:
         # Route through call_llm so auxiliary.kanban_decomposer.* config
         # (provider/model/base_url, extra_body, reasoning_effort, retries)
@@ -351,11 +326,6 @@ def decompose_task(
             max_tokens=4000,
             timeout=timeout or 180,
         )
-        # A model call already in flight cannot be cancelled safely here, but a
-        # brake that arrives while it runs must stop all response parsing and
-        # every task mutation that would otherwise follow.
-        if _new_work_is_blocked():
-            return DecomposeOutcome(task_id, False, "dispatch is paused or halted")
     except Exception as exc:
         logger.info(
             "decompose: API call failed for %s (%s)", task_id, exc,
@@ -391,16 +361,7 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
-        if _new_work_is_blocked():
-            return DecomposeOutcome(task_id, False, "dispatch is paused or halted")
         with kb.connect_closing() as conn:
-            # Opening the database may wait on a busy writer. Recheck after
-            # entry so a brake that lands during that wait cannot be followed
-            # by the single-task mutation.
-            if _new_work_is_blocked():
-                return DecomposeOutcome(
-                    task_id, False, "dispatch is paused or halted"
-                )
             ok = kb.specify_triage_task(
                 conn,
                 task_id,
@@ -469,15 +430,7 @@ def decompose_task(
         })
 
     try:
-        if _new_work_is_blocked():
-            return DecomposeOutcome(task_id, False, "dispatch is paused or halted")
         with kb.connect_closing() as conn:
-            # Match the single-task path: connection setup is outside our
-            # control and must not reopen the mutation edge after a halt.
-            if _new_work_is_blocked():
-                return DecomposeOutcome(
-                    task_id, False, "dispatch is paused or halted"
-                )
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
