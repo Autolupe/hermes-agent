@@ -79,6 +79,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat as stat_module
 import subprocess
 import sys
 import threading
@@ -136,7 +137,7 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
 class DispatchPausedError(RuntimeError):
-    """Raised when a manual pause closes the final worker-spawn edge."""
+    """Raised when a shared-root brake closes the final worker-spawn edge."""
 
 
 class WorkspaceBusyError(RuntimeError):
@@ -559,6 +560,10 @@ _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override",
     default=None,
 )
+_KANBAN_HOME_OVERRIDE: ContextVar[Path | None] = ContextVar(
+    "hermes_kanban_home_override",
+    default=None,
+)
 
 
 @contextlib.contextmanager
@@ -569,6 +574,16 @@ def scoped_current_board(slug: str):
         yield
     finally:
         _CURRENT_BOARD_OVERRIDE.reset(token)
+
+
+@contextlib.contextmanager
+def _scoped_kanban_home(path: Path):
+    """Temporarily pin the shared root for an isolated behavior probe."""
+    token: Token[Path | None] = _KANBAN_HOME_OVERRIDE.set(Path(path))
+    try:
+        yield
+    finally:
+        _KANBAN_HOME_OVERRIDE.reset(token)
 
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
@@ -609,6 +624,9 @@ def kanban_home() -> Path:
     profile's ``HERMES_HOME`` would silently fork the board per profile,
     which breaks the dispatcher / worker handoff.
     """
+    scoped = _KANBAN_HOME_OVERRIDE.get()
+    if scoped is not None:
+        return scoped
     override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
     if override:
         return Path(override).expanduser()
@@ -621,12 +639,1006 @@ def dispatch_pause_path() -> Path:
     return kanban_home() / "state" / "dispatch_pause.json"
 
 
-def dispatch_is_paused() -> bool:
-    """Fail closed while the shared-root manual dispatch pause exists."""
+def dispatch_halt_path() -> Path:
+    """Return the shared-root full-halt sentinel path."""
+    return kanban_home() / "state" / "halt.json"
+
+
+def _dispatch_brake_entry_exists(path: Path) -> bool:
+    """Return whether any entry occupies *path*, failing closed on errors.
+
+    ``Path.exists()`` follows symlinks and reports a broken symlink as absent.
+    A dispatch brake is authoritative by directory entry, so use ``lstat``:
+    regular files, directories, and intact or broken symlinks all block.  Only
+    a definite ``FileNotFoundError`` means the brake is absent; permission and
+    other filesystem errors must keep dispatch stopped.
+    """
     try:
-        return dispatch_pause_path().exists()
+        os.lstat(path)
+    except FileNotFoundError:
+        # ENOENT is ambiguous when an ancestor is a broken symlink.  Only
+        # accept it as a genuinely absent brake when walking upward reaches a
+        # usable directory.  Then retry the leaf: an entry may have appeared
+        # between the first lookup and ancestor validation, and every entry
+        # type at a brake path is authoritative.
+        if not _missing_path_has_usable_ancestor(path.parent):
+            return True
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
     except OSError:
         return True
+    return True
+
+
+def _missing_path_has_usable_ancestor(path: Path) -> bool:
+    """Return True only when *path* is missing below a usable directory.
+
+    ``lstat(path)`` reports ``ENOENT`` both for an absent leaf and when a
+    parent symlink is broken.  Walk upward without following entries until an
+    existing ancestor is found, then follow that one entry only to prove it is
+    a directory.  Any lookup failure remains fail-closed.
+    """
+    candidate = path
+    while True:
+        try:
+            info = os.lstat(candidate)
+        except FileNotFoundError:
+            parent = candidate.parent
+            if parent == candidate:
+                return False
+            candidate = parent
+            continue
+        except OSError:
+            return False
+        if stat_module.S_ISLNK(info.st_mode):
+            try:
+                followed = os.stat(candidate)
+            except OSError:
+                return False
+            return stat_module.S_ISDIR(followed.st_mode)
+        return stat_module.S_ISDIR(info.st_mode)
+
+
+def _dispatch_state_snapshot(state_dir: Path) -> Optional[tuple[Any, ...]]:
+    """Describe a usable dispatch-state directory without following it.
+
+    A real directory (or a genuinely absent root/state directory) is usable.
+    A symlink or non-directory at ``state`` is not: otherwise a replaced or
+    broken ancestor can make both brake lookups report a misleading ENOENT.
+    The configured root may be an intact directory symlink for compatibility,
+    but broken root links and non-directories fail closed.
+    """
+    root = state_dir.parent
+    try:
+        root_info = os.lstat(root)
+    except FileNotFoundError:
+        if not _missing_path_has_usable_ancestor(root):
+            return None
+        root_identity: tuple[Any, ...] = ("missing",)
+    except OSError:
+        return None
+    else:
+        identity = (
+            root_info.st_mode,
+            root_info.st_dev,
+            root_info.st_ino,
+            root_info.st_mtime_ns,
+            root_info.st_ctime_ns,
+            root_info.st_size,
+            root_info.st_nlink,
+        )
+        if stat_module.S_ISLNK(root_info.st_mode):
+            try:
+                followed = os.stat(root)
+            except OSError:
+                return None
+            if not stat_module.S_ISDIR(followed.st_mode):
+                return None
+            root_identity = (
+                "symlink-directory",
+                *identity,
+                followed.st_mode,
+                followed.st_dev,
+                followed.st_ino,
+                followed.st_mtime_ns,
+                followed.st_ctime_ns,
+                followed.st_size,
+                followed.st_nlink,
+            )
+        elif stat_module.S_ISDIR(root_info.st_mode):
+            root_identity = ("directory", *identity)
+        else:
+            return None
+
+    try:
+        state_info = os.lstat(state_dir)
+    except FileNotFoundError:
+        if not _missing_path_has_usable_ancestor(state_dir):
+            return None
+        return (root_identity, "missing")
+    except OSError:
+        return None
+    if not stat_module.S_ISDIR(state_info.st_mode):
+        return None
+    return (
+        root_identity,
+        "directory",
+        state_info.st_mode,
+        state_info.st_dev,
+        state_info.st_ino,
+        state_info.st_mtime_ns,
+        state_info.st_ctime_ns,
+        state_info.st_size,
+        state_info.st_nlink,
+    )
+
+
+def dispatch_is_paused() -> bool:
+    """Fail closed while a shared-root dispatch pause or full halt exists."""
+    try:
+        pause_path = dispatch_pause_path()
+        halt_path = dispatch_halt_path()
+        if pause_path.parent != halt_path.parent:
+            return True
+        state_dir = pause_path.parent
+        before = _dispatch_state_snapshot(state_dir)
+        if before is None:
+            return True
+        if (
+            _dispatch_brake_entry_exists(pause_path)
+            or _dispatch_brake_entry_exists(halt_path)
+        ):
+            return True
+        # Detect an ancestor replacement during the two child lookups.  A
+        # changed state directory is not proof that both brakes were absent.
+        return _dispatch_state_snapshot(state_dir) != before
+    except Exception:
+        # Path resolution is part of the trust decision.  If the shared root
+        # cannot be resolved, dispatch must not silently fall through.
+        return True
+
+
+def _raise_if_dispatch_paused() -> None:
+    """Raise the shared exception used to release a late-paused claim."""
+    try:
+        from agent.estop import check_paused
+    except Exception:
+        estop_paused = True
+    else:
+        try:
+            estop_paused = check_paused("kanban", _log)
+        except Exception:
+            estop_paused = True
+    if estop_paused:
+        raise DispatchPausedError(
+            "Kanban dispatch is paused by the global emergency stop "
+            "(or its state could not be read)"
+        )
+    if dispatch_is_paused():
+        raise DispatchPausedError(
+            f"Kanban dispatch is paused by {_dispatch_brake_description()}"
+        )
+
+
+def _dispatch_brake_description() -> str:
+    """Return a safe operator-facing description of both dispatch brakes."""
+    try:
+        return f"{dispatch_pause_path()} or {dispatch_halt_path()}"
+    except Exception:
+        return "the unreadable shared-root dispatch state"
+
+
+DISPATCH_BOUNDARY_CONTRACT = "hermes-kanban-dispatch-boundary"
+DISPATCH_BOUNDARY_SCHEMA_VERSION = 1
+DISPATCH_BOUNDARY_CHECKS = (
+    "absent_brakes_allow",
+    "dispatch_pause_regular_blocks",
+    "dispatch_pause_broken_symlink_blocks",
+    "halt_regular_blocks",
+    "halt_broken_symlink_blocks",
+    "profile_shared_root_halt_blocks",
+    "lookup_errors_fail_closed",
+    "halt_blocks_final_spawn_edge",
+    "estop_blocks_final_spawn_edge",
+    "halt_blocks_gateway_auto_decompose_edge",
+)
+
+
+def normalize_dispatch_boundary_self_test(
+    candidate: object,
+) -> tuple[dict[str, Any], bool]:
+    """Return the strict v1 capability payload and whether it verified.
+
+    Keep validation beside the contract constants so the standalone probe
+    fails closed in one place when a behavior check crashes or returns a
+    malformed result.
+    """
+    expected_top = {
+        "schema_version",
+        "contract",
+        "state",
+        "probe_scope",
+        "shared_halt_path",
+        "live_writes_performed",
+        "checks",
+    }
+    expected_checks = set(DISPATCH_BOUNDARY_CHECKS)
+    raw_checks = candidate.get("checks") if isinstance(candidate, dict) else None
+    checks_shape_ok = (
+        isinstance(raw_checks, dict)
+        and set(raw_checks) == expected_checks
+        and all(type(raw_checks[name]) is bool for name in DISPATCH_BOUNDARY_CHECKS)
+    )
+    normalized_checks = {
+        name: raw_checks[name] if checks_shape_ok else False
+        for name in DISPATCH_BOUNDARY_CHECKS
+    }
+    all_checks_pass = all(normalized_checks.values())
+    shape_ok = (
+        isinstance(candidate, dict)
+        and set(candidate) == expected_top
+        and type(candidate.get("schema_version")) is int
+        and candidate.get("schema_version") == DISPATCH_BOUNDARY_SCHEMA_VERSION
+        and candidate.get("contract") == DISPATCH_BOUNDARY_CONTRACT
+        and candidate.get("probe_scope") == "temporary_shared_root"
+        and candidate.get("shared_halt_path") == "state/halt.json"
+        and type(candidate.get("live_writes_performed")) is bool
+        and candidate.get("live_writes_performed") is False
+        and checks_shape_ok
+        and candidate.get("state")
+        == ("verified" if all_checks_pass else "failed")
+    )
+    verified = shape_ok and all_checks_pass
+    if not shape_ok:
+        normalized_checks = {name: False for name in DISPATCH_BOUNDARY_CHECKS}
+    return (
+        {
+            "schema_version": DISPATCH_BOUNDARY_SCHEMA_VERSION,
+            "contract": DISPATCH_BOUNDARY_CONTRACT,
+            "state": "verified" if verified else "failed",
+            "probe_scope": "temporary_shared_root",
+            "shared_halt_path": "state/halt.json",
+            "live_writes_performed": False,
+            "checks": normalized_checks,
+        },
+        verified,
+    )
+
+
+def run_dispatch_boundary_self_test() -> tuple[dict[str, Any], bool]:
+    """Run and normalize the capability without ever leaking a traceback."""
+    try:
+        candidate: object = dispatch_boundary_self_test()
+    except BaseException:
+        candidate = None
+    return normalize_dispatch_boundary_self_test(candidate)
+
+
+def _dispatch_probe_temp_parent() -> Path:
+    """Choose a writable temp parent that is outside every live Hermes root.
+
+    ``tempfile`` normally honors ``TMPDIR``/``TEMP``/``TMP``. A service can
+    legitimately point one of those variables at ``HERMES_HOME``; creating
+    and deleting the probe directory there would mutate live directory
+    metadata even when the final tree contents looked unchanged. Resolve and
+    validate candidates before passing an explicit parent to ``tempfile``.
+    If no safe parent exists, the outer normalizer emits a failed contract
+    without creating anything.
+    """
+    configured_roots: list[Path] = []
+    raw_hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    raw_kanban_home = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    for raw in (raw_hermes_home, raw_kanban_home):
+        if not raw:
+            continue
+        configured_roots.append(Path(raw).expanduser().resolve(strict=False))
+    # ``kanban_home`` also folds a profile-scoped HERMES_HOME back to its
+    # shared root, which is wider than the literal environment value.
+    configured_roots.append(kanban_home().expanduser().resolve(strict=False))
+
+    raw_candidates: list[str] = []
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot", "").strip()
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        user_profile = os.environ.get("USERPROFILE", "").strip()
+        if system_root:
+            raw_candidates.append(str(Path(system_root) / "Temp"))
+        if local_app_data:
+            raw_candidates.append(str(Path(local_app_data) / "Temp"))
+        if user_profile:
+            raw_candidates.append(
+                str(Path(user_profile) / "AppData" / "Local" / "Temp")
+            )
+    else:
+        raw_candidates.extend(("/tmp", "/var/tmp", "/dev/shm", "/usr/tmp"))
+    raw_candidates.extend(
+        os.environ.get(name, "").strip() for name in ("TMPDIR", "TEMP", "TMP")
+    )
+
+    seen: set[Path] = set()
+    for raw in raw_candidates:
+        if not raw:
+            continue
+        try:
+            candidate = Path(raw).expanduser().resolve(strict=True)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if not candidate.is_dir():
+                continue
+            if any(
+                candidate == live_root or live_root in candidate.parents
+                for live_root in configured_roots
+            ):
+                continue
+            if not os.access(candidate, os.W_OK | os.X_OK):
+                continue
+        except (OSError, RuntimeError):
+            continue
+        return candidate
+    raise RuntimeError("no temporary directory exists outside live Hermes roots")
+
+
+def dispatch_boundary_self_test() -> dict[str, Any]:
+    """Prove the dispatch brake contract entirely under a temporary root.
+
+    This is the machine-readable capability behind
+    ``python3 -m hermes_cli.dispatch_boundary_probe``. It never reads or writes
+    the live shared root. The context-local root override also avoids mutating
+    process-wide environment variables if the probe is invoked from a
+    long-lived process.
+    """
+    import tempfile
+
+    checks = {name: False for name in DISPATCH_BOUNDARY_CHECKS}
+
+    def _probe(root: Path) -> bool:
+        with _scoped_kanban_home(root):
+            return dispatch_is_paused()
+
+    def _root(base: Path, name: str) -> Path:
+        path = base / name
+        path.mkdir(parents=True)
+        return path
+
+    def _regular_brake(base: Path, name: str, brake: str) -> bool:
+        root = _root(base, name)
+        path = root / "state" / brake
+        path.parent.mkdir(parents=True)
+        path.write_text("{}\n", encoding="utf-8")
+        return _probe(root)
+
+    def _broken_symlink_brake(base: Path, name: str, brake: str) -> bool:
+        root = _root(base, name)
+        path = root / "state" / brake
+        path.parent.mkdir(parents=True)
+        path.symlink_to(root / "missing-target")
+        return _probe(root)
+
+    def _isolated_child_env(
+        root: Path, *, shared_kanban_root: Optional[Path] = None
+    ) -> dict[str, str]:
+        """Pin every runtime path used by a behavior probe under *root*.
+
+        The probe is deliberately stricter than ``_scoped_kanban_home``. Some
+        database helpers load normal Hermes configuration while selecting a
+        SQLite journal mode, and that configuration path follows
+        ``HERMES_HOME`` rather than the Kanban-only context override. Running
+        those helpers in a child with an isolated environment prevents both
+        reads and startup repairs from reaching the caller's live home. Clear
+        inherited board/task pins as well so a service environment cannot
+        redirect a probe back to its live database or workspace.
+        """
+        child_env = dict(os.environ)
+        for name in (
+            "HERMES_CONFIG",
+            "HERMES_ENV",
+            "HERMES_PROFILE",
+            "HERMES_GATEWAY_LOCK_DIR",
+            "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_DB",
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            "HERMES_KANBAN_ATTACHMENTS_ROOT",
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_DELEGATED_CHILD_CONTEXT",
+            "HERMES_SHARED_AUTH_DIR",
+        ):
+            child_env.pop(name, None)
+        user_home = root / "probe-home"
+        xdg_root = root / "probe-xdg"
+        for path in (
+            user_home,
+            xdg_root / "cache",
+            xdg_root / "config",
+            xdg_root / "data",
+            xdg_root / "runtime",
+            xdg_root / "state",
+            root / "probe-tmp",
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+        os.chmod(xdg_root / "runtime", 0o700)
+        child_env["HOME"] = str(user_home)
+        child_env["USERPROFILE"] = str(user_home)
+        child_env["XDG_CACHE_HOME"] = str(xdg_root / "cache")
+        child_env["XDG_CONFIG_HOME"] = str(xdg_root / "config")
+        child_env["XDG_DATA_HOME"] = str(xdg_root / "data")
+        child_env["XDG_RUNTIME_DIR"] = str(xdg_root / "runtime")
+        child_env["XDG_STATE_HOME"] = str(xdg_root / "state")
+        child_env["TMPDIR"] = str(root / "probe-tmp")
+        child_env["HERMES_HOME"] = str(root)
+        if shared_kanban_root is None:
+            child_env.pop("HERMES_KANBAN_HOME", None)
+        else:
+            child_env["HERMES_KANBAN_HOME"] = str(shared_kanban_root)
+        child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        return child_env
+
+    def _halt_runtime_boundaries_probe() -> bool:
+        root = _root(base, "halt-runtime-boundaries")
+        halt = root / "state" / "halt.json"
+        halt.parent.mkdir(parents=True)
+        halt.write_text("{}\n", encoding="utf-8")
+        child_code = """
+import contextlib
+import logging
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+logging.disable(logging.CRITICAL)
+
+from hermes_cli import kanban_db as kb
+
+root = Path(os.environ["HERMES_KANBAN_HOME"])
+spawned = []
+with contextlib.closing(sqlite3.connect(":memory:")) as conn:
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    ready_id = kb.create_task(conn, title="ready self-test", assignee="default")
+    review_id = kb.create_task(conn, title="review self-test", assignee="default")
+    conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,))
+    conn.commit()
+    ready_claim = kb.claim_task(conn, ready_id)
+    review_claim = kb.claim_review_task(conn, review_id)
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args, **kwargs: spawned.append((args, kwargs)),
+        max_spawn=1,
+        _emit_tick_hook=False,
+    )
+    run_count = conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
+
+ok = (
+    ready_claim is None
+    and review_claim is None
+    and result.spawned == []
+    and spawned == []
+    and run_count == 0
+    and not any(
+        name == "plugins.model_providers"
+        or name.startswith("plugins.model_providers.")
+        for name in sys.modules
+    )
+)
+raise SystemExit(0 if ok else 1)
+"""
+        child = subprocess.run(
+            [sys.executable, "-c", child_code],
+            env=_isolated_child_env(root, shared_kanban_root=root),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return (
+            child.returncode == 0
+            and child.stdout == ""
+            and child.stderr == ""
+        )
+
+    def _run(name: str, probe) -> None:
+        try:
+            checks[name] = probe() is True
+        except Exception:
+            checks[name] = False
+
+    with tempfile.TemporaryDirectory(
+        prefix="hermes-dispatch-boundary-",
+        dir=_dispatch_probe_temp_parent(),
+    ) as td:
+        base = Path(td)
+        _run(
+            "absent_brakes_allow",
+            lambda: not _probe(_root(base, "absent")),
+        )
+        _run(
+            "dispatch_pause_regular_blocks",
+            lambda: _regular_brake(
+                base, "pause-regular", "dispatch_pause.json"
+            ),
+        )
+        _run(
+            "dispatch_pause_broken_symlink_blocks",
+            lambda: _broken_symlink_brake(
+                base, "pause-broken-symlink", "dispatch_pause.json"
+            ),
+        )
+        _run(
+            "halt_regular_blocks",
+            lambda: _halt_runtime_boundaries_probe(),
+        )
+        _run(
+            "halt_broken_symlink_blocks",
+            lambda: _broken_symlink_brake(
+                base, "halt-broken-symlink", "halt.json"
+            ),
+        )
+
+        def _profile_shared_root_probe() -> bool:
+            shared_root = _root(base, "profile-shared-root")
+            profile_home = shared_root / "profiles" / "planner"
+            profile_home.mkdir(parents=True)
+            halt = shared_root / "state" / "halt.json"
+            halt.parent.mkdir(parents=True)
+            halt.write_text("{}\n", encoding="utf-8")
+            child = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from hermes_cli import kanban_db as kb; "
+                        "raise SystemExit(0 if kb.dispatch_is_paused() else 1)"
+                    ),
+                ],
+                env=_isolated_child_env(profile_home),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return (
+                child.returncode == 0
+                and child.stdout == ""
+                and child.stderr == ""
+            )
+
+        _run("profile_shared_root_halt_blocks", _profile_shared_root_probe)
+
+        def _lookup_error_probe() -> bool:
+            def _lstat_failure_case(name: str, target_kind: str) -> bool:
+                root = _root(base, name)
+                state = root / "state"
+                state.mkdir()
+                targets = {
+                    "root": root,
+                    "state": state,
+                    "brake": state / "dispatch_pause.json",
+                }
+                target = targets[target_kind]
+                real_lstat = os.lstat
+
+                def failed_lstat(path, *args, **kwargs):
+                    if Path(path) == target:
+                        raise PermissionError("dispatch lookup denied")
+                    return real_lstat(path, *args, **kwargs)
+
+                os.lstat = failed_lstat
+                try:
+                    return _probe(root)
+                finally:
+                    os.lstat = real_lstat
+
+            def _stat_failure_case() -> bool:
+                target = _root(base, "lookup-error-stat-target")
+                root = base / "lookup-error-stat-link"
+                root.symlink_to(target, target_is_directory=True)
+                real_stat = os.stat
+
+                def failed_stat(path, *args, **kwargs):
+                    if Path(path) == root:
+                        raise OSError("dispatch symlink target unavailable")
+                    return real_stat(path, *args, **kwargs)
+
+                os.stat = failed_stat
+                try:
+                    return _probe(root)
+                finally:
+                    os.stat = real_stat
+
+            return all(
+                (
+                    _lstat_failure_case("lookup-error-root", "root"),
+                    _lstat_failure_case("lookup-error-state", "state"),
+                    _lstat_failure_case("lookup-error-brake", "brake"),
+                    _stat_failure_case(),
+                )
+            )
+
+        _run("lookup_errors_fail_closed", _lookup_error_probe)
+
+        def _final_spawn_probe(name: str, brake_relative: str) -> bool:
+            root = _root(base, name)
+            child_code = """
+import inspect
+import sqlite3
+import sys
+import types
+from pathlib import Path
+from hermes_cli import kanban_db as kb
+
+root = Path(kb.os.environ["HERMES_KANBAN_HOME"])
+brake = root / __BRAKE_RELATIVE__
+popen_calls = []
+
+# Exercise the real final Popen edge without importing the normal gateway or
+# profile/config startup graphs. Those graphs can discover user plugins, which
+# is outside a no-live-effects capability probe.
+profiles = types.ModuleType("hermes_cli.profiles")
+profiles.normalize_profile_name = lambda profile: profile
+profiles.resolve_profile_env = lambda _profile: str(root)
+sys.modules["hermes_cli.profiles"] = profiles
+gateway = types.ModuleType("gateway")
+gateway.__path__ = []
+session_context = types.ModuleType("gateway.session_context")
+session_context._VAR_MAP = {}
+gateway.session_context = session_context
+sys.modules["gateway"] = gateway
+sys.modules["gateway.session_context"] = session_context
+
+def brake_during_setup(*_args, **_kwargs):
+    brake.parent.mkdir(parents=True, exist_ok=True)
+    brake.write_text("{}\\n", encoding="utf-8")
+    return None
+
+def fake_popen(*_args, **_kwargs):
+    popen_calls.append(True)
+    return type("Proc", (), {"pid": 4242})()
+
+kb._resolve_worker_cli_toolsets = brake_during_setup
+kb._retag_legacy_worker_sessions = lambda *_args, **_kwargs: None
+kb._resolve_hermes_argv = lambda: ["hermes"]
+kb.worker_log_rotation_config = lambda *_args, **_kwargs: (2097152, 1)
+kb.subprocess.Popen = fake_popen
+task = kb.Task(
+    id="t_dispatch_boundary_self_test",
+    title="dispatch boundary self-test",
+    body=None,
+    assignee="default",
+    status="ready",
+    priority=0,
+    created_by=None,
+    created_at=0,
+    started_at=None,
+    completed_at=None,
+    workspace_kind="scratch",
+    workspace_path=None,
+    claim_lock=None,
+    claim_expires=None,
+    tenant=None,
+)
+try:
+    kb._default_spawn(task, str(root))
+except kb.DispatchPausedError:
+    default_ok = brake.is_file() and popen_calls == []
+except Exception:
+    default_ok = False
+else:
+    default_ok = False
+
+if brake.is_file():
+    brake.unlink()
+kb._fire_kanban_lifecycle_hook = lambda *_args, **_kwargs: None
+kb.review_dispatch_enabled = lambda: True
+
+def injected_lane_blocks(lane):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    task_id = kb.create_task(
+        conn,
+        title=f"{lane} injected edge",
+        assignee="default",
+        workspace_kind="dir",
+        workspace_path=str(root),
+    )
+    if lane == "review":
+        conn.execute(
+            "UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,)
+        )
+        conn.commit()
+    spawn_calls = []
+
+    def injected_spawn(*_args, **_kwargs):
+        spawn_calls.append(True)
+        return 4242
+
+    real_signature = inspect.signature
+
+    def brake_before_guard(callable_obj):
+        signature = real_signature(callable_obj)
+        if callable_obj is injected_spawn:
+            brake.parent.mkdir(parents=True, exist_ok=True)
+            brake.write_text("{}\\n", encoding="utf-8")
+        return signature
+
+    inspect.signature = brake_before_guard
+    try:
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=injected_spawn,
+            max_spawn=1,
+            _emit_tick_hook=False,
+        )
+    finally:
+        inspect.signature = real_signature
+    row = conn.execute(
+        "SELECT status, consecutive_failures FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    run = conn.execute(
+        "SELECT status, outcome, ended_at FROM task_runs WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    lane_ok = (
+        result.spawned == []
+        and spawn_calls == []
+        and row is not None
+        and row["status"] == lane
+        and row["consecutive_failures"] == 0
+        and run is not None
+        and run["status"] == "reclaimed"
+        and run["outcome"] == "reclaimed"
+        and run["ended_at"] is not None
+    )
+    conn.close()
+    return lane_ok
+
+ready_ok = injected_lane_blocks("ready")
+if brake.is_file():
+    brake.unlink()
+review_ok = injected_lane_blocks("review")
+
+ok = default_ok and ready_ok and review_ok and not any(
+    name == "plugins.model_providers"
+    or name.startswith("plugins.model_providers.")
+    for name in sys.modules
+)
+raise SystemExit(0 if ok else 1)
+"""
+            child_code = child_code.replace(
+                "__BRAKE_RELATIVE__", repr(brake_relative)
+            )
+            child = subprocess.run(
+                [sys.executable, "-c", child_code],
+                env=_isolated_child_env(root, shared_kanban_root=root),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return (
+                child.returncode == 0
+                and child.stdout == ""
+                and child.stderr == ""
+            )
+
+        _run(
+            "halt_blocks_final_spawn_edge",
+            lambda: _final_spawn_probe(
+                "final-spawn-halt", "state/halt.json"
+            ),
+        )
+        _run(
+            "estop_blocks_final_spawn_edge",
+            lambda: _final_spawn_probe("final-spawn-estop", "ESTOP"),
+        )
+
+        def _gateway_auto_decompose_edge_probe() -> bool:
+            allow_root = _root(base, "gateway-auto-decompose-allow")
+            allow_code = """
+import importlib.util
+import sys
+from pathlib import Path
+
+from hermes_cli import kanban_db as kb
+
+watcher_path = (
+    Path(kb.__file__).resolve().parent.parent / "gateway" / "kanban_watchers.py"
+)
+spec = importlib.util.spec_from_file_location(
+    "_hermes_dispatch_boundary_gateway_watchers", watcher_path
+)
+if spec is None or spec.loader is None:
+    raise SystemExit(1)
+watchers = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(watchers)
+calls = []
+result = watchers._decompose_if_dispatch_allowed(
+    lambda *args, **kwargs: calls.append((args, kwargs)) or "called",
+    "t_probe",
+    author="auto-decomposer",
+)
+provider_plugins_loaded = any(
+    name == "plugins.model_providers"
+    or name.startswith("plugins.model_providers.")
+    for name in sys.modules
+)
+raise SystemExit(
+    0 if result == "called" and len(calls) == 1 and not provider_plugins_loaded
+    else 1
+)
+"""
+            before = subprocess.run(
+                [sys.executable, "-c", allow_code],
+                env=_isolated_child_env(
+                    allow_root, shared_kanban_root=allow_root
+                ),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            edge_root = _root(base, "gateway-auto-decompose-edges")
+            block_code = """
+import contextlib
+import importlib.util
+import json
+import logging
+import os
+import sqlite3
+import sys
+import types
+from pathlib import Path
+
+logging.disable(logging.CRITICAL)
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_decompose as decomp
+
+watcher_path = (
+    Path(kb.__file__).resolve().parent.parent / "gateway" / "kanban_watchers.py"
+)
+spec = importlib.util.spec_from_file_location(
+    "_hermes_dispatch_boundary_gateway_watchers", watcher_path
+)
+if spec is None or spec.loader is None:
+    raise SystemExit(1)
+watchers = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(watchers)
+_decompose_if_dispatch_allowed = watchers._decompose_if_dispatch_allowed
+
+root = Path(os.environ["HERMES_KANBAN_HOME"])
+halt = root / "state" / "halt.json"
+conn = sqlite3.connect(":memory:")
+conn.row_factory = sqlite3.Row
+conn.executescript(kb.SCHEMA_SQL)
+pre_id = kb.create_task(conn, title="pre-call edge", triage=True)
+
+@contextlib.contextmanager
+def raw_connect_closing(*_args, **_kwargs):
+    yield conn
+
+kb.connect_closing = raw_connect_closing
+
+decomp._load_config = lambda: {}
+decomp._resolve_orchestrator_profile = lambda _cfg: "default"
+decomp._resolve_default_assignee = lambda _cfg: "default"
+
+fake_aux = types.ModuleType("agent.auxiliary_client")
+model_calls = []
+
+def response():
+    content = json.dumps({
+        "fanout": False,
+        "rationale": "single test task",
+        "title": "tightened test task",
+        "body": "must remain in triage while halted",
+        "assignee": "default",
+    })
+    message = types.SimpleNamespace(content=content)
+    return types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=message)]
+    )
+
+def forbidden_pre_call(**_kwargs):
+    model_calls.append("pre")
+    return response()
+
+fake_aux.call_llm = forbidden_pre_call
+sys.modules["agent.auxiliary_client"] = fake_aux
+
+def halt_during_roster():
+    halt.parent.mkdir(parents=True, exist_ok=True)
+    halt.write_text("{}\\n", encoding="utf-8")
+    return ([{"name": "default", "description": "test", "has_description": True}], {"default"})
+
+decomp._build_roster = halt_during_roster
+pre_outcome = _decompose_if_dispatch_allowed(
+    decomp.decompose_task, pre_id, author="auto-decomposer"
+)
+with raw_connect_closing() as conn:
+    pre_task = kb.get_task(conn, pre_id)
+pre_ok = (
+    pre_outcome is not None
+    and not pre_outcome.ok
+    and model_calls == []
+    and pre_task is not None
+    and pre_task.status == "triage"
+)
+
+halt.unlink()
+with raw_connect_closing() as conn:
+    post_id = kb.create_task(conn, title="post-call edge", triage=True)
+
+decomp._build_roster = lambda: (
+    [{"name": "default", "description": "test", "has_description": True}],
+    {"default"},
+)
+
+def halt_during_model(**_kwargs):
+    model_calls.append("post")
+    halt.parent.mkdir(parents=True, exist_ok=True)
+    halt.write_text("{}\\n", encoding="utf-8")
+    return response()
+
+fake_aux.call_llm = halt_during_model
+post_outcome = _decompose_if_dispatch_allowed(
+    decomp.decompose_task, post_id, author="auto-decomposer"
+)
+with raw_connect_closing() as conn:
+    post_task = kb.get_task(conn, post_id)
+    task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+post_ok = (
+    post_outcome is not None
+    and not post_outcome.ok
+    and model_calls == ["post"]
+    and post_task is not None
+    and post_task.status == "triage"
+    and task_count == 2
+    and not any(
+        name == "plugins.model_providers"
+        or name.startswith("plugins.model_providers.")
+        for name in sys.modules
+    )
+)
+
+raise SystemExit(0 if pre_ok and post_ok else 1)
+"""
+            after = subprocess.run(
+                [sys.executable, "-c", block_code],
+                env=_isolated_child_env(
+                    edge_root, shared_kanban_root=edge_root
+                ),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return all(
+                proc.returncode == 0
+                and proc.stdout == ""
+                and proc.stderr == ""
+                for proc in (before, after)
+            )
+
+        _run(
+            "halt_blocks_gateway_auto_decompose_edge",
+            _gateway_auto_decompose_edge_probe,
+        )
+
+    verified = all(checks.values())
+    return {
+        "schema_version": DISPATCH_BOUNDARY_SCHEMA_VERSION,
+        "contract": DISPATCH_BOUNDARY_CONTRACT,
+        "state": "verified" if verified else "failed",
+        "probe_scope": "temporary_shared_root",
+        "shared_halt_path": "state/halt.json",
+        "live_writes_performed": False,
+        "checks": checks,
+    }
 
 
 def boards_root() -> Path:
@@ -10541,6 +11553,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    _emit_tick_hook: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -10557,9 +11570,12 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
-    if dispatch_is_paused():
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
         result = DispatchResult()
-        _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        if _emit_tick_hook:
+            _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     try:
         db_path = kanban_db_path(board=board)
@@ -10581,7 +11597,8 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
         )
-        _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        if _emit_tick_hook:
+            _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -10609,7 +11626,8 @@ def dispatch_once(
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
-    _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    if _emit_tick_hook:
+        _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
 
 
@@ -11021,10 +12039,13 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
+                    _raise_if_dispatch_paused()
                     pid = _spawn(claimed, str(workspace), board=board)
                 else:
+                    _raise_if_dispatch_paused()
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
+                _raise_if_dispatch_paused()
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
@@ -11171,10 +12192,13 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
+                    _raise_if_dispatch_paused()
                     pid = _spawn(claimed, str(workspace), board=board)
                 else:
+                    _raise_if_dispatch_paused()
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
+                _raise_if_dispatch_paused()
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
@@ -11524,10 +12548,7 @@ def _default_spawn(
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
     """
-    if dispatch_is_paused():
-        raise DispatchPausedError(
-            f"Kanban dispatch is paused by {dispatch_pause_path()}"
-        )
+    _raise_if_dispatch_paused()
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
@@ -11709,6 +12730,10 @@ def _default_spawn(
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
+        # Final process edge: setup above may take long enough for a halt to
+        # arrive after the entry guard.  Recheck immediately before Popen and
+        # release the opened parent-side log handle on that path.
+        _raise_if_dispatch_paused()
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
@@ -11719,6 +12744,9 @@ def _default_spawn(
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
+    except DispatchPausedError:
+        log_f.close()
+        raise
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(
