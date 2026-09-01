@@ -97,9 +97,17 @@ WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 # services and containers), and cache the result for the process lifetime.
 
 _SYSTEMD_SCOPE_AVAILABLE: Optional[bool] = None
+_SYSTEMD_RUN_EXPAND_ENVIRONMENT_SUPPORTED: Optional[bool] = None
+_SYSTEMD_SCOPE_STOP_PROPAGATION_SUPPORTED: Optional[bool] = None
 _SYSTEMD_SCOPE_PROBE_LOCK = threading.Lock()
 _SYSTEMD_SCOPE_PROBED_AT = 0.0
 _SYSTEMD_SCOPE_FAILURE_TTL_SECONDS = 60.0
+_SYSTEMD_UNIT_STOP_TIMEOUT_SECONDS = 15.0
+_FOREGROUND_SCOPE_STOP_TIMEOUT_SECONDS = 3.0
+_FOREGROUND_SCOPE_KILL_TIMEOUT_SECONDS = 5.0
+_SYSTEMD_UNIT_STOPPED = "stopped"
+_SYSTEMD_UNIT_ABSENT = "absent"
+_SYSTEMD_UNIT_FAILED = "failed"
 _MIN_WORKER_MEMORY_MAX_BYTES = 64 * 1024 * 1024
 _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
@@ -178,7 +186,9 @@ def _systemd_run_user_scope_available() -> bool:
     (``systemd-run --user --scope --unit=… -- /bin/true``) and remember the
     outcome.
     """
+    global _SYSTEMD_RUN_EXPAND_ENVIRONMENT_SUPPORTED
     global _SYSTEMD_SCOPE_AVAILABLE, _SYSTEMD_SCOPE_PROBED_AT
+    global _SYSTEMD_SCOPE_STOP_PROPAGATION_SUPPORTED
     cached = _SYSTEMD_SCOPE_AVAILABLE
     now = time.monotonic()
     if cached is True:
@@ -213,30 +223,93 @@ def _systemd_run_user_scope_available() -> bool:
                 if binary:
                     # Probe: create a transient scope that immediately exits.
                     # A unique unit avoids collisions; timeout bounds D-Bus.
+                    # Probe optional arguments in the same call so the builder
+                    # never emits a flag/property that this systemd rejects.
                     probe_unit = f"hermes-probe-scope-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-                    result = subprocess.run(
-                        [
+                    try_expand_environment = (
+                        _SYSTEMD_RUN_EXPAND_ENVIRONMENT_SUPPORTED is not False
+                    )
+                    try_stop_propagation = (
+                        _SYSTEMD_SCOPE_STOP_PROPAGATION_SUPPORTED is not False
+                    )
+                    for _attempt in range(3):
+                        probe_argv = [
                             binary, "--user", "--scope", "--quiet",
+                        ]
+                        if try_expand_environment:
+                            probe_argv.append("--expand-environment=no")
+                        probe_argv.extend([
                             "--unit", probe_unit,
                             "--collect",
                             "--property", "MemoryAccounting=yes",
                             "--property", f"MemoryMax={_worker_memory_max_bytes()}",
                             "--property", "OOMPolicy=kill",
-                            "--",
-                            "/bin/true",
-                        ],
-                        capture_output=True,
-                        timeout=3,
-                    )
-                    available = result.returncode == 0
-                    if not available:
+                        ])
+                        if try_stop_propagation:
+                            probe_argv.extend([
+                                "--property",
+                                "StopPropagatedFrom=basic.target",
+                            ])
+                        probe_argv.extend(["--", "/bin/true"])
+                        result = subprocess.run(
+                            probe_argv,
+                            capture_output=True,
+                            timeout=3,
+                        )
+                        if result.returncode == 0:
+                            available = True
+                            if try_expand_environment:
+                                _SYSTEMD_RUN_EXPAND_ENVIRONMENT_SUPPORTED = True
+                            if try_stop_propagation:
+                                _SYSTEMD_SCOPE_STOP_PROPAGATION_SUPPORTED = True
+                            break
+
+                        stderr_value = getattr(result, "stderr", b"") or b""
+                        if isinstance(stderr_value, bytes):
+                            stderr = stderr_value.decode("utf-8", "replace").strip()
+                        else:
+                            stderr = str(stderr_value).strip()
+                        stderr_lower = stderr.lower()
+                        retry_for_compatibility = False
+                        if (
+                            try_expand_environment
+                            and "expand-environment" in stderr_lower
+                            and any(
+                                marker in stderr_lower
+                                for marker in (
+                                    "unrecognized option",
+                                    "unknown option",
+                                    "invalid option",
+                                )
+                            )
+                        ):
+                            _SYSTEMD_RUN_EXPAND_ENVIRONMENT_SUPPORTED = False
+                            try_expand_environment = False
+                            retry_for_compatibility = True
+                        if (
+                            try_stop_propagation
+                            and "stoppropagatedfrom" in stderr_lower
+                            and any(
+                                marker in stderr_lower
+                                for marker in (
+                                    "unknown assignment",
+                                    "cannot set property",
+                                    "unknown property",
+                                    "not supported",
+                                )
+                            )
+                        ):
+                            _SYSTEMD_SCOPE_STOP_PROPAGATION_SUPPORTED = False
+                            try_stop_propagation = False
+                            retry_for_compatibility = True
+                        if retry_for_compatibility:
+                            continue
                         logger.debug(
                             "systemd-run --user --scope probe failed (rc=%s): %s",
                             result.returncode,
-                            (result.stderr or b"").decode(
-                                "utf-8", "replace"
-                            ).strip(),
+                            stderr,
                         )
+                        break
             except Exception as exc:
                 logger.debug("systemd-run --user --scope probe error: %s", exc)
 
@@ -245,15 +318,63 @@ def _systemd_run_user_scope_available() -> bool:
         return available
 
 
-def _is_supervised_gateway_process() -> bool:
-    """Return whether this process is in a supervised Hermes gateway runtime.
+def _systemd_scope_stop_propagation_available() -> bool:
+    """Return whether the successful scope probe accepted restart propagation."""
+    return _SYSTEMD_SCOPE_STOP_PROPAGATION_SUPPORTED is True
 
-    Both supervisor markers and ``_HERMES_GATEWAY`` are inherited by every
-    descendant, and importing ``gateway.run`` also sets the latter. Require
-    this process to own the live gateway PID file as well. That keeps transient
-    systemd scopes limited to the gateway itself instead of terminal children
-    or unrelated interactive CLIs in the same supervised process tree.
+
+def _supervised_runtime_owner() -> tuple[str, bool]:
+    """Return ``(unit_name, is_user_unit)`` for a supervised Hermes runtime.
+
+    The value comes only from the process's kernel cgroup membership and a
+    fixed allowlist. A transient scope created by ``systemd-run --user`` can
+    depend only on another unit in that same user manager. The boolean keeps a
+    same-named system-manager service from becoming a broken (or unrelated)
+    user-manager dependency.
     """
+    try:
+        cgroup_text = Path("/proc/self/cgroup").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return "", False
+
+    for line in cgroup_text.splitlines():
+        components = line.strip().split("/")
+        for unit in (
+            "hermes-dashboard.service",
+            "hermes-serve.service",
+            "hermes-gateway.service",
+        ):
+            if unit not in components:
+                continue
+            is_user_unit = any(
+                component.startswith("user@") and component.endswith(".service")
+                for component in components[: components.index(unit)]
+            )
+            return unit, is_user_unit
+    return "", False
+
+
+def _is_supervised_gateway_process() -> bool:
+    """Return whether this process belongs to a supervised Hermes runtime.
+
+    Dashboard and Serve chat descendants are identified from their systemd
+    cgroup. Their local terminal workers need the same sibling-scope isolation
+    as gateway workers; otherwise a test/build runs inside the web service's
+    memory budget and can freeze HTTP and WebSocket handling.
+
+    The gateway path retains the stricter marker + live-PID identity check.
+    A worker already moved into ``hermes-worker-*.scope`` no longer matches a
+    dashboard/Serve cgroup, preventing unnecessary nested scopes.
+    """
+    owner_unit, owner_is_user_unit = _supervised_runtime_owner()
+    if owner_unit in ("hermes-dashboard.service", "hermes-serve.service"):
+        # These runtimes have no separate supervisor identity marker. Scope
+        # them only when the owner is proven to live in the same user manager;
+        # a system/unknown-manager unit cannot safely own a user scope.
+        return owner_is_user_unit
+
     if os.environ.get("_HERMES_GATEWAY") != "1":
         return False
 
@@ -273,6 +394,8 @@ def _is_supervised_gateway_process() -> bool:
 def _build_systemd_scope_argv(
     shell_argv: List[str],
     unit_suffix: str,
+    binds_to_unit: str = "",
+    stop_propagated_from_unit: str = "",
 ) -> List[str]:
     """Wrap *shell_argv* in a ``systemd-run --user --scope`` invocation.
 
@@ -290,11 +413,19 @@ def _build_systemd_scope_argv(
         return shell_argv
     unit_name = f"hermes-worker-{unit_suffix}"
     memory_max = _worker_memory_max_bytes()
-    return [
+    argv = [
         binary,
         "--user",
         "--scope",
         "--quiet",
+    ]
+    if _SYSTEMD_RUN_EXPAND_ENVIRONMENT_SUPPORTED is True:
+        # systemd v258 changed scope argv expansion to default-on. Hermes gives
+        # Bash a script containing $variables that Bash itself must expand, so
+        # make the cross-version intent explicit whenever the probe proved the
+        # flag is supported (v254+). Older releases already default scopes off.
+        argv.append("--expand-environment=no")
+    argv.extend([
         "--unit",
         unit_name,
         "--collect",
@@ -304,13 +435,41 @@ def _build_systemd_scope_argv(
         f"MemoryMax={memory_max}",
         "--property",
         "OOMPolicy=kill",
-        "--",
-        *shell_argv,
-    ]
+    ])
+    if binds_to_unit:
+        # Foreground workers are sibling scopes, not descendants of the web
+        # service cgroup. Bind the scope's lifecycle to its detected owner so
+        # a supervised-service stop, crash, or OOM teardown also stops every
+        # worker that the process could not clean up itself. Bound only
+        # the stop phase so a SIGTERM-resistant worker cannot delay its owner's
+        # restart by the user manager's longer default; this does not cap normal
+        # or detached-child runtime.
+        argv.extend(
+            [
+                "--property",
+                f"BindsTo={binds_to_unit}",
+                "--property",
+                f"After={binds_to_unit}",
+                "--property",
+                f"TimeoutStopSec={_FOREGROUND_SCOPE_STOP_TIMEOUT_SECONDS:g}s",
+            ]
+        )
+    if stop_propagated_from_unit:
+        # StopPropagatedFrom turns both an owner stop and the stop half of an
+        # owner restart into a stop-only job for this transient scope. PartOf
+        # is not suitable: it tries to restart the scope, a job type scopes do
+        # not support, and leaves the command running.
+        argv.extend(
+            [
+                "--property",
+                f"StopPropagatedFrom={stop_propagated_from_unit}",
+            ]
+        )
+    return [*argv, "--", *shell_argv]
 
 
-def _stop_systemd_unit(unit_name: str) -> bool:
-    """Stop a transient systemd user scope by unit name.
+def _stop_systemd_unit_status(unit_name: str, *, aggressive: bool = False) -> str:
+    """Stop a transient systemd scope and report stopped/absent/failed.
 
     This reaps the *entire* cgroup — catching double-forked descendants that
     survive a plain PID signal because they were reparented to init inside the
@@ -318,38 +477,124 @@ def _stop_systemd_unit(unit_name: str) -> bool:
     SIGTERM to every process in the unit's cgroup and escalates to SIGKILL
     after the unit's ``TimeoutStopSec``.
 
-    Returns True if the unit was successfully stopped (or was already gone),
-    False if ``systemctl`` is unavailable or the stop command failed.
+    Existing background registry cleanup keeps its established 15-second
+    graceful stop with no forced signal. ``aggressive=True`` is reserved for a
+    foreground timeout/interrupt: bound that graceful attempt to three seconds,
+    then send SIGKILL to every remaining cgroup member. This is stronger than
+    killing the ``systemd-run`` wrapper's process group, which a daemonized
+    child can outlive while remaining inside the transient scope.
+
+    Distinguishing ``absent`` from ``stopped`` is necessary during immediate
+    cancellation: ``Popen(systemd-run ...)`` may return just before systemd has
+    registered the unique scope, so an early "not loaded" result is not final
+    while the wrapper is still alive.
     """
     import shutil
 
     binary = shutil.which("systemctl")
     if binary is None:
-        return False
+        return _SYSTEMD_UNIT_FAILED
+    absent_markers = ("not loaded", "not found", "does not exist")
+
+    def _stderr_text(value: object) -> str:
+        if isinstance(value, bytes):
+            return value.decode(errors="replace").strip()
+        return str(value or "").strip()
+
+    def _unit_is_absent(stderr: str) -> bool:
+        return any(marker in stderr.lower() for marker in absent_markers)
+
+    stop_timeout = (
+        _FOREGROUND_SCOPE_STOP_TIMEOUT_SECONDS
+        if aggressive
+        else _SYSTEMD_UNIT_STOP_TIMEOUT_SECONDS
+    )
     try:
         result = subprocess.run(
             [binary, "--user", "stop", unit_name],
             capture_output=True,
-            timeout=15,
+            timeout=stop_timeout,
         )
         if result.returncode != 0:
-            stderr = (result.stderr or b"").decode(errors="replace").strip()
-            stderr_lower = stderr.lower()
-            if any(
-                marker in stderr_lower
-                for marker in ("not loaded", "not found", "does not exist")
-            ):
-                return True
+            stderr = _stderr_text(result.stderr)
+            if _unit_is_absent(stderr):
+                return _SYSTEMD_UNIT_ABSENT
+            if not aggressive:
+                logger.debug(
+                    "systemctl --user stop %s exited %d: %s",
+                    unit_name,
+                    result.returncode,
+                    stderr,
+                )
+                return _SYSTEMD_UNIT_FAILED
             logger.debug(
-                "systemctl --user stop %s exited %d: %s",
+                "systemctl --user stop %s exited %d; forcing remaining "
+                "scope members: %s",
                 unit_name, result.returncode,
                 stderr,
             )
-            return False
-        return True
+        else:
+            return _SYSTEMD_UNIT_STOPPED
+    except subprocess.TimeoutExpired:
+        if not aggressive:
+            logger.debug(
+                "systemctl --user stop %s exceeded %.1fs",
+                unit_name,
+                stop_timeout,
+            )
+            return _SYSTEMD_UNIT_FAILED
+        logger.debug(
+            "systemctl --user stop %s exceeded %.1fs; forcing remaining "
+            "scope members",
+            unit_name,
+            stop_timeout,
+        )
     except Exception as exc:
-        logger.debug("systemctl --user stop %s failed: %s", unit_name, exc)
-        return False
+        if not aggressive:
+            logger.debug("systemctl --user stop %s failed: %s", unit_name, exc)
+            return _SYSTEMD_UNIT_FAILED
+        logger.debug(
+            "systemctl --user stop %s failed; forcing remaining scope "
+            "members: %s",
+            unit_name,
+            exc,
+        )
+
+    if not aggressive:
+        return _SYSTEMD_UNIT_FAILED
+
+    try:
+        result = subprocess.run(
+            [
+                binary,
+                "--user",
+                "kill",
+                "--kill-whom=all",
+                "--signal=SIGKILL",
+                unit_name,
+            ],
+            capture_output=True,
+            timeout=_FOREGROUND_SCOPE_KILL_TIMEOUT_SECONDS,
+        )
+        if result.returncode == 0:
+            return _SYSTEMD_UNIT_STOPPED
+        stderr = _stderr_text(result.stderr)
+        if _unit_is_absent(stderr):
+            return _SYSTEMD_UNIT_ABSENT
+        logger.debug(
+            "systemctl --user kill %s exited %d: %s",
+            unit_name,
+            result.returncode,
+            stderr,
+        )
+    except Exception as exc:
+        logger.debug("systemctl --user kill %s failed: %s", unit_name, exc)
+    return _SYSTEMD_UNIT_FAILED
+
+
+def _stop_systemd_unit(unit_name: str) -> bool:
+    """Compatibility wrapper for callers that treat absence as clean."""
+    return _stop_systemd_unit_status(unit_name) != _SYSTEMD_UNIT_FAILED
 
 
 def format_uptime_short(seconds: int) -> str:
