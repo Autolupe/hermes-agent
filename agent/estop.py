@@ -731,7 +731,12 @@ def engage(reason: Optional[str] = None) -> Path:
             path.touch(exist_ok=True)
         except OSError as touch_error:
             creation_error = touch_error
-    if not is_engaged():
+    try:
+        # Verify this exact shared entry. The aggregate is_engaged() check is
+        # deliberately fail-closed, so an unrelated unreadable legacy path can
+        # report True even when this write and fallback touch both failed.
+        os.lstat(path)
+    except OSError:
         raise EngageError(
             "the shared stop file could not be created or verified"
         ) from creation_error

@@ -298,6 +298,56 @@ def test_stop_engaged_during_claim_lock_wait_blocks_transaction(
     verify.close()
 
 
+@pytest.mark.parametrize("lane", ["ready", "review"])
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_stop_engaged_during_claim_writes_rolls_back_transaction(
+    tmp_path, monkeypatch, lane, brake
+):
+    """A stop raised from inside the claim transaction wins before commit."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(conn, title=f"{lane} late stop", assignee="default")
+    if lane == "review":
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+
+    stop_created = False
+
+    def stop_on_running_update(statement):
+        nonlocal stop_created
+        normalized = " ".join(statement.lower().split())
+        if (
+            not stop_created
+            and normalized.startswith("update tasks")
+            and "set status = 'running'" in normalized
+        ):
+            stop_created = True
+            _engage_brake(tmp_path, monkeypatch, brake)
+
+    conn.set_trace_callback(stop_on_running_update)
+    try:
+        claim = kb.claim_task if lane == "ready" else kb.claim_review_task
+        outcome = claim(conn, task_id)
+    finally:
+        conn.set_trace_callback(None)
+
+    task = kb.get_task(conn, task_id)
+    assert stop_created is True
+    assert outcome is None
+    assert task is not None and task.status == lane
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'claimed'",
+        (task_id,),
+    ).fetchone()[0] == 0
+    conn.close()
+
+
 @pytest.mark.parametrize("operation", ["specify", "decompose"])
 @pytest.mark.parametrize("brake", ["halt", "estop"])
 def test_stop_engaged_during_planning_lock_wait_rolls_back_transaction(
@@ -385,6 +435,73 @@ def test_stop_engaged_during_planning_lock_wait_rolls_back_transaction(
     assert verify.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
     assert verify.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == 0
     verify.close()
+
+
+@pytest.mark.parametrize("operation", ["specify", "decompose"])
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_stop_engaged_during_planning_writes_rolls_back_transaction(
+    tmp_path, monkeypatch, operation, brake
+):
+    """A stop raised after planning starts rolls back its whole audit trail."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(conn, title="planning write", triage=True)
+    stop_created = False
+
+    def stop_on_todo_update(statement):
+        nonlocal stop_created
+        normalized = " ".join(statement.lower().split())
+        if (
+            not stop_created
+            and normalized.startswith("update tasks")
+            and "set status = 'todo'" in normalized
+        ):
+            stop_created = True
+            _engage_brake(tmp_path, monkeypatch, brake)
+
+    conn.set_trace_callback(stop_on_todo_update)
+    try:
+        with pytest.raises(kb.DispatchPausedError):
+            if operation == "specify":
+                kb.specify_triage_task(
+                    conn,
+                    task_id,
+                    title="must not land",
+                    body="must roll back",
+                    author="test",
+                )
+            else:
+                kb.decompose_triage_task(
+                    conn,
+                    task_id,
+                    root_assignee="default",
+                    children=[
+                        {
+                            "title": "must not exist",
+                            "body": "must roll back",
+                            "assignee": "default",
+                            "parents": [],
+                        }
+                    ],
+                    author="test",
+                )
+    finally:
+        conn.set_trace_callback(None)
+
+    task = kb.get_task(conn, task_id)
+    assert stop_created is True
+    assert task is not None and task.status == "triage"
+    assert task.title == "planning write"
+    assert task.body is None
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM task_comments").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind IN ('specified', 'decomposed')"
+    ).fetchone()[0] == 0
+    conn.close()
 
 
 @pytest.mark.parametrize("operation", ["specify", "decompose"])
@@ -493,6 +610,49 @@ def test_stop_engaged_during_ready_promotion_lock_wait_keeps_todos_parked(
     expected_task_count = 1 if operation == "specify" else 2
     assert verify.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == expected_task_count
     verify.close()
+
+
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_stop_engaged_during_ready_promotion_writes_rolls_back_transaction(
+    tmp_path, monkeypatch, brake
+):
+    """A stop raised during todo-to-ready writes prevents their commit."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(conn, title="promotion write", triage=True)
+    conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+    conn.commit()
+    stop_created = False
+
+    def stop_on_ready_update(statement):
+        nonlocal stop_created
+        normalized = " ".join(statement.lower().split())
+        if (
+            not stop_created
+            and normalized.startswith("update tasks")
+            and "set status = 'ready'" in normalized
+        ):
+            stop_created = True
+            _engage_brake(tmp_path, monkeypatch, brake)
+
+    conn.set_trace_callback(stop_on_ready_update)
+    try:
+        with pytest.raises(kb.DispatchPausedError):
+            kb.recompute_ready(conn)
+    finally:
+        conn.set_trace_callback(None)
+
+    task = kb.get_task(conn, task_id)
+    assert stop_created is True
+    assert task is not None and task.status == "todo"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'promoted'",
+        (task_id,),
+    ).fetchone()[0] == 0
+    conn.close()
 
 
 @pytest.mark.parametrize("brake", ["halt", "estop"])
@@ -1104,6 +1264,81 @@ def test_stop_during_worktree_resolution_removes_new_worktree_and_branch(
         "AND kind = 'worktree_base_fallback'",
         (task_id,),
     ).fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("lane", "expected_status"),
+    [("ready", "ready"), ("review", "review")],
+)
+def test_halt_from_failing_checkout_hook_rolls_back_partial_worktree(
+    tmp_path, monkeypatch, lane, expected_status
+):
+    """A failing Git hook cannot hide the worktree it created before stopping."""
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(hermes_home))
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    hook.write_text(
+        "#!/bin/sh\n"
+        'mkdir -p "$HERMES_KANBAN_HOME/state"\n'
+        'printf "{}\\n" > "$HERMES_KANBAN_HOME/state/halt.json"\n'
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o755)
+    monkeypatch.setattr(
+        kb, "read_board_metadata", lambda _board: {"default_workdir": str(repo)}
+    )
+    db_path = hermes_home / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(
+        conn,
+        title=f"{lane} failing hook",
+        assignee="default",
+        workspace_kind="worktree",
+    )
+    original_workspace_path = kb.get_task(conn, task_id).workspace_path
+    if lane == "review":
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+        monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+
+    expected_path = repo / ".worktrees" / task_id
+    branch_name = kb.default_task_branch_name(task_id)
+    spawn_calls = []
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args, **kwargs: spawn_calls.append((args, kwargs)),
+        max_spawn=1,
+    )
+
+    task = kb.get_task(conn, task_id)
+    run = conn.execute(
+        "SELECT status, outcome, ended_at FROM task_runs WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "show-ref", "--verify", f"refs/heads/{branch_name}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert (hermes_home / "state" / "halt.json").is_file()
+    assert not expected_path.exists()
+    assert branch.returncode != 0
+    assert spawn_calls == []
+    assert result.spawned == []
+    assert task is not None and task.status == expected_status
+    assert task.workspace_path == original_workspace_path
+    assert task.branch_name is None
+    assert task.consecutive_failures == 0
+    assert run is not None
+    assert (run["status"], run["outcome"]) == ("reclaimed", "reclaimed")
+    assert run["ended_at"] is not None
     conn.close()
 
 

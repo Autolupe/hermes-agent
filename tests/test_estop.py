@@ -48,7 +48,7 @@ def test_engage_creates_sentinel_and_is_engaged(hermes_home):
 def test_engage_reports_when_shared_stop_cannot_be_created(
     hermes_home, monkeypatch
 ):
-    """A failed stop write must not be reported as an active pause."""
+    """An unrelated fail-closed state cannot hide a failed shared write."""
     profile_home = hermes_home / "profiles" / "coder"
     profile_home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
@@ -68,10 +68,11 @@ def test_engage_reports_when_shared_stop_cannot_be_created(
 
     monkeypatch.setattr(estop.Path, "write_text", denied_write_text)
     monkeypatch.setattr(estop.Path, "touch", denied_touch)
+    monkeypatch.setattr(estop, "is_engaged", lambda: True)
 
     with pytest.raises(estop.EngageError, match="could not be created"):
         estop.engage(reason="maintenance")
-    assert estop.is_engaged() is False
+    assert not os.path.lexists(sentinel)
 
 
 def test_disengage_removes_sentinel(hermes_home):

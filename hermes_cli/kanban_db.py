@@ -5756,11 +5756,11 @@ def recompute_ready(
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
 
-    Dispatch brakes protect every promotion by default. The check runs once
-    before waiting for SQLite and again after the write transaction is acquired,
-    so a stop engaged during lock contention cannot promote new runnable work.
-    Tests of the isolated dependency algorithm can explicitly set
-    ``require_dispatch_allowed=False``.
+    Dispatch brakes protect every promotion by default. Checks run before
+    waiting for SQLite, after the write transaction is acquired, and again
+    immediately before commit. A stop engaged during lock contention or the
+    promotion writes cannot create new runnable work. Tests of the isolated
+    dependency algorithm can explicitly set ``require_dispatch_allowed=False``.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -5823,6 +5823,8 @@ def recompute_ready(
                     {"status": resume_status} if resume_status != "ready" else None,
                 )
                 promoted += 1
+        if require_dispatch_allowed:
+            _raise_if_dispatch_paused()
     return promoted
 
 
@@ -5870,13 +5872,11 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
+    claim_completed = False
+    with contextlib.suppress(DispatchPausedError), write_txn(conn):
         # BEGIN IMMEDIATE may wait behind another writer. A stop engaged during
         # that wait must win before this transaction changes a task or run.
-        try:
-            _raise_if_dispatch_paused()
-        except DispatchPausedError:
-            return None
+        _raise_if_dispatch_paused()
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -5973,6 +5973,13 @@ def claim_task(
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
+        # A stop can arrive after the first in-transaction check while the
+        # claim writes are running. Let it escape through write_txn so every
+        # task, run, and event mutation rolls back before it is suppressed.
+        _raise_if_dispatch_paused()
+        claim_completed = True
+    if not claim_completed:
+        return None
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -6008,13 +6015,12 @@ def claim_review_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
+    claim_completed = False
+    claimed = None
+    with contextlib.suppress(DispatchPausedError), write_txn(conn):
         # Match the ready lane: the acquired transaction is the final claim
         # boundary after any SQLite busy wait.
-        try:
-            _raise_if_dispatch_paused()
-        except DispatchPausedError:
-            return None
+        _raise_if_dispatch_paused()
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -6081,7 +6087,12 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+        _raise_if_dispatch_paused()
+        claim_completed = True
+    if not claim_completed:
+        return None
+    return claimed
 
 
 def _retry_status_for_run(
@@ -8548,6 +8559,7 @@ def specify_triage_task(
             "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
         )
+        _raise_if_dispatch_paused()
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
@@ -8798,6 +8810,7 @@ def decompose_triage_task(
                 "root_assignee": root_assignee,
             },
         )
+        _raise_if_dispatch_paused()
 
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern
@@ -9383,6 +9396,43 @@ def _worktree_base_ref(repo_root: Path) -> tuple[str, bool]:
     return "HEAD", True
 
 
+def _capture_created_worktree(
+    materialization: Optional[_WorkspaceMaterialization],
+    *,
+    repo_root: Path,
+    repo_common: Optional[Path],
+    target: Path,
+    branch_name: str,
+    branch_existed: bool,
+    target_was_missing: bool,
+) -> None:
+    """Record a worktree created even when ``git worktree add`` fails."""
+    if materialization is None or not target_was_missing or repo_common is None:
+        return
+    try:
+        identity = _directory_identity(target)
+        if (
+            identity is None
+            or _git_common_dir(target) != repo_common
+            or _git_current_branch(target) != branch_name
+        ):
+            return
+        materialization.kind = "worktree"
+        materialization.path = target
+        materialization.identity = identity
+        materialization.repo_root = repo_root.expanduser().resolve(strict=False)
+        materialization.branch_name = branch_name
+        materialization.created_branch = not branch_existed
+        materialization.branch_oid = _git_branch_oid(repo_root, branch_name)
+    except Exception:
+        # Rollback is best effort and must never hide the original git error.
+        _log.debug(
+            "Could not safely capture partially-created worktree %s",
+            target,
+            exc_info=True,
+        )
+
+
 def _ensure_git_worktree(
     repo_root: Path,
     target: Path,
@@ -9422,29 +9472,33 @@ def _ensure_git_worktree(
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
             str(target), base_ref,
         ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True, encoding='utf-8', errors='replace',
-        timeout=60,
-        check=False,
-        env=_git_worktree_env(),
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=60,
+            check=False,
+            env=_git_worktree_env(),
+        )
+    finally:
+        # Git can leave a registered checkout and branch behind when a
+        # post-checkout hook fails or the parent process times out. Capture
+        # that exact artifact before the original error is propagated.
+        _capture_created_worktree(
+            materialization,
+            repo_root=repo_root,
+            repo_common=repo_common,
+            target=target,
+            branch_name=branch_name,
+            branch_existed=branch_existed,
+            target_was_missing=target_was_missing,
+        )
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
-    if materialization is not None and target_was_missing:
-        identity = _directory_identity(target)
-        if identity is not None:
-            materialization.kind = "worktree"
-            materialization.path = target
-            materialization.identity = identity
-            materialization.repo_root = repo_root.expanduser().resolve(strict=False)
-            materialization.branch_name = branch_name
-            materialization.created_branch = not branch_existed
-            materialization.branch_oid = _git_branch_oid(repo_root, branch_name)
     if materialization is not None and fell_back:
         materialization.base_fell_back = True
     return fell_back
