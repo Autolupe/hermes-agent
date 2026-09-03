@@ -617,6 +617,85 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
+    def test_read_open_waits_for_nonempty_bootstrap_to_finish(
+        self, tmp_path, monkeypatch
+    ):
+        """A non-empty SQLite file is not proof that its schema committed."""
+        from concurrent.futures import ThreadPoolExecutor
+        import sqlite3
+
+        import hermes_state
+        from hermes_cli import web_server
+
+        db_path = tmp_path / "state.db"
+        partial_file_created = threading.Event()
+        bootstrap_finished = threading.Event()
+        route_condition = threading.Condition()
+        route = {"second": None}
+        real_lock = threading.Lock()
+
+        class RoutingLock:
+            def __enter__(self):
+                if real_lock.locked():
+                    with route_condition:
+                        route["second"] = "lock"
+                        route_condition.notify_all()
+                real_lock.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                real_lock.release()
+
+        class FakeSessionDB:
+            def __init__(self, *, db_path, read_only=False):
+                self._conn = None
+                if not read_only:
+                    Path(db_path).write_bytes(b"partial sqlite file")
+                    partial_file_created.set()
+                    with route_condition:
+                        assert route_condition.wait_for(
+                            lambda: route["second"] is not None,
+                            timeout=5,
+                        )
+                    bootstrap_finished.set()
+                elif not bootstrap_finished.is_set():
+                    with route_condition:
+                        route["second"] = "read"
+                        route_condition.notify_all()
+                    raise sqlite3.OperationalError(
+                        "vtable constructor failed: messages_fts_trigram"
+                    )
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(
+            web_server,
+            "_session_db_bootstrap_lock",
+            RoutingLock(),
+        )
+        monkeypatch.setattr(hermes_state, "SessionDB", FakeSessionDB)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(
+                web_server._open_session_db_at_path,
+                db_path,
+                read_only=True,
+            )
+            assert partial_file_created.wait(timeout=5)
+            second = pool.submit(
+                web_server._open_session_db_at_path,
+                db_path,
+                read_only=True,
+            )
+            first_db = first.result(timeout=5)
+            second_db = second.result(timeout=5)
+
+        first_db.close()
+        second_db.close()
+        assert route["second"] == "lock"
+        assert bootstrap_finished.is_set()
+
     def test_concurrent_first_load_reads_all_succeed_on_fresh_store(self):
         from concurrent.futures import ThreadPoolExecutor
 
