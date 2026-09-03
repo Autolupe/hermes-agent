@@ -10,9 +10,11 @@
   agent run (``gateway/run.py:_handle_message``).
 
 In-flight work is NEVER killed — this is pause-new-work, not panic/exit.
-The check is a single ``os.lstat`` so every directory entry, including a
-broken symlink, holds the stop. Callers may run it every tick; no caching beyond
-the OS is performed, so engaging/disengaging takes effect on the next check.
+The check uses ``os.lstat`` so every directory entry, including a broken
+symlink, holds the stop. A missing entry also gets an ancestor check so a
+broken parent cannot look like an absent stop. Callers may run it every tick;
+no caching beyond the OS is performed, so engaging/disengaging takes effect on
+the next check.
 
 The sentinel body is optional JSON ``{"reason": ..., "engaged_at": ...}``.
 A corrupt or empty file still counts as engaged (fail safe): the pause must
@@ -29,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat as stat_module
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,7 +60,7 @@ def sentinel_path() -> Path:
 
 
 def is_engaged() -> bool:
-    """Cheap check (one lstat): is the global emergency stop engaged?
+    """Cheap filesystem check: is the global emergency stop engaged?
 
     Fail SAFE on stat errors: if we cannot determine whether the sentinel
     exists (permission error, transient I/O failure on HERMES_HOME), report
@@ -66,12 +69,56 @@ def is_engaged() -> bool:
     operator's emergency stop exactly when the filesystem is misbehaving.
     """
     try:
-        os.lstat(sentinel_path())
+        path = sentinel_path()
+    except Exception:
+        return True
+    try:
+        os.lstat(path)
     except FileNotFoundError:
-        return False
+        # ENOENT also means "missing" when any ancestor is a broken symlink.
+        # Only accept it as an absent ESTOP below a usable directory, then
+        # retry the leaf in case an operator engaged the stop during the walk.
+        if not _missing_path_has_usable_ancestor(path.parent):
+            return True
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
     except OSError:
         return True
     return True
+
+
+def _missing_path_has_usable_ancestor(path: Path) -> bool:
+    """Return True only when *path* is missing below a usable directory.
+
+    ``lstat`` reports ``ENOENT`` both for an absent leaf and for a path below
+    a broken symlink. Walk upward without following entries until an existing
+    ancestor is found, then follow only that entry when it is a symlink. Any
+    lookup failure keeps the emergency stop engaged.
+    """
+    candidate = path
+    while True:
+        try:
+            info = os.lstat(candidate)
+        except FileNotFoundError:
+            parent = candidate.parent
+            if parent == candidate:
+                return False
+            candidate = parent
+            continue
+        except OSError:
+            return False
+        if stat_module.S_ISLNK(info.st_mode):
+            try:
+                followed = os.stat(candidate)
+            except OSError:
+                return False
+            return stat_module.S_ISDIR(followed.st_mode)
+        return stat_module.S_ISDIR(info.st_mode)
 
 
 def engage(reason: Optional[str] = None) -> Path:

@@ -97,6 +97,28 @@ def test_estop_blocks_ready_and_review_claims_without_run_rows(
     assert kb.claim_review_task(conn, review_id) is not None
 
 
+@pytest.mark.linux_only
+def test_broken_estop_ancestor_blocks_claim_and_final_spawn(tmp_path, monkeypatch):
+    """A broken HERMES_HOME ancestor must hold every dispatch edge closed."""
+    broken = tmp_path / "broken-home"
+    broken.symlink_to(tmp_path / "missing-home", target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(broken / "profiles" / "planner"))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(conn, title="ready", assignee="default")
+
+    assert kb.claim_task(conn, task_id) is None
+    assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+
+    task = kb.get_task(conn, task_id)
+    with pytest.raises(kb.DispatchPausedError, match="global emergency stop"):
+        kb._default_spawn(task, str(tmp_path))
+
+    assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+
+
 @pytest.mark.parametrize("lane", ["ready", "review"])
 @pytest.mark.parametrize("brake", ["halt", "estop"])
 def test_stop_engaged_during_claim_lock_wait_blocks_transaction(

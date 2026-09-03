@@ -1308,9 +1308,18 @@ brake = root / __BRAKE_RELATIVE__
 brake_mode = __BRAKE_MODE__
 popen_calls = []
 real_lstat = os.lstat
+original_hermes_home = os.environ["HERMES_HOME"]
+broken_home_link = root / "broken-hermes-home"
 
 def disarm_brake():
     os.lstat = real_lstat
+    os.environ["HERMES_HOME"] = original_hermes_home
+    if brake_mode == "broken_ancestor":
+        try:
+            broken_home_link.unlink()
+        except FileNotFoundError:
+            pass
+        return
     try:
         brake.unlink()
     except FileNotFoundError:
@@ -1334,12 +1343,31 @@ def arm_brake():
                 raise PermissionError("ESTOP lookup denied")
             return real_lstat(path, *args, **kwargs)
         os.lstat = failed_lstat
+    elif brake_mode == "broken_ancestor":
+        try:
+            broken_home_link.symlink_to(
+                root / "missing-hermes-home", target_is_directory=True
+            )
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                raise SystemExit(0)
+            raise
+        os.environ["HERMES_HOME"] = str(
+            broken_home_link / "profiles" / "planner"
+        )
     else:
         raise RuntimeError("unknown brake mode")
 
 def brake_is_armed():
     if brake_mode == "lookup_error":
         return True
+    if brake_mode == "broken_ancestor":
+        from agent import estop
+        try:
+            os.lstat(broken_home_link)
+        except OSError:
+            return False
+        return estop.is_engaged()
     try:
         os.lstat(brake)
     except OSError:
@@ -1541,7 +1569,12 @@ raise SystemExit(0 if ok else 1)
                     "ESTOP",
                     brake_mode=mode,
                 )
-                for mode in ("regular", "broken_symlink", "lookup_error")
+                for mode in (
+                    "regular",
+                    "broken_symlink",
+                    "lookup_error",
+                    "broken_ancestor",
+                )
             ),
         )
 

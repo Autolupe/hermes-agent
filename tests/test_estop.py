@@ -83,6 +83,32 @@ def test_broken_symlink_sentinel_still_engages(hermes_home):
     assert estop.check_paused("kanban", logging.getLogger(__name__)) is True
 
 
+@pytest.mark.linux_only
+@pytest.mark.parametrize("broken_at_home", [True, False])
+def test_broken_hermes_home_ancestor_fails_closed(
+    hermes_home, monkeypatch, broken_at_home
+):
+    """A broken HERMES_HOME path must never make ESTOP look absent."""
+    broken = hermes_home / "broken-home"
+    broken.symlink_to(hermes_home / "missing-home", target_is_directory=True)
+    active_home = broken if broken_at_home else broken / "profiles" / "planner"
+    monkeypatch.setenv("HERMES_HOME", str(active_home))
+
+    assert estop.is_engaged() is True
+    assert estop.get_state() == {"reason": None, "engaged_at": None}
+    assert estop.check_paused("kanban", logging.getLogger(__name__)) is True
+
+
+def test_genuinely_missing_hermes_home_below_real_parent_is_not_engaged(
+    hermes_home, monkeypatch
+):
+    """An absent home under a real directory remains a normal no-ESTOP case."""
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home / "missing-home"))
+
+    assert estop.is_engaged() is False
+    assert estop.get_state() is None
+
+
 # ── paused notice for new gateway turns ─────────────────────────────────────
 
 
