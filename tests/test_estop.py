@@ -229,7 +229,7 @@ def test_symlinked_profile_directory_fails_closed_without_external_delete(
 async def test_gateway_pause_off_anchors_profile_during_symlink_swap(
     tmp_path, monkeypatch
 ):
-    """A profile replaced after capture cannot redirect the real chat cleanup."""
+    """Chat cleanup stays on the captured directory after a profile swap."""
     from gateway.run import GatewayRunner
 
     root = tmp_path / "shared-root"
@@ -261,7 +261,7 @@ async def test_gateway_pause_off_anchors_profile_during_symlink_swap(
 
     assert "hermes is still paused" in reply.lower()
     assert external_stop.is_file()
-    assert (moved_profile / "ESTOP").is_file()
+    assert not (moved_profile / "ESTOP").exists()
 
 
 def test_profile_redirect_detector_rejects_windows_reparse_attribute():
@@ -281,7 +281,10 @@ def test_linux_mountinfo_path_decoder_preserves_literal_escape_text():
 
 
 @pytest.mark.linux_only
-@pytest.mark.parametrize("mounted_kind", ["profile", "profiles_root"])
+@pytest.mark.parametrize(
+    "mounted_kind",
+    ["profile", "profiles_root", "post_anchor_profiles_root"],
+)
 def test_gateway_pause_off_rejects_real_bind_mounted_profiles(
     tmp_path, mounted_kind
 ):
@@ -296,6 +299,7 @@ def test_gateway_pause_off_rejects_real_bind_mounted_profiles(
     profiles_root.mkdir(parents=True)
     outside = tmp_path / "outside-profile"
     outside.mkdir()
+    original_stop = root / "unused-original-stop"
     if mounted_kind == "profile":
         mount_target = profiles_root / "mounted"
         mount_target.mkdir()
@@ -305,6 +309,11 @@ def test_gateway_pause_off_rejects_real_bind_mounted_profiles(
         outside_profile = outside / "mounted"
         outside_profile.mkdir()
         external_stop = outside_profile / "ESTOP"
+        if mounted_kind == "post_anchor_profiles_root":
+            original_profile = profiles_root / "mounted"
+            original_profile.mkdir()
+            original_stop = original_profile / "ESTOP"
+            original_stop.write_text("{}\n", encoding="utf-8")
     external_stop.write_text("{}\n", encoding="utf-8")
     child = r'''
 import asyncio
@@ -318,12 +327,34 @@ root = Path(sys.argv[1])
 outside = Path(sys.argv[2])
 mount_target = Path(sys.argv[3])
 external_stop = Path(sys.argv[5])
+mounted_kind = sys.argv[6]
 subprocess.run([sys.argv[4], "--make-rprivate", "/"], check=True)
-subprocess.run([sys.argv[4], "--bind", str(outside), str(mount_target)], check=True)
+if mounted_kind != "post_anchor_profiles_root":
+    subprocess.run(
+        [sys.argv[4], "--bind", str(outside), str(mount_target)],
+        check=True,
+    )
 os.environ["HERMES_HOME"] = str(root)
 
 from agent import estop
 from gateway.run import GatewayRunner
+
+if mounted_kind == "post_anchor_profiles_root":
+    original_fd_mount_id = estop._fd_mount_id
+    mount_id_calls = 0
+
+    def mount_after_profiles_anchor(fd):
+        global mount_id_calls
+        result = original_fd_mount_id(fd)
+        mount_id_calls += 1
+        if mount_id_calls == 2:
+            subprocess.run(
+                [sys.argv[4], "--bind", str(outside), str(mount_target)],
+                check=True,
+            )
+        return result
+
+    estop._fd_mount_id = mount_after_profiles_anchor
 
 class Event:
     def get_command_args(self):
@@ -350,6 +381,7 @@ print(json.dumps({
             str(mount_target),
             mount,
             str(external_stop),
+            mounted_kind,
         ],
         cwd=os.fspath(Path(__file__).resolve().parents[1]),
         capture_output=True,
@@ -363,6 +395,8 @@ print(json.dumps({
     assert "hermes is still paused" in payload["reply"].lower()
     assert payload["external_stop_present"] is True
     assert external_stop.is_file()
+    if mounted_kind == "post_anchor_profiles_root":
+        assert not original_stop.exists()
 
 
 @pytest.mark.windows_only

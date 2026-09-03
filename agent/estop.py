@@ -63,6 +63,7 @@ class _CleanupTarget(NamedTuple):
     logical_path: Path
     physical_parent: Path
     parent_identity: tuple[object, ...]
+    parent_fd: int | None = None
 
 
 def _hermes_home() -> Path:
@@ -226,6 +227,29 @@ def _is_profile_mount_point(
     return normalized in linux_mount_points
 
 
+def _fd_mount_id(fd: int) -> int | None:
+    """Return the Linux mount ID for an already-open directory."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        lines = Path(f"/proc/self/fdinfo/{fd}").read_text(
+            encoding="utf-8",
+            errors="strict",
+        ).splitlines()
+        values = [
+            line.partition(":")[2].strip()
+            for line in lines
+            if line.startswith("mnt_id:")
+        ]
+        if len(values) != 1:
+            raise ValueError("missing or repeated mount ID")
+        return int(values[0])
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise OSError(
+            "Linux directory mount identity could not be checked safely"
+        ) from exc
+
+
 def _stat_identity(info: object) -> tuple[object, ...]:
     """Return stable directory identity fields available on every host."""
     return (
@@ -282,8 +306,228 @@ def _capture_cleanup_target(
     return _CleanupTarget(path, physical_parent, parent_identity)
 
 
+def _supports_anchored_cleanup() -> bool:
+    """Return whether this host can keep cleanup below open directories."""
+    supports_dir_fd = getattr(os, "supports_dir_fd", set())
+    supports_fd = getattr(os, "supports_fd", set())
+    return (
+        os.name != "nt"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and os.open in supports_dir_fd
+        and os.stat in supports_dir_fd
+        and os.unlink in supports_dir_fd
+        and os.scandir in supports_fd
+    )
+
+
+def _directory_open_flags() -> int:
+    """Open a real directory without following its final path component."""
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _optional_entry_info(parent_fd: int, name: str) -> object | None:
+    """Read an entry below an open directory, retrying a missing leaf once."""
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+
+def _reject_child_mount(
+    parent_fd: int,
+    child_fd: int,
+    message: str,
+) -> None:
+    """Reject a mounted child using identities from open directories."""
+    parent_info = os.fstat(parent_fd)
+    child_info = os.fstat(child_fd)
+    if getattr(parent_info, "st_dev", None) != getattr(
+        child_info,
+        "st_dev",
+        None,
+    ):
+        raise OSError(message)
+    parent_mount_id = _fd_mount_id(parent_fd)
+    child_mount_id = _fd_mount_id(child_fd)
+    if parent_mount_id is not None and child_mount_id != parent_mount_id:
+        raise OSError(message)
+
+
+def _capture_anchored_cleanup_target(
+    logical_path: Path,
+    physical_parent: Path,
+    parent_fd: int,
+) -> _CleanupTarget | None:
+    """Keep an open copy of a present stop's validated parent directory."""
+    if _optional_entry_info(parent_fd, logical_path.name) is None:
+        return None
+    parent_identity = _stat_identity(os.fstat(parent_fd))
+    return _CleanupTarget(
+        logical_path,
+        physical_parent,
+        parent_identity,
+        os.dup(parent_fd),
+    )
+
+
+def _close_cleanup_target_fds(targets: list[_CleanupTarget]) -> None:
+    """Close retained directory descriptors after failed discovery."""
+    for target in targets:
+        if target.parent_fd is not None:
+            try:
+                os.close(target.parent_fd)
+            except OSError:
+                pass
+
+
+def _posix_sentinel_cleanup_targets() -> tuple[_CleanupTarget, ...]:
+    """Discover stops through directories held open for the later unlink."""
+    shared = sentinel_path()
+    legacy = _active_hermes_home() / SENTINEL_NAME
+    try:
+        physical_root = shared.parent.resolve(strict=True)
+    except FileNotFoundError:
+        if not _missing_path_has_usable_ancestor(shared.parent.parent):
+            raise OSError("shared Hermes root ancestry is not usable") from None
+        try:
+            physical_root = shared.parent.resolve(strict=True)
+        except FileNotFoundError:
+            if legacy != shared and _path_is_engaged(legacy):
+                raise OSError("an active legacy stop is outside the shared root")
+            return ()
+    except (OSError, RuntimeError) as exc:
+        raise OSError("shared Hermes root could not be resolved safely") from exc
+
+    try:
+        root_info = os.stat(physical_root, follow_symlinks=False)
+    except OSError as exc:
+        raise OSError("shared Hermes root could not be checked safely") from exc
+    if (
+        not stat_module.S_ISDIR(root_info.st_mode)
+        or _is_unsafe_profile_redirect(root_info)
+    ):
+        raise OSError("shared Hermes root is not a real directory")
+
+    root_fd: int | None = None
+    profiles_fd: int | None = None
+    captured: list[_CleanupTarget] = []
+    covered_parent_identities: set[tuple[object, ...]] = set()
+    try:
+        root_fd = os.open(physical_root, _directory_open_flags())
+        opened_root_info = os.fstat(root_fd)
+        if _stat_identity(opened_root_info) != _stat_identity(root_info):
+            raise OSError("shared Hermes root changed during stop discovery")
+        root_identity = _stat_identity(opened_root_info)
+        covered_parent_identities.add(root_identity)
+
+        shared_target = _capture_anchored_cleanup_target(
+            shared,
+            physical_root,
+            root_fd,
+        )
+        if shared_target is not None:
+            captured.append(shared_target)
+
+        profiles_info = _optional_entry_info(root_fd, "profiles")
+        if profiles_info is not None:
+            if (
+                not stat_module.S_ISDIR(profiles_info.st_mode)
+                or _is_unsafe_profile_redirect(profiles_info)
+            ):
+                raise OSError("profiles path is not a real, unredirected directory")
+            profiles_fd = os.open(
+                "profiles",
+                _directory_open_flags(),
+                dir_fd=root_fd,
+            )
+            opened_profiles_info = os.fstat(profiles_fd)
+            if _stat_identity(opened_profiles_info) != _stat_identity(profiles_info):
+                raise OSError("profiles directory changed during stop discovery")
+            _reject_child_mount(
+                root_fd,
+                profiles_fd,
+                "profiles path is a mounted directory",
+            )
+
+            with os.scandir(profiles_fd) as entries:
+                profile_names = sorted(entry.name for entry in entries)
+            for profile_name in profile_names:
+                profile_info = _optional_entry_info(profiles_fd, profile_name)
+                if profile_info is None:
+                    raise OSError("profile directory changed during stop discovery")
+                if _is_unsafe_profile_redirect(profile_info):
+                    raise OSError("redirected profile directory is unsafe")
+                if not stat_module.S_ISDIR(profile_info.st_mode):
+                    continue
+
+                profile_fd = os.open(
+                    profile_name,
+                    _directory_open_flags(),
+                    dir_fd=profiles_fd,
+                )
+                try:
+                    opened_profile_info = os.fstat(profile_fd)
+                    if _stat_identity(opened_profile_info) != _stat_identity(
+                        profile_info
+                    ):
+                        raise OSError(
+                            "profile directory changed during stop discovery"
+                        )
+                    _reject_child_mount(
+                        profiles_fd,
+                        profile_fd,
+                        "mounted profile directory is unsafe",
+                    )
+                    covered_parent_identities.add(
+                        _stat_identity(opened_profile_info)
+                    )
+                    logical_parent = shared.parent / "profiles" / profile_name
+                    target = _capture_anchored_cleanup_target(
+                        logical_parent / SENTINEL_NAME,
+                        physical_root / "profiles" / profile_name,
+                        profile_fd,
+                    )
+                    if target is not None:
+                        captured.append(target)
+                finally:
+                    os.close(profile_fd)
+
+        if legacy != shared and _path_is_engaged(legacy):
+            try:
+                legacy_parent = legacy.parent.resolve(strict=True)
+                legacy_info = os.stat(legacy_parent, follow_symlinks=False)
+            except (OSError, RuntimeError) as exc:
+                raise OSError("active legacy stop could not be checked safely") from exc
+            if _stat_identity(legacy_info) not in covered_parent_identities:
+                raise OSError(
+                    "an active legacy stop is outside the anchored profile tree"
+                )
+
+        return tuple(sorted(captured, key=lambda target: str(target.logical_path)))
+    except BaseException:
+        _close_cleanup_target_fds(captured)
+        raise
+    finally:
+        if profiles_fd is not None:
+            os.close(profiles_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+
+
 def _sentinel_cleanup_targets() -> tuple[_CleanupTarget, ...]:
     """Capture deletions so a later path replacement cannot redirect them."""
+    if _supports_anchored_cleanup():
+        return _posix_sentinel_cleanup_targets()
+
     shared = sentinel_path()
     legacy = _active_hermes_home() / SENTINEL_NAME
     candidates: dict[Path, tuple[object, ...] | None] = {shared: None}
@@ -355,6 +599,20 @@ def _unlink_windows_cleanup_target(target: _CleanupTarget) -> None:
 
 def _unlink_cleanup_target(target: _CleanupTarget) -> None:
     """Delete a stop through a directory that still has captured identity."""
+    if target.parent_fd is not None:
+        try:
+            if target.logical_path.name != SENTINEL_NAME:
+                raise OSError("refusing to remove an unexpected stop filename")
+            if (
+                _stat_identity(os.fstat(target.parent_fd))
+                != target.parent_identity
+            ):
+                raise OSError("stop parent changed before cleanup")
+            os.unlink(target.logical_path.name, dir_fd=target.parent_fd)
+        finally:
+            os.close(target.parent_fd)
+        return
+
     if target.logical_path.name != SENTINEL_NAME:
         raise OSError("refusing to remove an unexpected stop filename")
     if os.name == "nt":
