@@ -72,6 +72,17 @@ def test_corrupt_sentinel_still_engages(hermes_home):
     assert state.get("reason") is None
 
 
+@pytest.mark.linux_only
+def test_broken_symlink_sentinel_still_engages(hermes_home):
+    """A broken ESTOP link is still an authoritative stop entry."""
+    sentinel = hermes_home / "ESTOP"
+    sentinel.symlink_to(hermes_home / "missing-estop-target")
+
+    assert estop.is_engaged() is True
+    assert estop.get_state() == {"reason": None, "engaged_at": None}
+    assert estop.check_paused("kanban", logging.getLogger(__name__)) is True
+
+
 # ── paused notice for new gateway turns ─────────────────────────────────────
 
 
@@ -294,12 +305,17 @@ def test_is_engaged_fails_safe_on_stat_error(hermes_home, monkeypatch):
     """A stat failure must report ENGAGED (fail safe) — the pause has to
     hold even when HERMES_HOME is misbehaving, matching the module's
     corrupt-sentinel doctrine."""
-    class _BoomPath:
-        def exists(self):
-            raise OSError("permission denied")
+    sentinel = hermes_home / "ESTOP"
+    real_lstat = estop.os.lstat
 
-    monkeypatch.setattr(estop, "sentinel_path", lambda: _BoomPath())
+    def denied_lstat(path, *args, **kwargs):
+        if path == sentinel:
+            raise PermissionError("permission denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(estop.os, "lstat", denied_lstat)
     assert estop.is_engaged() is True
+    assert estop.get_state() == {"reason": None, "engaged_at": None}
 
 
 class _FakeCmdEvent(_FakeEvent):

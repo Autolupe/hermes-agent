@@ -95,6 +95,33 @@ def test_estop_blocks_ready_and_review_claims_without_run_rows(
     assert kb.claim_review_task(conn, review_id) is not None
 
 
+@pytest.mark.linux_only
+def test_broken_estop_entry_blocks_dispatch_boundary(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    (tmp_path / "ESTOP").symlink_to(tmp_path / "missing-estop-target")
+
+    with pytest.raises(kb.DispatchPausedError, match="emergency stop"):
+        kb._raise_if_dispatch_paused()
+
+
+def test_estop_lstat_error_blocks_dispatch_boundary(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    target = tmp_path / "ESTOP"
+    real_lstat = estop.os.lstat
+
+    def denied_lstat(path, *args, **kwargs):
+        if path == target:
+            raise PermissionError("ESTOP lookup denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(estop.os, "lstat", denied_lstat)
+
+    with pytest.raises(kb.DispatchPausedError, match="emergency stop"):
+        kb._raise_if_dispatch_paused()
+
+
 @pytest.mark.parametrize("brake_name", ["dispatch_pause.json", "halt.json"])
 def test_dispatch_brake_directory_entry_blocks(tmp_path, monkeypatch, brake_name):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))

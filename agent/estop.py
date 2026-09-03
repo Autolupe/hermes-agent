@@ -10,9 +10,9 @@
   agent run (``gateway/run.py:_handle_message``).
 
 In-flight work is NEVER killed — this is pause-new-work, not panic/exit.
-The check is a single ``os.stat`` so callers may run it every tick; no
-caching beyond the OS is performed, so engaging/disengaging takes effect on
-the very next check.
+The check is a single ``os.lstat`` so every directory entry, including a
+broken symlink, holds the stop. Callers may run it every tick; no caching beyond
+the OS is performed, so engaging/disengaging takes effect on the next check.
 
 The sentinel body is optional JSON ``{"reason": ..., "engaged_at": ...}``.
 A corrupt or empty file still counts as engaged (fail safe): the pause must
@@ -57,7 +57,7 @@ def sentinel_path() -> Path:
 
 
 def is_engaged() -> bool:
-    """Cheap check (one stat): is the global emergency stop engaged?
+    """Cheap check (one lstat): is the global emergency stop engaged?
 
     Fail SAFE on stat errors: if we cannot determine whether the sentinel
     exists (permission error, transient I/O failure on HERMES_HOME), report
@@ -66,9 +66,12 @@ def is_engaged() -> bool:
     operator's emergency stop exactly when the filesystem is misbehaving.
     """
     try:
-        return sentinel_path().exists()
+        os.lstat(sentinel_path())
+    except FileNotFoundError:
+        return False
     except OSError:
         return True
+    return True
 
 
 def engage(reason: Optional[str] = None) -> Path:
@@ -108,7 +111,7 @@ def get_state() -> Optional[dict]:
     both fields None — the pause is authoritative, the metadata is not.
     """
     path = sentinel_path()
-    if not path.exists():
+    if not is_engaged():
         return None
     reason = None
     engaged_at = None

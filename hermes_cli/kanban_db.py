@@ -1287,10 +1287,16 @@ raise SystemExit(0 if ok else 1)
 
         _run("lookup_errors_fail_closed", _lookup_error_probe)
 
-        def _final_spawn_probe(name: str, brake_relative: str) -> bool:
+        def _final_spawn_probe(
+            name: str,
+            brake_relative: str,
+            *,
+            brake_mode: str = "regular",
+        ) -> bool:
             root = _root(base, name)
             child_code = """
 import inspect
+import os
 import sqlite3
 import sys
 import types
@@ -1299,7 +1305,46 @@ from hermes_cli import kanban_db as kb
 
 root = Path(kb.os.environ["HERMES_KANBAN_HOME"])
 brake = root / __BRAKE_RELATIVE__
+brake_mode = __BRAKE_MODE__
 popen_calls = []
+real_lstat = os.lstat
+
+def disarm_brake():
+    os.lstat = real_lstat
+    try:
+        brake.unlink()
+    except FileNotFoundError:
+        pass
+
+def arm_brake():
+    disarm_brake()
+    brake.parent.mkdir(parents=True, exist_ok=True)
+    if brake_mode == "regular":
+        brake.write_text("{}\\n", encoding="utf-8")
+    elif brake_mode == "broken_symlink":
+        try:
+            brake.symlink_to(root / "missing-estop-target")
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                raise SystemExit(0)
+            raise
+    elif brake_mode == "lookup_error":
+        def failed_lstat(path, *args, **kwargs):
+            if Path(path) == brake:
+                raise PermissionError("ESTOP lookup denied")
+            return real_lstat(path, *args, **kwargs)
+        os.lstat = failed_lstat
+    else:
+        raise RuntimeError("unknown brake mode")
+
+def brake_is_armed():
+    if brake_mode == "lookup_error":
+        return True
+    try:
+        os.lstat(brake)
+    except OSError:
+        return False
+    return True
 
 # Exercise the real final Popen edge without importing the normal gateway or
 # profile/config startup graphs. Those graphs can discover user plugins, which
@@ -1317,8 +1362,7 @@ sys.modules["gateway"] = gateway
 sys.modules["gateway.session_context"] = session_context
 
 def brake_during_setup(*_args, **_kwargs):
-    brake.parent.mkdir(parents=True, exist_ok=True)
-    brake.write_text("{}\\n", encoding="utf-8")
+    arm_brake()
     return None
 
 def fake_popen(*_args, **_kwargs):
@@ -1350,14 +1394,13 @@ task = kb.Task(
 try:
     kb._default_spawn(task, str(root))
 except kb.DispatchPausedError:
-    default_ok = brake.is_file() and popen_calls == []
+    default_ok = brake_is_armed() and popen_calls == []
 except Exception:
     default_ok = False
 else:
     default_ok = False
 
-if brake.is_file():
-    brake.unlink()
+disarm_brake()
 kb._fire_kanban_lifecycle_hook = lambda *_args, **_kwargs: None
 kb.review_dispatch_enabled = lambda: True
 
@@ -1371,8 +1414,7 @@ def direct_claims_block():
         "UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,)
     )
     conn.commit()
-    brake.parent.mkdir(parents=True, exist_ok=True)
-    brake.write_text("{}\\n", encoding="utf-8")
+    arm_brake()
     ready_claim = kb.claim_task(conn, ready_id)
     review_claim = kb.claim_review_task(conn, review_id)
     run_count = conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
@@ -1390,8 +1432,7 @@ def direct_claims_block():
     )
 
 direct_claims_ok = direct_claims_block()
-if brake.is_file():
-    brake.unlink()
+disarm_brake()
 
 def injected_lane_blocks(lane):
     conn = sqlite3.connect(":memory:")
@@ -1420,8 +1461,7 @@ def injected_lane_blocks(lane):
     def brake_before_guard(callable_obj):
         signature = real_signature(callable_obj)
         if callable_obj is injected_spawn:
-            brake.parent.mkdir(parents=True, exist_ok=True)
-            brake.write_text("{}\\n", encoding="utf-8")
+            arm_brake()
         return signature
 
     inspect.signature = brake_before_guard
@@ -1457,9 +1497,9 @@ def injected_lane_blocks(lane):
     return lane_ok
 
 ready_ok = injected_lane_blocks("ready")
-if brake.is_file():
-    brake.unlink()
+disarm_brake()
 review_ok = injected_lane_blocks("review")
+disarm_brake()
 
 ok = default_ok and direct_claims_ok and ready_ok and review_ok and not any(
     name == "plugins.model_providers"
@@ -1470,6 +1510,9 @@ raise SystemExit(0 if ok else 1)
 """
             child_code = child_code.replace(
                 "__BRAKE_RELATIVE__", repr(brake_relative)
+            )
+            child_code = child_code.replace(
+                "__BRAKE_MODE__", repr(brake_mode)
             )
             child = subprocess.run(
                 [sys.executable, "-c", child_code],
@@ -1492,7 +1535,14 @@ raise SystemExit(0 if ok else 1)
         )
         _run(
             "estop_blocks_final_spawn_edge",
-            lambda: _final_spawn_probe("final-spawn-estop", "ESTOP"),
+            lambda: all(
+                _final_spawn_probe(
+                    f"final-spawn-estop-{mode}",
+                    "ESTOP",
+                    brake_mode=mode,
+                )
+                for mode in ("regular", "broken_symlink", "lookup_error")
+            ),
         )
 
         def _gateway_auto_decompose_edge_probe() -> bool:
