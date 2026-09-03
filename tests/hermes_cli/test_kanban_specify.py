@@ -171,6 +171,35 @@ def test_specify_task_reports_transaction_boundary_stop_as_paused(
     assert "paused or halted" in outcome.reason
 
 
+def test_specify_task_reports_a_late_post_commit_stop_as_parked(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+    content = jsonlib.dumps({"title": "Refined", "body": "Committed body"})
+    patcher, _model_call = _patch_aux_client(content)
+    original_recompute = kb.recompute_ready
+
+    def stop_after_commit(conn, *args, **kwargs):
+        _engage_planning_brake(kanban_home, "halt")
+        raise kb.DispatchPausedError("stop engaged after specification commit")
+
+    monkeypatch.setattr(kb, "recompute_ready", stop_after_commit)
+    with patcher:
+        outcome = spec.specify_task(tid, author="ace")
+    monkeypatch.setattr(kb, "recompute_ready", original_recompute)
+
+    assert outcome.ok is True
+    assert outcome.parked is True
+    assert "paused or halted" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "todo"
+    assert task.title == "Refined"
+
+
 
 
 
@@ -215,4 +244,3 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
         assert kb.get_task(conn, outside).status == "triage"
         # The inside task was promoted.
         assert kb.get_task(conn, inside).status in {"todo", "ready"}
-

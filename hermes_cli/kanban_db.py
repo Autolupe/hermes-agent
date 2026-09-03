@@ -8542,7 +8542,13 @@ def specify_triage_task(
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn, require_dispatch_allowed=True)
+    try:
+        recompute_ready(conn, require_dispatch_allowed=True)
+    except DispatchPausedError:
+        # The specification transaction already committed. A stop that lands
+        # before this separate promotion transaction leaves the task safely in
+        # todo; report the committed mutation instead of pretending it failed.
+        pass
     return True
 
 
@@ -8788,7 +8794,13 @@ def decompose_triage_task(
     # stay in 'todo' until the user manually promotes them — useful
     # for manual-review-first workflows.
     if auto_promote:
-        recompute_ready(conn, require_dispatch_allowed=True)
+        try:
+            recompute_ready(conn, require_dispatch_allowed=True)
+        except DispatchPausedError:
+            # Child creation and root promotion already committed atomically.
+            # A late stop keeps every child in todo, which is the safe parked
+            # result callers need to report as committed rather than failed.
+            pass
     return child_ids
 
 

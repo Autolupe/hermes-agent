@@ -97,6 +97,7 @@ class SpecifyOutcome:
     ok: bool
     reason: str = ""
     new_title: Optional[str] = None
+    parked: bool = False
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -271,7 +272,14 @@ def specify_task(
         return SpecifyOutcome(
             task_id, False, "task moved out of triage before promotion"
         )
-    return SpecifyOutcome(task_id, True, "specified", new_title=new_title)
+    parked = _new_work_is_blocked()
+    return SpecifyOutcome(
+        task_id,
+        True,
+        "specified; dispatch is paused or halted" if parked else "specified",
+        new_title=new_title,
+        parked=parked,
+    )
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:

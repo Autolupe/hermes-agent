@@ -49,6 +49,10 @@ _log_lock = threading.Lock()
 _logged_components: set[str] = set()
 
 
+class DisengageError(RuntimeError):
+    """The emergency stop could not be removed or verified safely."""
+
+
 def _hermes_home() -> Path:
     """Resolve the shared Hermes root at call time, folding named profiles."""
     try:
@@ -206,13 +210,15 @@ def engage(reason: Optional[str] = None) -> Path:
 
 
 def disengage() -> bool:
-    """Remove global and all legacy profile sentinels if safely possible."""
+    """Remove every stop, raising when safe cleanup cannot be proved."""
     removed = False
     failed = False
     try:
         paths = _sentinel_paths()
-    except Exception:
-        return False
+    except Exception as exc:
+        raise DisengageError(
+            "the shared or legacy profile stop paths could not be checked safely"
+        ) from exc
     for path in paths:
         try:
             path.unlink()
@@ -221,11 +227,21 @@ def disengage() -> bool:
             continue
         except OSError:
             failed = True
-    if failed or not removed:
+    if failed:
+        raise DisengageError(
+            "one or more stop files could not be removed safely"
+        )
+    if not removed:
+        if is_engaged():
+            raise DisengageError(
+                "the stop state remains engaged or unreadable"
+            )
         return False
     # Re-enumerate after deletion so a sibling legacy stop created during the
     # cleanup cannot be missed by the paths snapshot above.
-    return not is_engaged()
+    if is_engaged():
+        raise DisengageError("a stop is still present after cleanup")
+    return True
 
 
 def get_state() -> Optional[dict]:

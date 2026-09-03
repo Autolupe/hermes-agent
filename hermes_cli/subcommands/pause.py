@@ -13,6 +13,7 @@ Ported from: gastownhall/gastown estop.go (MIT); related prior art:
 from __future__ import annotations
 
 import argparse
+import sys
 
 
 def cmd_pause(args: argparse.Namespace) -> int:
@@ -36,12 +37,18 @@ def cmd_pause(args: argparse.Namespace) -> int:
 
 def cmd_resume(args: argparse.Namespace) -> int:
     """Disengage the global emergency stop."""
-    from agent.estop import disengage, sentinel_path
+    from agent.estop import DisengageError, disengage, sentinel_path
 
-    if disengage():
+    try:
+        removed = disengage()
+    except DisengageError as exc:
+        print(f"Hermes is still paused — {exc}.", file=sys.stderr)
+        print(f"    sentinel: {sentinel_path()}", file=sys.stderr)
+        return 1
+    if removed:
         print("▶️  Hermes resumed — dispatch picks up on the next tick.")
-    else:
-        print(f"Hermes is not paused (no sentinel at {sentinel_path()}).")
+        return 0
+    print(f"Hermes is not paused (no sentinel at {sentinel_path()}).")
     return 0
 
 

@@ -113,6 +113,52 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_reports_a_late_post_commit_stop_with_parked_children(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship safely", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test split",
+        "tasks": [
+            {"title": "first", "body": "one", "assignee": "worker", "parents": []},
+            {"title": "second", "body": "two", "assignee": "worker", "parents": []},
+        ],
+    })
+    patches = _patch_list_profiles(["orchestrator", "worker"])
+    for item in patches:
+        item.start()
+    original_recompute = kb.recompute_ready
+
+    def stop_after_commit(conn, *args, **kwargs):
+        state = kanban_home / "state"
+        state.mkdir(exist_ok=True)
+        (state / "halt.json").write_text("{}\n", encoding="utf-8")
+        raise kb.DispatchPausedError("stop engaged after decomposition commit")
+
+    monkeypatch.setattr(kb, "recompute_ready", stop_after_commit)
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        monkeypatch.setattr(kb, "recompute_ready", original_recompute)
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is True
+    assert outcome.parked is True
+    assert "paused or halted" in outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 2
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        children = [kb.get_task(conn, child_id) for child_id in outcome.child_ids]
+    assert root is not None and root.status == "todo"
+    assert all(child is not None and child.status == "todo" for child in children)
+
+
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="route me safely", triage=True)
@@ -159,5 +205,4 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
             p.stop()
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
-
 

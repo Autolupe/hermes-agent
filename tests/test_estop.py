@@ -195,7 +195,8 @@ def test_symlinked_profile_directory_fails_closed_without_external_delete(
     estop._reset_log_state_for_tests()
 
     assert estop.is_engaged() is True
-    assert estop.disengage() is False
+    with pytest.raises(estop.DisengageError, match="could not be checked safely"):
+        estop.disengage()
     assert external_stop.is_file()
 
 
@@ -389,6 +390,33 @@ def test_cli_resume_when_not_paused(hermes_home, capsys):
     rc = cmd_resume(argparse.Namespace())
     assert rc == 0
     assert "not paused" in capsys.readouterr().out.lower()
+
+
+@pytest.mark.linux_only
+def test_cli_resume_reports_an_unsafe_profile_layout_as_still_paused(
+    tmp_path, monkeypatch, capsys
+):
+    from hermes_cli.subcommands.pause import cmd_resume
+
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profiles_root.mkdir(parents=True)
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    external_stop = outside / "ESTOP"
+    external_stop.write_text("{}\n", encoding="utf-8")
+    (profiles_root / "linked").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    rc = cmd_resume(argparse.Namespace())
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert "still paused" in captured.err.lower()
+    assert "could not be checked safely" in captured.err.lower()
+    assert estop.is_engaged() is True
+    assert external_stop.is_file()
 
 
 def test_builtin_subcommands_include_pause_resume():

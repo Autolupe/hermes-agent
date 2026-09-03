@@ -134,6 +134,7 @@ class DecomposeOutcome:
     fanout: bool = False
     child_ids: list[str] | None = None
     new_title: Optional[str] = None
+    parked: bool = False
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -418,9 +419,18 @@ def decompose_task(
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
             )
+        parked = _new_work_is_blocked()
         return DecomposeOutcome(
-            task_id, True, "single task (no fanout)",
-            fanout=False, new_title=title_val,
+            task_id,
+            True,
+            (
+                "single task committed; dispatch is paused or halted"
+                if parked
+                else "single task (no fanout)"
+            ),
+            fanout=False,
+            new_title=title_val,
+            parked=parked,
         )
 
     raw_tasks = parsed.get("tasks") or []
@@ -504,9 +514,18 @@ def decompose_task(
             task_id, False, "task moved out of triage before decomposition",
         )
 
+    parked = _new_work_is_blocked()
     return DecomposeOutcome(
-        task_id, True, f"decomposed into {len(child_ids)} children",
-        fanout=True, child_ids=child_ids,
+        task_id,
+        True,
+        (
+            f"decomposed into {len(child_ids)} children; dispatch is paused or halted"
+            if parked
+            else f"decomposed into {len(child_ids)} children"
+        ),
+        fanout=True,
+        child_ids=child_ids,
+        parked=parked,
     )
 
 

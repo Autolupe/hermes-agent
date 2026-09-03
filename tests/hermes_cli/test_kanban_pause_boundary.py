@@ -389,9 +389,13 @@ def test_stop_engaged_during_ready_promotion_lock_wait_keeps_todos_parked(
     worker.join(timeout=5)
 
     assert not worker.is_alive()
-    assert outcomes == []
-    assert len(failures) == 1
-    assert isinstance(failures[0], kb.DispatchPausedError)
+    assert failures == []
+    assert len(outcomes) == 1
+    if operation == "specify":
+        assert outcomes[0] is True
+    else:
+        assert isinstance(outcomes[0], list)
+        assert len(outcomes[0]) == 1
     verify = kb.connect(db_path=db_path)
     root = kb.get_task(verify, task_id)
     assert root is not None and root.status == "todo"
