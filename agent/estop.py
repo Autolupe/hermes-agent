@@ -54,6 +54,10 @@ class DisengageError(RuntimeError):
     """The emergency stop could not be removed or verified safely."""
 
 
+class EngageError(RuntimeError):
+    """The emergency stop could not be created or verified safely."""
+
+
 class _LegacySentinelEntry(NamedTuple):
     path: Path
     parent_identity: tuple[object, ...]
@@ -671,7 +675,7 @@ def _path_is_engaged(path: Path) -> bool:
         try:
             os.lstat(path)
         except FileNotFoundError:
-            return False
+            return not _missing_path_has_usable_ancestor(path.parent)
         except OSError:
             return True
         return True
@@ -710,21 +714,27 @@ def _missing_path_has_usable_ancestor(path: Path) -> bool:
 
 
 def engage(reason: Optional[str] = None) -> Path:
-    """Create the ESTOP sentinel. Idempotent; re-engaging updates the file."""
+    """Create and verify the ESTOP sentinel, or report that pause failed."""
     path = sentinel_path()
     payload = {
         "engaged_at": datetime.now(timezone.utc).isoformat(),
         "reason": reason or None,
     }
+    creation_error: OSError | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    except OSError:
+    except OSError as exc:
+        creation_error = exc
         # Best effort: an empty/partial sentinel still pauses (fail safe).
         try:
             path.touch(exist_ok=True)
-        except OSError:
-            pass
+        except OSError as touch_error:
+            creation_error = touch_error
+    if not is_engaged():
+        raise EngageError(
+            "the shared stop file could not be created or verified"
+        ) from creation_error
     return path
 
 

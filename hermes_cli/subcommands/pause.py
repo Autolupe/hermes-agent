@@ -18,11 +18,16 @@ import sys
 
 def cmd_pause(args: argparse.Namespace) -> int:
     """Engage the global emergency stop."""
-    from agent.estop import engage, get_state, is_engaged
+    from agent.estop import EngageError, engage, get_state, is_engaged, sentinel_path
 
     reason = getattr(args, "reason", None)
     already = is_engaged()
-    path = engage(reason=reason)
+    try:
+        path = engage(reason=reason)
+    except EngageError as exc:
+        print(f"Hermes was not paused — {exc}.", file=sys.stderr)
+        print(f"    sentinel: {sentinel_path()}", file=sys.stderr)
+        return 1
     state = get_state() or {}
     verb = "Still paused" if already else "Hermes paused"
     detail = f" — reason: {state['reason']}" if state.get("reason") else ""

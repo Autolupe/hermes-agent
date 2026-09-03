@@ -45,6 +45,35 @@ def test_engage_creates_sentinel_and_is_engaged(hermes_home):
     assert estop.is_engaged() is True
 
 
+def test_engage_reports_when_shared_stop_cannot_be_created(
+    hermes_home, monkeypatch
+):
+    """A failed stop write must not be reported as an active pause."""
+    profile_home = hermes_home / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    sentinel = hermes_home / "ESTOP"
+    real_write_text = estop.Path.write_text
+    real_touch = estop.Path.touch
+
+    def denied_write_text(path, *args, **kwargs):
+        if path == sentinel:
+            raise PermissionError("shared root is read-only")
+        return real_write_text(path, *args, **kwargs)
+
+    def denied_touch(path, *args, **kwargs):
+        if path == sentinel:
+            raise PermissionError("shared root is read-only")
+        return real_touch(path, *args, **kwargs)
+
+    monkeypatch.setattr(estop.Path, "write_text", denied_write_text)
+    monkeypatch.setattr(estop.Path, "touch", denied_touch)
+
+    with pytest.raises(estop.EngageError, match="could not be created"):
+        estop.engage(reason="maintenance")
+    assert estop.is_engaged() is False
+
+
 def test_disengage_removes_sentinel(hermes_home):
     estop.engage()
     assert estop.disengage() is True
@@ -121,6 +150,39 @@ def test_broken_hermes_home_ancestor_fails_closed(
     assert estop.is_engaged() is True
     assert estop.get_state() == {"reason": None, "engaged_at": None}
     assert estop.check_paused("kanban", logging.getLogger(__name__)) is True
+
+
+@pytest.mark.linux_only
+def test_missing_stop_rechecks_ancestor_after_home_symlink_breaks(
+    tmp_path, monkeypatch
+):
+    """A home link broken after the first absence check must stay paused."""
+    physical_home = tmp_path / "physical-home"
+    physical_home.mkdir()
+    configured_home = tmp_path / "configured-home"
+    configured_home.symlink_to(physical_home, target_is_directory=True)
+    missing_target = tmp_path / "missing-home"
+    sentinel = configured_home / "ESTOP"
+    check_ancestor = estop._missing_path_has_usable_ancestor
+    checks = 0
+
+    def check_then_break(path):
+        nonlocal checks
+        result = check_ancestor(path)
+        checks += 1
+        if checks == 1:
+            configured_home.unlink()
+            configured_home.symlink_to(missing_target, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(
+        estop,
+        "_missing_path_has_usable_ancestor",
+        check_then_break,
+    )
+
+    assert estop._path_is_engaged(sentinel) is True
+    assert checks == 2
 
 
 def test_genuinely_missing_hermes_home_below_real_parent_is_not_engaged(
@@ -620,6 +682,22 @@ def test_cli_pause_idempotent(hermes_home, capsys):
     assert estop.is_engaged() is True
 
 
+def test_cli_pause_reports_creation_failure(hermes_home, monkeypatch, capsys):
+    from hermes_cli.subcommands.pause import cmd_pause
+
+    def failed_engage(reason=None):
+        raise estop.EngageError("the shared stop file could not be created")
+
+    monkeypatch.setattr(estop, "engage", failed_engage)
+
+    rc = cmd_pause(argparse.Namespace(reason="maintenance"))
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert "was not paused" in captured.err.lower()
+
+
 def test_cli_resume_disengages(hermes_home, capsys):
     from hermes_cli.subcommands.pause import cmd_pause, cmd_resume
 
@@ -772,6 +850,24 @@ async def test_gateway_pause_command_engages_and_resumes(hermes_home):
 
     reply = await runner._handle_pause_command(_FakePauseEvent("off"))
     assert "wasn't paused" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_gateway_pause_command_reports_creation_failure(
+    hermes_home, monkeypatch
+):
+    from gateway.run import GatewayRunner
+
+    def failed_engage(reason=None):
+        raise estop.EngageError("the shared stop file could not be created")
+
+    monkeypatch.setattr(estop, "engage", failed_engage)
+    runner = object.__new__(GatewayRunner)
+
+    reply = await runner._handle_pause_command(_FakePauseEvent("maintenance"))
+
+    assert "was not paused" in reply.lower()
+    assert "new work may still be accepted" in reply.lower()
 
 
 @pytest.mark.asyncio

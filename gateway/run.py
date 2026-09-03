@@ -16290,7 +16290,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"⏸️ Hermes is already paused{suffix}. "
                 "Use `/pause off` to resume."
             )
-        estop.engage(reason=args or None)
+        try:
+            estop.engage(reason=args or None)
+        except estop.EngageError as exc:
+            return (
+                f"⚠️ Hermes was not paused — {exc}. "
+                "New work may still be accepted."
+            )
         suffix = f" (reason: {args})" if args else ""
         return (
             f"⏸️ Paused{suffix}. New cron/kanban/gateway work is on hold; "
