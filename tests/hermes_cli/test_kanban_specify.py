@@ -92,6 +92,85 @@ def test_specify_task_happy_path(kanban_home):
     assert "**Goal**" in (task.body or "")
 
 
+def _engage_planning_brake(home: Path, brake: str) -> Path:
+    if brake == "estop":
+        path = home / "ESTOP"
+    else:
+        path = home / "state" / "halt.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n", encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("brake", ["halt", "estop"])
+def test_specify_task_existing_stop_blocks_model_and_mutation(
+    kanban_home, monkeypatch, brake
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+    _engage_planning_brake(kanban_home, brake)
+    content = jsonlib.dumps({"title": "must not land", "body": "blocked"})
+    patcher, model_call = _patch_aux_client(content)
+
+    with patcher:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is False
+    assert "paused or halted" in outcome.reason
+    model_call.assert_not_called()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "triage"
+    assert task.title == "rough"
+
+
+@pytest.mark.parametrize("brake", ["halt", "estop"])
+def test_specify_task_stop_during_model_blocks_response_mutation(
+    kanban_home, monkeypatch, brake
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+    content = jsonlib.dumps({"title": "must not land", "body": "blocked"})
+
+    def stop_during_model(**_kwargs):
+        _engage_planning_brake(kanban_home, brake)
+        return _fake_aux_response(content)
+
+    model_call = MagicMock(side_effect=stop_during_model)
+    with patch("agent.auxiliary_client.call_llm", model_call):
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is False
+    assert "paused or halted" in outcome.reason
+    model_call.assert_called_once()
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None and task.status == "triage"
+    assert task.title == "rough"
+
+
+def test_specify_task_reports_transaction_boundary_stop_as_paused(
+    kanban_home, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+    content = jsonlib.dumps({"title": "must not land", "body": "blocked"})
+    patcher, _model_call = _patch_aux_client(content)
+
+    def stopped_at_write_boundary(*_args, **_kwargs):
+        raise kb.DispatchPausedError("stop engaged after lock wait")
+
+    monkeypatch.setattr(kb, "specify_triage_task", stopped_at_write_boundary)
+    with patcher:
+        outcome = spec.specify_task(tid, author="ace")
+
+    assert outcome.ok is False
+    assert "paused or halted" in outcome.reason
+
+
 
 
 
@@ -136,5 +215,4 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
         assert kb.get_task(conn, outside).status == "triage"
         # The inside task was promoted.
         assert kb.get_task(conn, inside).status in {"todo", "ready"}
-
 

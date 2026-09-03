@@ -8414,7 +8414,12 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
+    # Keep the cheap check outside the write lock, then repeat it after
+    # BEGIN IMMEDIATE succeeds. A brake may be engaged while this caller is
+    # waiting behind another SQLite writer.
+    _raise_if_dispatch_paused()
     with write_txn(conn):
+        _raise_if_dispatch_paused()
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -8559,6 +8564,10 @@ def decompose_triage_task(
     if _seen != len(children):
         raise ValueError("cyclic dependency detected in decomposed children list")
 
+    # Avoid waiting for a write lock when planning is already stopped. The
+    # authoritative check is repeated inside the acquired transaction below.
+    _raise_if_dispatch_paused()
+
     # We do the full decomposition in a SINGLE write_txn so it's
     # atomic: either every child is created AND the root flips to
     # ``todo``, or nothing changes. We deliberately do NOT call any
@@ -8569,6 +8578,10 @@ def decompose_triage_task(
     now = int(time.time())
     child_ids: list[str] = []
     with write_txn(conn):
+        # BEGIN IMMEDIATE may have waited on another writer. A halt or ESTOP
+        # engaged during that wait must win before any child, link, comment,
+        # event, or root-status mutation.
+        _raise_if_dispatch_paused()
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",

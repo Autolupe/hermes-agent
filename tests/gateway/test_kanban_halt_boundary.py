@@ -361,6 +361,49 @@ def test_decomposer_fanout_brake_during_connection_entry_blocks_mutation(
     )
 
 
+@pytest.mark.parametrize(
+    ("model_response", "helper_name"),
+    [
+        (_decompose_response, "specify_triage_task"),
+        (_fanout_response, "decompose_triage_task"),
+    ],
+)
+def test_decomposer_reports_transaction_boundary_stop_as_paused(
+    tmp_path, monkeypatch, model_response, helper_name
+):
+    task_id, fake_aux = _prepare_decompose_probe(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        decomp,
+        "_build_roster",
+        lambda: (
+            [
+                {
+                    "name": "default",
+                    "description": "test",
+                    "has_description": True,
+                }
+            ],
+            {"default"},
+        ),
+    )
+    fake_aux.call_llm = lambda **_kwargs: model_response()
+
+    def stopped_at_write_boundary(*_args, **_kwargs):
+        raise kb.DispatchPausedError("stop engaged after lock wait")
+
+    monkeypatch.setattr(kb, helper_name, stopped_at_write_boundary)
+
+    outcome = decomp.decompose_task(task_id, author="auto-decomposer")
+
+    assert outcome.ok is False
+    assert "paused or halted" in outcome.reason
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    assert task is not None and task.status == "triage"
+    assert task_count == 1
+
+
 @pytest.mark.parametrize("brake_name", ["dispatch_pause.json", "halt.json"])
 def test_gateway_brake_suppresses_auto_decompose_and_dispatch_tick(
     tmp_path, monkeypatch, brake_name

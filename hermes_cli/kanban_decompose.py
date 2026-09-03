@@ -401,14 +401,19 @@ def decompose_task(
                 return DecomposeOutcome(
                     task_id, False, "dispatch is paused or halted"
                 )
-            ok = kb.specify_triage_task(
-                conn,
-                task_id,
-                title=title_val,
-                body=body_val,
-                assignee=assignee_val,
-                author=audit_author,
-            )
+            try:
+                ok = kb.specify_triage_task(
+                    conn,
+                    task_id,
+                    title=title_val,
+                    body=body_val,
+                    assignee=assignee_val,
+                    author=audit_author,
+                )
+            except kb.DispatchPausedError:
+                return DecomposeOutcome(
+                    task_id, False, "dispatch is paused or halted"
+                )
         if not ok:
             return DecomposeOutcome(
                 task_id, False, "task moved out of triage before promotion",
@@ -486,6 +491,8 @@ def decompose_task(
                 author=audit_author,
                 auto_promote=auto_promote,
             )
+    except kb.DispatchPausedError:
+        return DecomposeOutcome(task_id, False, "dispatch is paused or halted")
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
     except Exception as exc:
