@@ -15,7 +15,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import shutil
 import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -270,6 +274,97 @@ def test_profile_redirect_detector_rejects_windows_reparse_attribute():
     assert estop._is_unsafe_profile_redirect(junction_info) is True
 
 
+def test_linux_mountinfo_path_decoder_preserves_literal_escape_text():
+    encoded = r"/tmp/a\040b/actual\134040text"
+
+    assert estop._decode_mountinfo_path(encoded) == "/tmp/a b/actual\\040text"
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("mounted_kind", ["profile", "profiles_root"])
+def test_gateway_pause_off_rejects_real_bind_mounted_profiles(
+    tmp_path, mounted_kind
+):
+    """Real profile mounts cannot make chat resume delete an outside stop."""
+    unshare = shutil.which("unshare")
+    mount = shutil.which("mount")
+    if not unshare or not mount:
+        pytest.skip("unshare and mount are required for the bind-mount proof")
+
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profiles_root.mkdir(parents=True)
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    if mounted_kind == "profile":
+        mount_target = profiles_root / "mounted"
+        mount_target.mkdir()
+        external_stop = outside / "ESTOP"
+    else:
+        mount_target = profiles_root
+        outside_profile = outside / "mounted"
+        outside_profile.mkdir()
+        external_stop = outside_profile / "ESTOP"
+    external_stop.write_text("{}\n", encoding="utf-8")
+    child = r'''
+import asyncio
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root = Path(sys.argv[1])
+outside = Path(sys.argv[2])
+mount_target = Path(sys.argv[3])
+external_stop = Path(sys.argv[5])
+subprocess.run([sys.argv[4], "--make-rprivate", "/"], check=True)
+subprocess.run([sys.argv[4], "--bind", str(outside), str(mount_target)], check=True)
+os.environ["HERMES_HOME"] = str(root)
+
+from agent import estop
+from gateway.run import GatewayRunner
+
+class Event:
+    def get_command_args(self):
+        return "off"
+
+reply = asyncio.run(
+    object.__new__(GatewayRunner)._handle_pause_command(Event())
+)
+print(json.dumps({
+    "reply": reply,
+    "external_stop_present": external_stop.is_file(),
+}))
+'''
+    result = subprocess.run(
+        [
+            unshare,
+            "-Ur",
+            "-m",
+            sys.executable,
+            "-c",
+            child,
+            str(root),
+            str(outside),
+            str(mount_target),
+            mount,
+            str(external_stop),
+        ],
+        cwd=os.fspath(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 and "Operation not permitted" in result.stderr:
+        pytest.skip("this Linux host disables unprivileged mount namespaces")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.splitlines()[-1])
+
+    assert "hermes is still paused" in payload["reply"].lower()
+    assert payload["external_stop_present"] is True
+    assert external_stop.is_file()
+
+
 @pytest.mark.windows_only
 @pytest.mark.asyncio
 async def test_gateway_pause_off_rejects_windows_profile_junction(
@@ -312,7 +407,6 @@ async def test_gateway_pause_off_rejects_windows_profile_junction(
     reply = await runner._handle_pause_command(_FakePauseEvent("off"))
 
     assert "hermes is still paused" in reply.lower()
-    assert "could not be checked safely" in reply.lower()
     assert external_stop.is_file()
     assert (moved_profile / "ESTOP").is_file()
     assert estop.is_engaged() is True

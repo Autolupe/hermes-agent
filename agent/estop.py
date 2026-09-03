@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import stat as stat_module
+import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -135,6 +136,9 @@ def _legacy_profile_sentinel_entries(
         or _is_unsafe_profile_redirect(root_info)
     ):
         raise OSError("profiles path is not a real, unredirected directory")
+    linux_mount_points = _linux_mount_points()
+    if _is_profile_mount_point(profiles_root, linux_mount_points):
+        raise OSError("profiles path is a mounted directory")
 
     discovered: list[_LegacySentinelEntry] = []
     with os.scandir(profiles_root) as entries:
@@ -143,9 +147,12 @@ def _legacy_profile_sentinel_entries(
             if _is_unsafe_profile_redirect(entry_info):
                 raise OSError("redirected profile directory is unsafe")
             if stat_module.S_ISDIR(entry_info.st_mode):
+                entry_path = Path(entry.path)
+                if _is_profile_mount_point(entry_path, linux_mount_points):
+                    raise OSError("mounted profile directory is unsafe")
                 discovered.append(
                     _LegacySentinelEntry(
-                        Path(entry.path) / SENTINEL_NAME,
+                        entry_path / SENTINEL_NAME,
                         _stat_identity(entry_info),
                     )
                 )
@@ -168,6 +175,55 @@ def _is_unsafe_profile_redirect(info: object) -> bool:
     )
     file_attributes = getattr(info, "st_file_attributes", 0)
     return stat_module.S_ISLNK(mode) or bool(file_attributes & reparse_flag)
+
+
+def _decode_mountinfo_path(value: str) -> str:
+    """Decode the four pathname escapes used by Linux mountinfo."""
+    return (
+        value.replace(r"\040", " ")
+        .replace(r"\011", "\t")
+        .replace(r"\012", "\n")
+        .replace(r"\134", "\\")
+    )
+
+
+def _linux_mount_points() -> frozenset[str]:
+    """Read exact Linux mount points, including same-filesystem bind mounts."""
+    if not sys.platform.startswith("linux"):
+        return frozenset()
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(
+            encoding="utf-8",
+            errors="surrogateescape",
+        ).splitlines()
+    except OSError as exc:
+        raise OSError("Linux mount points could not be checked safely") from exc
+
+    mount_points: set[str] = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 6 or "-" not in fields[6:]:
+            raise OSError("Linux mountinfo is malformed")
+        decoded = _decode_mountinfo_path(fields[4])
+        mount_points.add(os.path.normcase(os.path.abspath(decoded)))
+    return frozenset(mount_points)
+
+
+def _is_profile_mount_point(
+    path: Path,
+    linux_mount_points: frozenset[str],
+) -> bool:
+    """Reject volume, FUSE, and same-filesystem bind mount redirects."""
+    try:
+        physical_path = path.resolve(strict=True)
+        if os.path.ismount(physical_path):
+            return True
+    except (OSError, RuntimeError) as exc:
+        raise OSError("profile mount state could not be checked safely") from exc
+    if not linux_mount_points:
+        return False
+    normalized = os.path.normcase(os.path.abspath(str(physical_path)))
+    return normalized in linux_mount_points
 
 
 def _stat_identity(info: object) -> tuple[object, ...]:
