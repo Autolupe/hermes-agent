@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -198,6 +200,52 @@ def test_symlinked_profile_directory_fails_closed_without_external_delete(
     with pytest.raises(estop.DisengageError, match="could not be checked safely"):
         estop.disengage()
     assert external_stop.is_file()
+
+
+def test_profile_redirect_detector_rejects_windows_reparse_attribute():
+    """The junction attribute is unsafe even when its mode says directory."""
+    junction_info = SimpleNamespace(
+        st_mode=0o040000,
+        st_file_attributes=0x400,
+    )
+
+    assert estop._is_unsafe_profile_redirect(junction_info) is True
+
+
+@pytest.mark.windows_only
+@pytest.mark.asyncio
+async def test_gateway_pause_off_rejects_windows_profile_junction(
+    tmp_path, monkeypatch
+):
+    """A real Windows junction must not let chat resume delete outside state."""
+    from gateway.run import GatewayRunner
+
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profiles_root.mkdir(parents=True)
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    external_stop = outside / "ESTOP"
+    external_stop.write_text("{}\n", encoding="utf-8")
+    junction = profiles_root / "linked"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode(
+        "utf-8", errors="replace"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+    runner = object.__new__(GatewayRunner)
+
+    reply = await runner._handle_pause_command(_FakePauseEvent("off"))
+
+    assert "hermes is still paused" in reply.lower()
+    assert "could not be checked safely" in reply.lower()
+    assert external_stop.is_file()
+    assert estop.is_engaged() is True
 
 
 # ── paused notice for new gateway turns ─────────────────────────────────────

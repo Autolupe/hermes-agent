@@ -110,18 +110,39 @@ def _legacy_profile_sentinel_paths(shared_root: Path) -> tuple[Path, ...]:
             root_info = os.lstat(profiles_root)
         except FileNotFoundError:
             return ()
-    if not stat_module.S_ISDIR(root_info.st_mode):
-        raise OSError("profiles path is not a real directory")
+    if (
+        not stat_module.S_ISDIR(root_info.st_mode)
+        or _is_unsafe_profile_redirect(root_info)
+    ):
+        raise OSError("profiles path is not a real, unredirected directory")
 
     discovered: list[Path] = []
     with os.scandir(profiles_root) as entries:
         for entry in entries:
             entry_info = entry.stat(follow_symlinks=False)
-            if stat_module.S_ISLNK(entry_info.st_mode):
-                raise OSError("symlinked profile directory is unsafe")
+            if _is_unsafe_profile_redirect(entry_info):
+                raise OSError("redirected profile directory is unsafe")
             if stat_module.S_ISDIR(entry_info.st_mode):
                 discovered.append(Path(entry.path) / SENTINEL_NAME)
     return tuple(sorted(discovered, key=lambda path: str(path)))
+
+
+def _is_unsafe_profile_redirect(info: object) -> bool:
+    """Reject symlinks and Windows directory reparse points.
+
+    Python 3.11 can report a Windows junction as a directory even when the
+    caller asks not to follow links. The Windows file-attribute bit remains
+    authoritative, so reject every reparse point before collecting a legacy
+    ESTOP path that ``disengage`` might unlink.
+    """
+    mode = getattr(info, "st_mode", 0)
+    reparse_flag = getattr(
+        stat_module,
+        "FILE_ATTRIBUTE_REPARSE_POINT",
+        0x400,
+    )
+    file_attributes = getattr(info, "st_file_attributes", 0)
+    return stat_module.S_ISLNK(mode) or bool(file_attributes & reparse_flag)
 
 
 def is_engaged() -> bool:
