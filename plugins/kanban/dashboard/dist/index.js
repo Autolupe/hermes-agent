@@ -4637,7 +4637,14 @@
                 const suffix = res.new_title
                   ? ` — retitled: ${res.new_title}`
                   : "";
-                setSpecifyMsg({ ok: true, text: `Specified${suffix}` });
+                const parkedSuffix = res.parked
+                  ? ` — parked: ${res.reason || "dispatch is paused or halted"}`
+                  : "";
+                setSpecifyMsg({
+                  ok: true,
+                  parked: Boolean(res.parked),
+                  text: `Specified${suffix}${parkedSuffix}`,
+                });
               } else {
                 setSpecifyMsg({
                   ok: false,
@@ -4671,10 +4678,14 @@
             setDecomposeMsg(null);
             props.onDecompose().then(function (res) {
               if (res && res.ok) {
+                const parkedSuffix = res.parked
+                  ? ` — parked: ${res.reason || "dispatch is paused or halted"}`
+                  : "";
                 if (res.fanout && res.child_ids && res.child_ids.length) {
                   setDecomposeMsg({
                     ok: true,
-                    text: `Decomposed into ${res.child_ids.length} children: ${res.child_ids.join(", ")}`,
+                    parked: Boolean(res.parked),
+                    text: `Decomposed into ${res.child_ids.length} children: ${res.child_ids.join(", ")}${parkedSuffix}`,
                   });
                 } else {
                   const suffix = res.new_title
@@ -4682,7 +4693,8 @@
                     : "";
                   setDecomposeMsg({
                     ok: true,
-                    text: `Single task (no fanout)${suffix}`,
+                    parked: Boolean(res.parked),
+                    text: `Single task (no fanout)${suffix}${parkedSuffix}`,
                   });
                 }
               } else {
@@ -4726,14 +4738,18 @@
           getDestructiveConfirm(t, "archived")),
       ),
       specifyMsg ? h("div", {
-        className: specifyMsg.ok
-          ? "hermes-kanban-msg-ok"
-          : "hermes-kanban-msg-err",
+        className: specifyMsg.parked
+          ? "hermes-kanban-msg-warn"
+          : specifyMsg.ok
+            ? "hermes-kanban-msg-ok"
+            : "hermes-kanban-msg-err",
       }, specifyMsg.text) : null,
       decomposeMsg ? h("div", {
-        className: decomposeMsg.ok
-          ? "hermes-kanban-msg-ok"
-          : "hermes-kanban-msg-err",
+        className: decomposeMsg.parked
+          ? "hermes-kanban-msg-warn"
+          : decomposeMsg.ok
+            ? "hermes-kanban-msg-ok"
+            : "hermes-kanban-msg-err",
       }, decomposeMsg.text) : null,
     );
   }

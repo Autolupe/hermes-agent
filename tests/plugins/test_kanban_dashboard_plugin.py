@@ -1225,8 +1225,85 @@ def test_specify_happy_path(client, monkeypatch):
     assert "**Goal**" in (detail["body"] or "")
 
 
+def test_specify_endpoint_preserves_parked_outcome(client, monkeypatch):
+    """The dashboard API must not flatten committed-but-parked success."""
+    from hermes_cli import kanban_specify
+
+    outcome = kanban_specify.SpecifyOutcome(
+        "t_parkedspec",
+        True,
+        "specified; dispatch is paused or halted",
+        new_title="Specified but parked",
+        parked=True,
+    )
+    monkeypatch.setattr(kanban_specify, "specify_task", lambda *a, **kw: outcome)
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/t_parkedspec/specify",
+        json={"author": "ui-tester"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "task_id": "t_parkedspec",
+        "reason": "specified; dispatch is paused or halted",
+        "new_title": "Specified but parked",
+        "parked": True,
+    }
+
+
+def test_decompose_endpoint_preserves_parked_outcome(client, monkeypatch):
+    """Fan-out reports when its committed children remain parked in todo."""
+    from hermes_cli import kanban_decompose
+
+    outcome = kanban_decompose.DecomposeOutcome(
+        "t_parkedgraph",
+        True,
+        "decomposed into 2 children; dispatch is paused or halted",
+        fanout=True,
+        child_ids=["t_childone", "t_childtwo"],
+        parked=True,
+    )
+    monkeypatch.setattr(
+        kanban_decompose,
+        "decompose_task",
+        lambda *a, **kw: outcome,
+    )
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/t_parkedgraph/decompose",
+        json={"author": "ui-tester"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "task_id": "t_parkedgraph",
+        "reason": "decomposed into 2 children; dispatch is paused or halted",
+        "fanout": True,
+        "child_ids": ["t_childone", "t_childtwo"],
+        "new_title": None,
+        "parked": True,
+    }
+
+
+def test_dashboard_marks_parked_planning_as_a_visible_warning():
+    """Successful planning cannot look runnable when dispatch is paused."""
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text(encoding="utf-8")
+    css = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css"
+    ).read_text(encoding="utf-8")
+
+    assert js.count('parked: ${res.reason || "dispatch is paused or halted"}') == 2
+    assert js.count('"hermes-kanban-msg-warn"') == 2
+    assert ".hermes-kanban-msg-warn" in css
+
+
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
 

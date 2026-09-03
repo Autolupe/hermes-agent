@@ -458,6 +458,7 @@
 
 /* Specifier result banner — sits directly under the status action row. */
 .hermes-kanban-msg-ok,
+.hermes-kanban-msg-warn,
 .hermes-kanban-msg-err {
   margin-top: 0.4rem;
   padding: 0.35rem 0.55rem;
@@ -469,6 +470,11 @@
   background: rgba(46, 160, 67, 0.12);
   color: #2ea043;
   border: 1px solid rgba(46, 160, 67, 0.35);
+}
+.hermes-kanban-msg-warn {
+  background: rgba(210, 153, 34, 0.12);
+  color: #d29922;
+  border: 1px solid rgba(210, 153, 34, 0.35);
 }
 .hermes-kanban-msg-err {
   background: rgba(248, 81, 73, 0.12);

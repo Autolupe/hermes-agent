@@ -1811,9 +1811,9 @@ def specify_task_endpoint(
     it to ``todo``. Maps 1:1 to ``hermes kanban specify <task_id>``.
 
     Returns the outcome shape used by the CLI: ``{ok, task_id, reason,
-    new_title}``. A non-OK outcome is NOT an HTTP error — the UI renders
-    the reason inline (e.g. "no auxiliary client configured") so the
-    operator knows what to fix, and retries without a page reload.
+    new_title, parked}``. A non-OK or parked outcome is NOT an HTTP error —
+    the UI renders the reason inline so the operator knows what happened and
+    can retry without a page reload.
 
     This endpoint runs in FastAPI's threadpool (sync ``def``) because
     the underlying LLM call can take tens of seconds to minutes on
@@ -1842,6 +1842,7 @@ def specify_task_endpoint(
         "task_id": outcome.task_id,
         "reason": outcome.reason,
         "new_title": outcome.new_title,
+        "parked": bool(getattr(outcome, "parked", False)),
     }
 
 
@@ -2767,8 +2768,8 @@ def decompose_task_endpoint(
     1:1 to ``hermes kanban decompose <task_id>``.
 
     Returns the outcome shape used by the CLI: ``{ok, task_id, reason,
-    fanout, child_ids, new_title}``. A non-OK outcome is NOT an HTTP
-    error — the UI renders the reason inline.
+    fanout, child_ids, new_title, parked}``. A non-OK or parked outcome is
+    NOT an HTTP error — the UI renders the reason inline.
 
     Runs in FastAPI's threadpool (sync ``def``) because the LLM call
     can take minutes on reasoning models.
@@ -2792,6 +2793,7 @@ def decompose_task_endpoint(
         "fanout": bool(outcome.fanout),
         "child_ids": outcome.child_ids or [],
         "new_title": outcome.new_title,
+        "parked": bool(getattr(outcome, "parked", False)),
     }
 
 
