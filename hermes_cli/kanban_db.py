@@ -1311,6 +1311,7 @@ real_lstat = os.lstat
 original_hermes_home = os.environ["HERMES_HOME"]
 broken_home_link = root / "broken-hermes-home"
 profile_home = root / "profiles" / "planner"
+legacy_profile_brake = root / "profiles" / "coder" / "ESTOP"
 
 def disarm_brake():
     os.lstat = real_lstat
@@ -1321,10 +1322,11 @@ def disarm_brake():
         except FileNotFoundError:
             pass
         return
-    try:
-        brake.unlink()
-    except FileNotFoundError:
-        pass
+    for candidate in (brake, legacy_profile_brake):
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
 
 def arm_brake():
     disarm_brake()
@@ -1360,6 +1362,11 @@ def arm_brake():
         profile_home.mkdir(parents=True, exist_ok=True)
         brake.write_text("{}\\n", encoding="utf-8")
         os.environ["HERMES_HOME"] = str(profile_home)
+    elif brake_mode == "legacy_sibling_profile":
+        profile_home.mkdir(parents=True, exist_ok=True)
+        legacy_profile_brake.parent.mkdir(parents=True, exist_ok=True)
+        legacy_profile_brake.write_text("{}\\n", encoding="utf-8")
+        os.environ["HERMES_HOME"] = str(profile_home)
     else:
         raise RuntimeError("unknown brake mode")
 
@@ -1373,8 +1380,13 @@ def brake_is_armed():
         except OSError:
             return False
         return estop.is_engaged()
+    target = (
+        legacy_profile_brake
+        if brake_mode == "legacy_sibling_profile"
+        else brake
+    )
     try:
-        os.lstat(brake)
+        os.lstat(target)
     except OSError:
         return False
     return True
@@ -1580,6 +1592,7 @@ raise SystemExit(0 if ok else 1)
                     "lookup_error",
                     "broken_ancestor",
                     "shared_profile_root",
+                    "legacy_sibling_profile",
                 )
             ),
         )
@@ -5709,7 +5722,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
 
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection,
+    failure_limit: int = None,
+    *,
+    require_dispatch_allowed: bool = False,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -5739,11 +5755,20 @@ def recompute_ready(
       2. caller-supplied ``failure_limit`` (the dispatcher passes the
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
+
+    ``require_dispatch_allowed`` protects automatic planning follow-ups. It
+    checks once before waiting for SQLite and again after the write transaction
+    is acquired, so a stop engaged during lock contention cannot promote new
+    runnable work.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    if require_dispatch_allowed:
+        _raise_if_dispatch_paused()
     promoted = 0
     with write_txn(conn):
+        if require_dispatch_allowed:
+            _raise_if_dispatch_paused()
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -8517,7 +8542,7 @@ def specify_triage_task(
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    recompute_ready(conn, require_dispatch_allowed=True)
     return True
 
 
@@ -8763,7 +8788,7 @@ def decompose_triage_task(
     # stay in 'todo' until the user manually promotes them — useful
     # for manual-review-first workflows.
     if auto_promote:
-        recompute_ready(conn)
+        recompute_ready(conn, require_dispatch_allowed=True)
     return child_ids
 
 

@@ -2,8 +2,9 @@
 
 ``hermes pause`` writes a sentinel file at ``<shared-root>/ESTOP``;
 ``hermes resume`` removes it. Named profiles use the same shared sentinel.
-Profile-local sentinels created by older versions remain authoritative and are
-removed by ``hermes resume`` so an upgrade can never lift an existing stop.
+Profile-local sentinels created by older versions remain authoritative across
+all named profiles and are removed by ``hermes resume`` so an upgrade can
+never lift an existing stop.
 While a sentinel exists:
 
 * the cron scheduler skips dispatching due jobs (``cron/scheduler.py:tick``),
@@ -72,10 +73,51 @@ def sentinel_path() -> Path:
 
 
 def _sentinel_paths() -> tuple[Path, ...]:
-    """Return the canonical global path plus any distinct legacy profile path."""
+    """Return the global path plus every legacy named-profile path.
+
+    Older Hermes releases wrote ESTOP inside only the active profile. A
+    default or sibling-profile gateway must therefore scan the shared
+    ``profiles`` directory, or an already-engaged stop could disappear during
+    upgrade. Enumeration errors fail closed through the public callers.
+    """
     shared = sentinel_path()
     legacy = _active_hermes_home() / SENTINEL_NAME
-    return (shared,) if legacy == shared else (shared, legacy)
+    paths = [shared]
+    if legacy != shared:
+        paths.append(legacy)
+    paths.extend(_legacy_profile_sentinel_paths(shared.parent))
+    return tuple(dict.fromkeys(paths))
+
+
+def _legacy_profile_sentinel_paths(shared_root: Path) -> tuple[Path, ...]:
+    """Discover legacy ESTOP paths without following profile-dir symlinks.
+
+    A symlinked or unreadable profile directory is not safe to scan or clean:
+    following it during ``hermes resume`` could unlink a file outside the
+    shared Hermes root. Treat that uncertain layout as engaged instead.
+    """
+    profiles_root = shared_root / "profiles"
+    try:
+        root_info = os.lstat(profiles_root)
+    except FileNotFoundError:
+        if not _missing_path_has_usable_ancestor(profiles_root.parent):
+            raise OSError("profiles directory ancestry is not usable")
+        try:
+            root_info = os.lstat(profiles_root)
+        except FileNotFoundError:
+            return ()
+    if not stat_module.S_ISDIR(root_info.st_mode):
+        raise OSError("profiles path is not a real directory")
+
+    discovered: list[Path] = []
+    with os.scandir(profiles_root) as entries:
+        for entry in entries:
+            entry_info = entry.stat(follow_symlinks=False)
+            if stat_module.S_ISLNK(entry_info.st_mode):
+                raise OSError("symlinked profile directory is unsafe")
+            if stat_module.S_ISDIR(entry_info.st_mode):
+                discovered.append(Path(entry.path) / SENTINEL_NAME)
+    return tuple(sorted(discovered, key=lambda path: str(path)))
 
 
 def is_engaged() -> bool:
@@ -164,7 +206,7 @@ def engage(reason: Optional[str] = None) -> Path:
 
 
 def disengage() -> bool:
-    """Remove global and legacy profile sentinels if the pause was lifted."""
+    """Remove global and all legacy profile sentinels if safely possible."""
     removed = False
     failed = False
     try:
@@ -181,7 +223,9 @@ def disengage() -> bool:
             failed = True
     if failed or not removed:
         return False
-    return not any(_path_is_engaged(path) for path in paths)
+    # Re-enumerate after deletion so a sibling legacy stop created during the
+    # cleanup cannot be missed by the paths snapshot above.
+    return not is_engaged()
 
 
 def get_state() -> Optional[dict]:

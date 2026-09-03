@@ -147,6 +147,58 @@ def test_named_profile_honors_and_removes_legacy_profile_estop(
     assert not (profile_home / "ESTOP").exists()
 
 
+@pytest.mark.parametrize("active_kind", ["default", "sibling"])
+def test_every_gateway_honors_and_removes_all_legacy_profile_estops(
+    tmp_path, monkeypatch, active_kind
+):
+    """A stop left by any old profile is global after an upgrade."""
+    root = tmp_path / "shared-root"
+    coder_home = root / "profiles" / "coder"
+    reviewer_home = root / "profiles" / "reviewer"
+    planner_home = root / "profiles" / "planner"
+    for profile_home in (coder_home, reviewer_home, planner_home):
+        profile_home.mkdir(parents=True)
+    monkeypatch.setenv(
+        "HERMES_HOME",
+        str(root if active_kind == "default" else planner_home),
+    )
+    estop._reset_log_state_for_tests()
+    (coder_home / "ESTOP").write_text(
+        '{"reason": "coder legacy pause"}\n', encoding="utf-8"
+    )
+    (reviewer_home / "ESTOP").write_text(
+        '{"reason": "reviewer legacy pause"}\n', encoding="utf-8"
+    )
+
+    assert estop.is_engaged() is True
+    assert estop.get_state()["reason"] == "coder legacy pause"
+    assert estop.disengage() is True
+    assert estop.is_engaged() is False
+    assert not (coder_home / "ESTOP").exists()
+    assert not (reviewer_home / "ESTOP").exists()
+
+
+@pytest.mark.linux_only
+def test_symlinked_profile_directory_fails_closed_without_external_delete(
+    tmp_path, monkeypatch
+):
+    """Resume must not follow a profile symlink and unlink outside the root."""
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profiles_root.mkdir(parents=True)
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    external_stop = outside / "ESTOP"
+    external_stop.write_text("{}\n", encoding="utf-8")
+    (profiles_root / "linked").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+
+    assert estop.is_engaged() is True
+    assert estop.disengage() is False
+    assert external_stop.is_file()
+
+
 # ── paused notice for new gateway turns ─────────────────────────────────────
 
 

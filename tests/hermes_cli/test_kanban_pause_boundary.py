@@ -299,6 +299,110 @@ def test_stop_engaged_during_planning_lock_wait_rolls_back_transaction(
     verify.close()
 
 
+@pytest.mark.parametrize("operation", ["specify", "decompose"])
+@pytest.mark.parametrize("brake", ["halt", "estop"])
+def test_stop_engaged_during_ready_promotion_lock_wait_keeps_todos_parked(
+    tmp_path, monkeypatch, operation, brake
+):
+    """The second planning transaction must recheck a newly engaged stop."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    setup = kb.connect(db_path=db_path)
+    task_id = kb.create_task(setup, title="promotion lock wait", triage=True)
+    setup.close()
+
+    promotion_called = threading.Event()
+    allow_promotion = threading.Event()
+    entering_promotion_txn = threading.Event()
+    real_recompute_ready = kb.recompute_ready
+    real_write_txn = kb.write_txn
+
+    def observed_recompute_ready(conn, *args, **kwargs):
+        promotion_called.set()
+        if not allow_promotion.wait(timeout=5):
+            raise RuntimeError("test did not release promotion")
+        return real_recompute_ready(conn, *args, **kwargs)
+
+    monkeypatch.setattr(kb, "recompute_ready", observed_recompute_ready)
+    outcomes = []
+    failures = []
+
+    def plan_through_promotion():
+        conn = kb.connect(db_path=db_path)
+        try:
+            if operation == "specify":
+                outcomes.append(
+                    kb.specify_triage_task(
+                        conn,
+                        task_id,
+                        title="specified but parked",
+                        author="test",
+                    )
+                )
+            else:
+                outcomes.append(
+                    kb.decompose_triage_task(
+                        conn,
+                        task_id,
+                        root_assignee="default",
+                        children=[
+                            {
+                                "title": "created but parked",
+                                "assignee": "default",
+                                "parents": [],
+                            }
+                        ],
+                        author="test",
+                    )
+                )
+        except Exception as exc:
+            failures.append(exc)
+        finally:
+            conn.close()
+
+    worker = threading.Thread(target=plan_through_promotion)
+    worker.start()
+    assert promotion_called.wait(timeout=2)
+
+    blocker = kb.connect(db_path=db_path)
+    blocker.execute("BEGIN IMMEDIATE")
+
+    @contextlib.contextmanager
+    def observed_write_txn(conn, *args, **kwargs):
+        entering_promotion_txn.set()
+        with real_write_txn(conn, *args, **kwargs):
+            yield
+
+    monkeypatch.setattr(kb, "write_txn", observed_write_txn)
+    allow_promotion.set()
+    try:
+        assert entering_promotion_txn.wait(timeout=2)
+        if brake == "halt":
+            _halt(tmp_path, monkeypatch)
+        else:
+            (tmp_path / "ESTOP").write_text("{}\n", encoding="utf-8")
+    finally:
+        blocker.rollback()
+        blocker.close()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert outcomes == []
+    assert len(failures) == 1
+    assert isinstance(failures[0], kb.DispatchPausedError)
+    verify = kb.connect(db_path=db_path)
+    root = kb.get_task(verify, task_id)
+    assert root is not None and root.status == "todo"
+    assert verify.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'ready'"
+    ).fetchone()[0] == 0
+    expected_task_count = 1 if operation == "specify" else 2
+    assert verify.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == expected_task_count
+    verify.close()
+
+
 @pytest.mark.linux_only
 def test_broken_estop_entry_blocks_dispatch_boundary(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
