@@ -151,6 +151,13 @@ def _legacy_profile_sentinel_entries(
     if _is_profile_mount_point(profiles_root, linux_mount_points):
         raise OSError("profiles path is a mounted directory")
 
+    if _supports_anchored_profile_scan():
+        return _anchored_legacy_profile_sentinel_entries(
+            shared_root,
+            profiles_root,
+            root_info,
+        )
+
     discovered: list[_LegacySentinelEntry] = []
     with os.scandir(profiles_root) as entries:
         for entry in entries:
@@ -167,7 +174,112 @@ def _legacy_profile_sentinel_entries(
                         _stat_identity(entry_info),
                     )
                 )
+    final_root_info = os.lstat(profiles_root)
+    if (
+        _is_unsafe_profile_redirect(final_root_info)
+        or _stat_identity(final_root_info) != _stat_identity(root_info)
+        or _is_profile_mount_point(profiles_root, _linux_mount_points())
+    ):
+        raise OSError("profiles directory changed during stop discovery")
     return tuple(sorted(discovered, key=lambda item: str(item.path)))
+
+
+def _supports_anchored_profile_scan() -> bool:
+    """Return whether profile enumeration can stay below open directories."""
+    supports_dir_fd = getattr(os, "supports_dir_fd", set())
+    supports_fd = getattr(os, "supports_fd", set())
+    return (
+        os.name != "nt"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and os.open in supports_dir_fd
+        and os.stat in supports_dir_fd
+        and os.scandir in supports_fd
+    )
+
+
+def _anchored_legacy_profile_sentinel_entries(
+    shared_root: Path,
+    profiles_root: Path,
+    expected_profiles_info: object,
+) -> tuple[_LegacySentinelEntry, ...]:
+    """Enumerate profiles through handles that path replacement cannot retarget."""
+    try:
+        physical_root = shared_root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise OSError("shared Hermes root could not be resolved safely") from exc
+
+    root_fd: int | None = None
+    profiles_fd: int | None = None
+    try:
+        root_fd = os.open(physical_root, _directory_open_flags())
+        opened_root_info = os.fstat(root_fd)
+        if (
+            not stat_module.S_ISDIR(opened_root_info.st_mode)
+            or _is_unsafe_profile_redirect(opened_root_info)
+        ):
+            raise OSError("shared Hermes root is not a real directory")
+
+        profiles_fd = os.open(
+            "profiles",
+            _directory_open_flags(),
+            dir_fd=root_fd,
+        )
+        opened_profiles_info = os.fstat(profiles_fd)
+        if _stat_identity(opened_profiles_info) != _stat_identity(
+            expected_profiles_info
+        ):
+            raise OSError("profiles directory changed during stop discovery")
+        _reject_child_mount(
+            root_fd,
+            profiles_fd,
+            "profiles path is a mounted directory",
+        )
+
+        with os.scandir(profiles_fd) as entries:
+            profile_names = sorted(entry.name for entry in entries)
+        discovered: list[_LegacySentinelEntry] = []
+        for profile_name in profile_names:
+            profile_info = _optional_entry_info(profiles_fd, profile_name)
+            if profile_info is None:
+                raise OSError("profile directory changed during stop discovery")
+            if _is_unsafe_profile_redirect(profile_info):
+                raise OSError("redirected profile directory is unsafe")
+            if not stat_module.S_ISDIR(profile_info.st_mode):
+                continue
+
+            profile_fd = os.open(
+                profile_name,
+                _directory_open_flags(),
+                dir_fd=profiles_fd,
+            )
+            try:
+                opened_profile_info = os.fstat(profile_fd)
+                if _stat_identity(opened_profile_info) != _stat_identity(
+                    profile_info
+                ):
+                    raise OSError(
+                        "profile directory changed during stop discovery"
+                    )
+                _reject_child_mount(
+                    profiles_fd,
+                    profile_fd,
+                    "mounted profile directory is unsafe",
+                )
+                discovered.append(
+                    _LegacySentinelEntry(
+                        profiles_root / profile_name / SENTINEL_NAME,
+                        _stat_identity(opened_profile_info),
+                    )
+                )
+            finally:
+                os.close(profile_fd)
+        return tuple(discovered)
+    finally:
+        if profiles_fd is not None:
+            os.close(profiles_fd)
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def _is_unsafe_profile_redirect(info: object) -> bool:

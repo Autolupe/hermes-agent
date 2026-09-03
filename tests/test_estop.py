@@ -327,6 +327,64 @@ def test_legacy_stop_read_fails_closed_when_profile_replaced_after_discovery(
 
 
 @pytest.mark.linux_only
+def test_legacy_stop_scan_anchors_profiles_root_during_replacement(
+    tmp_path, monkeypatch
+):
+    """A temporary root replacement cannot hide an already-engaged stop."""
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profile = profiles_root / "coder"
+    profile.mkdir(parents=True)
+    (profile / "ESTOP").write_text("{}\n", encoding="utf-8")
+    moved_profiles = tmp_path / "profiles-original"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+    real_scandir = estop.os.scandir
+    swapped = False
+
+    class FrozenScandir:
+        def __init__(self, entries):
+            self._entries = iter(entries)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._entries)
+
+    def scan_during_temporary_replacement(target):
+        nonlocal swapped
+        if swapped:
+            return real_scandir(target)
+        swapped = True
+        profiles_root.rename(moved_profiles)
+        profiles_root.mkdir()
+        try:
+            entries = list(real_scandir(target))
+        finally:
+            profiles_root.rmdir()
+            moved_profiles.rename(profiles_root)
+        return FrozenScandir(entries)
+
+    monkeypatch.setattr(
+        estop,
+        "_supports_anchored_profile_scan",
+        lambda: True,
+    )
+    monkeypatch.setattr(estop.os, "scandir", scan_during_temporary_replacement)
+
+    assert estop.is_engaged() is True
+    assert swapped is True
+    assert (profile / "ESTOP").is_file()
+
+
+@pytest.mark.linux_only
 @pytest.mark.asyncio
 async def test_gateway_pause_off_anchors_profile_during_symlink_swap(
     tmp_path, monkeypatch
