@@ -119,6 +119,33 @@ def test_broken_estop_ancestor_blocks_claim_and_final_spawn(tmp_path, monkeypatc
     assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
 
 
+def test_shared_root_estop_blocks_named_profile_claims(tmp_path, monkeypatch):
+    """A named-profile caller must honor the default profile global stop."""
+    root = tmp_path / "shared-root"
+    profile_home = root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root))
+    (root / "ESTOP").write_text("{}\n", encoding="utf-8")
+    db_path = root / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    ready_id = kb.create_task(conn, title="ready", assignee="coder")
+    review_id = kb.create_task(conn, title="review", assignee="coder")
+    conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,))
+    conn.commit()
+
+    assert kb.claim_task(conn, ready_id) is None
+    assert kb.claim_review_task(conn, review_id) is None
+    assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+
+    task = kb.get_task(conn, ready_id)
+    with pytest.raises(kb.DispatchPausedError, match="global emergency stop"):
+        kb._default_spawn(task, str(root))
+
+    assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+
+
 @pytest.mark.parametrize("lane", ["ready", "review"])
 @pytest.mark.parametrize("brake", ["halt", "estop"])
 def test_stop_engaged_during_claim_lock_wait_blocks_transaction(

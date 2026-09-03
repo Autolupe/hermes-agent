@@ -1,7 +1,10 @@
 """Global emergency stop (ESTOP) — a resumable pause for NEW work only.
 
-``hermes pause`` writes a sentinel file at ``$HERMES_HOME/ESTOP``;
-``hermes resume`` removes it. While the sentinel exists:
+``hermes pause`` writes a sentinel file at ``<shared-root>/ESTOP``;
+``hermes resume`` removes it. Named profiles use the same shared sentinel.
+Profile-local sentinels created by older versions remain authoritative and are
+removed by ``hermes resume`` so an upgrade can never lift an existing stop.
+While a sentinel exists:
 
 * the cron scheduler skips dispatching due jobs (``cron/scheduler.py:tick``),
 * the embedded kanban dispatcher skips spawning workers
@@ -46,7 +49,16 @@ _logged_components: set[str] = set()
 
 
 def _hermes_home() -> Path:
-    """Resolve the active HERMES_HOME (profile-aware) at call time."""
+    """Resolve the shared Hermes root at call time, folding named profiles."""
+    try:
+        from hermes_constants import get_default_hermes_root
+        return get_default_hermes_root()
+    except Exception:
+        return Path(os.path.expanduser("~/.hermes"))
+
+
+def _active_hermes_home() -> Path:
+    """Resolve the active profile home for legacy-sentinel compatibility."""
     try:
         from hermes_constants import get_hermes_home
         return get_hermes_home()
@@ -55,8 +67,15 @@ def _hermes_home() -> Path:
 
 
 def sentinel_path() -> Path:
-    """Path of the ESTOP sentinel under the active HERMES_HOME."""
+    """Path of the global ESTOP sentinel under the shared Hermes root."""
     return _hermes_home() / SENTINEL_NAME
+
+
+def _sentinel_paths() -> tuple[Path, ...]:
+    """Return the canonical global path plus any distinct legacy profile path."""
+    shared = sentinel_path()
+    legacy = _active_hermes_home() / SENTINEL_NAME
+    return (shared,) if legacy == shared else (shared, legacy)
 
 
 def is_engaged() -> bool:
@@ -69,9 +88,13 @@ def is_engaged() -> bool:
     operator's emergency stop exactly when the filesystem is misbehaving.
     """
     try:
-        path = sentinel_path()
+        return any(_path_is_engaged(path) for path in _sentinel_paths())
     except Exception:
         return True
+
+
+def _path_is_engaged(path: Path) -> bool:
+    """Check one sentinel path, treating every uncertain state as engaged."""
     try:
         os.lstat(path)
     except FileNotFoundError:
@@ -141,14 +164,24 @@ def engage(reason: Optional[str] = None) -> Path:
 
 
 def disengage() -> bool:
-    """Remove the ESTOP sentinel. Returns True if a pause was lifted."""
+    """Remove global and legacy profile sentinels if the pause was lifted."""
+    removed = False
+    failed = False
     try:
-        sentinel_path().unlink()
-        return True
-    except FileNotFoundError:
+        paths = _sentinel_paths()
+    except Exception:
         return False
-    except OSError:
+    for path in paths:
+        try:
+            path.unlink()
+            removed = True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            failed = True
+    if failed or not removed:
         return False
+    return not any(_path_is_engaged(path) for path in paths)
 
 
 def get_state() -> Optional[dict]:
@@ -157,8 +190,12 @@ def get_state() -> Optional[dict]:
     A sentinel with an unreadable/corrupt body still reports engaged, with
     both fields None — the pause is authoritative, the metadata is not.
     """
-    path = sentinel_path()
-    if not is_engaged():
+    try:
+        paths = _sentinel_paths()
+    except Exception:
+        return {"reason": None, "engaged_at": None}
+    path = next((item for item in paths if _path_is_engaged(item)), None)
+    if path is None:
         return None
     reason = None
     engaged_at = None

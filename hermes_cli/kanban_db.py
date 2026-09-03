@@ -1310,6 +1310,7 @@ popen_calls = []
 real_lstat = os.lstat
 original_hermes_home = os.environ["HERMES_HOME"]
 broken_home_link = root / "broken-hermes-home"
+profile_home = root / "profiles" / "planner"
 
 def disarm_brake():
     os.lstat = real_lstat
@@ -1355,6 +1356,10 @@ def arm_brake():
         os.environ["HERMES_HOME"] = str(
             broken_home_link / "profiles" / "planner"
         )
+    elif brake_mode == "shared_profile_root":
+        profile_home.mkdir(parents=True, exist_ok=True)
+        brake.write_text("{}\\n", encoding="utf-8")
+        os.environ["HERMES_HOME"] = str(profile_home)
     else:
         raise RuntimeError("unknown brake mode")
 
@@ -1574,6 +1579,7 @@ raise SystemExit(0 if ok else 1)
                     "broken_symlink",
                     "lookup_error",
                     "broken_ancestor",
+                    "shared_profile_root",
                 )
             ),
         )

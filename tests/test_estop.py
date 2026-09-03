@@ -109,6 +109,44 @@ def test_genuinely_missing_hermes_home_below_real_parent_is_not_engaged(
     assert estop.get_state() is None
 
 
+def test_named_profile_uses_shared_root_estop(tmp_path, monkeypatch):
+    """Every profile must read, write, and remove the same global stop."""
+    root = tmp_path / "shared-root"
+    profile_home = root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    estop._reset_log_state_for_tests()
+
+    assert estop.sentinel_path() == root / "ESTOP"
+    assert estop.is_engaged() is False
+    assert estop.engage(reason="global maintenance") == root / "ESTOP"
+    assert (root / "ESTOP").is_file()
+    assert not (profile_home / "ESTOP").exists()
+    assert estop.get_state()["reason"] == "global maintenance"
+    assert estop.disengage() is True
+    assert not (root / "ESTOP").exists()
+
+
+def test_named_profile_honors_and_removes_legacy_profile_estop(
+    tmp_path, monkeypatch
+):
+    """An upgrade must not silently lift a profile-local existing stop."""
+    root = tmp_path / "shared-root"
+    profile_home = root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    estop._reset_log_state_for_tests()
+    (profile_home / "ESTOP").write_text(
+        '{"reason": "legacy pause"}\n', encoding="utf-8"
+    )
+
+    assert estop.is_engaged() is True
+    assert estop.get_state()["reason"] == "legacy pause"
+    assert estop.disengage() is True
+    assert estop.is_engaged() is False
+    assert not (profile_home / "ESTOP").exists()
+
+
 # ── paused notice for new gateway turns ─────────────────────────────────────
 
 

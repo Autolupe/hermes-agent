@@ -115,7 +115,7 @@ from hermes_constants import is_termux as _is_termux
 def _estop_status_line():
     """One-line pause banner for `hermes status`, or None when not paused.
 
-    Cheap: a single lstat on $HERMES_HOME/ESTOP via agent.estop.
+    Reads the shared-root ESTOP through :mod:`agent.estop`.
     """
     try:
         from agent.estop import get_state

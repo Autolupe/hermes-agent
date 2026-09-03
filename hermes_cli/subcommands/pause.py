@@ -1,9 +1,10 @@
 """``hermes pause`` / ``hermes resume`` — the global emergency stop.
 
-``hermes pause`` writes the ESTOP sentinel at ``$HERMES_HOME/ESTOP``, which
-halts cron dispatch, kanban dispatch, and new gateway turns on their next
-check. In-flight work is never killed. ``hermes resume`` removes the
-sentinel and normal operation resumes on the next tick — no restart needed.
+``hermes pause`` writes the ESTOP sentinel at ``<shared-root>/ESTOP``. The
+default profile and every named profile use that same global stop, which halts
+cron dispatch, kanban dispatch, and new gateway turns on their next check.
+In-flight work is never killed. ``hermes resume`` removes the sentinel and
+normal operation resumes on the next tick — no restart needed.
 
 Ported from: gastownhall/gastown estop.go (MIT); related prior art:
 #26778 (/panic — kill/exit semantics, different), #44617.
