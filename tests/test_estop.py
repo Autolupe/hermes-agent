@@ -50,6 +50,24 @@ def test_disengage_removes_sentinel(hermes_home):
     assert estop.disengage() is False
 
 
+@pytest.mark.linux_only
+def test_disengage_anchors_a_configured_symlinked_home(tmp_path, monkeypatch):
+    """A deliberate HERMES_HOME alias still cleans its own physical stop."""
+    physical_home = tmp_path / "physical-home"
+    physical_home.mkdir()
+    configured_home = tmp_path / "configured-home"
+    configured_home.symlink_to(physical_home, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(configured_home))
+    estop._reset_log_state_for_tests()
+
+    estop.engage(reason="maintenance")
+
+    assert (physical_home / "ESTOP").is_file()
+    assert estop.disengage() is True
+    assert not (physical_home / "ESTOP").exists()
+    assert estop.is_engaged() is False
+
+
 def test_reason_and_timestamp_stored(hermes_home):
     estop.engage(reason="runaway cron fan-out")
     state = estop.get_state()
@@ -202,6 +220,46 @@ def test_symlinked_profile_directory_fails_closed_without_external_delete(
     assert external_stop.is_file()
 
 
+@pytest.mark.linux_only
+@pytest.mark.asyncio
+async def test_gateway_pause_off_anchors_profile_during_symlink_swap(
+    tmp_path, monkeypatch
+):
+    """A profile replaced after capture cannot redirect the real chat cleanup."""
+    from gateway.run import GatewayRunner
+
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profile = profiles_root / "linked"
+    profile.mkdir(parents=True)
+    original_stop = profile / "ESTOP"
+    original_stop.write_text("{}\n", encoding="utf-8")
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    external_stop = outside / "ESTOP"
+    external_stop.write_text("{}\n", encoding="utf-8")
+    moved_profile = profiles_root / "linked-original"
+
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+    capture_targets = estop._sentinel_cleanup_targets
+
+    def capture_then_replace():
+        targets = capture_targets()
+        profile.rename(moved_profile)
+        profile.symlink_to(outside, target_is_directory=True)
+        return targets
+
+    monkeypatch.setattr(estop, "_sentinel_cleanup_targets", capture_then_replace)
+    runner = object.__new__(GatewayRunner)
+
+    reply = await runner._handle_pause_command(_FakePauseEvent("off"))
+
+    assert "hermes is still paused" in reply.lower()
+    assert external_stop.is_file()
+    assert (moved_profile / "ESTOP").is_file()
+
+
 def test_profile_redirect_detector_rejects_windows_reparse_attribute():
     """The junction attribute is unsafe even when its mode says directory."""
     junction_info = SimpleNamespace(
@@ -217,27 +275,38 @@ def test_profile_redirect_detector_rejects_windows_reparse_attribute():
 async def test_gateway_pause_off_rejects_windows_profile_junction(
     tmp_path, monkeypatch
 ):
-    """A real Windows junction must not let chat resume delete outside state."""
+    """A post-capture Windows junction cannot redirect the real chat cleanup."""
     from gateway.run import GatewayRunner
 
     root = tmp_path / "shared-root"
     profiles_root = root / "profiles"
-    profiles_root.mkdir(parents=True)
+    profile = profiles_root / "linked"
+    profile.mkdir(parents=True)
+    original_stop = profile / "ESTOP"
+    original_stop.write_text("{}\n", encoding="utf-8")
     outside = tmp_path / "outside-profile"
     outside.mkdir()
     external_stop = outside / "ESTOP"
     external_stop.write_text("{}\n", encoding="utf-8")
-    junction = profiles_root / "linked"
-    result = subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
-        capture_output=True,
-    )
-    assert result.returncode == 0, result.stderr.decode(
-        "utf-8", errors="replace"
-    )
+    moved_profile = profiles_root / "linked-original"
 
     monkeypatch.setenv("HERMES_HOME", str(root))
     estop._reset_log_state_for_tests()
+    capture_targets = estop._sentinel_cleanup_targets
+
+    def capture_then_replace():
+        targets = capture_targets()
+        profile.rename(moved_profile)
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(profile), str(outside)],
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr.decode(
+            "utf-8", errors="replace"
+        )
+        return targets
+
+    monkeypatch.setattr(estop, "_sentinel_cleanup_targets", capture_then_replace)
     runner = object.__new__(GatewayRunner)
 
     reply = await runner._handle_pause_command(_FakePauseEvent("off"))
@@ -245,6 +314,7 @@ async def test_gateway_pause_off_rejects_windows_profile_junction(
     assert "hermes is still paused" in reply.lower()
     assert "could not be checked safely" in reply.lower()
     assert external_stop.is_file()
+    assert (moved_profile / "ESTOP").is_file()
     assert estop.is_engaged() is True
 
 

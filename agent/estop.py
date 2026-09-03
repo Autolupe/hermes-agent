@@ -39,7 +39,7 @@ import stat as stat_module
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 SENTINEL_NAME = "ESTOP"
 
@@ -51,6 +51,17 @@ _logged_components: set[str] = set()
 
 class DisengageError(RuntimeError):
     """The emergency stop could not be removed or verified safely."""
+
+
+class _LegacySentinelEntry(NamedTuple):
+    path: Path
+    parent_identity: tuple[object, ...]
+
+
+class _CleanupTarget(NamedTuple):
+    logical_path: Path
+    physical_parent: Path
+    parent_identity: tuple[object, ...]
 
 
 def _hermes_home() -> Path:
@@ -94,6 +105,15 @@ def _sentinel_paths() -> tuple[Path, ...]:
 
 
 def _legacy_profile_sentinel_paths(shared_root: Path) -> tuple[Path, ...]:
+    """Return legacy paths after validating every profile directory."""
+    return tuple(
+        entry.path for entry in _legacy_profile_sentinel_entries(shared_root)
+    )
+
+
+def _legacy_profile_sentinel_entries(
+    shared_root: Path,
+) -> tuple[_LegacySentinelEntry, ...]:
     """Discover legacy ESTOP paths without following profile-dir symlinks.
 
     A symlinked or unreadable profile directory is not safe to scan or clean:
@@ -116,15 +136,20 @@ def _legacy_profile_sentinel_paths(shared_root: Path) -> tuple[Path, ...]:
     ):
         raise OSError("profiles path is not a real, unredirected directory")
 
-    discovered: list[Path] = []
+    discovered: list[_LegacySentinelEntry] = []
     with os.scandir(profiles_root) as entries:
         for entry in entries:
             entry_info = entry.stat(follow_symlinks=False)
             if _is_unsafe_profile_redirect(entry_info):
                 raise OSError("redirected profile directory is unsafe")
             if stat_module.S_ISDIR(entry_info.st_mode):
-                discovered.append(Path(entry.path) / SENTINEL_NAME)
-    return tuple(sorted(discovered, key=lambda path: str(path)))
+                discovered.append(
+                    _LegacySentinelEntry(
+                        Path(entry.path) / SENTINEL_NAME,
+                        _stat_identity(entry_info),
+                    )
+                )
+    return tuple(sorted(discovered, key=lambda item: str(item.path)))
 
 
 def _is_unsafe_profile_redirect(info: object) -> bool:
@@ -143,6 +168,165 @@ def _is_unsafe_profile_redirect(info: object) -> bool:
     )
     file_attributes = getattr(info, "st_file_attributes", 0)
     return stat_module.S_ISLNK(mode) or bool(file_attributes & reparse_flag)
+
+
+def _stat_identity(info: object) -> tuple[object, ...]:
+    """Return stable directory identity fields available on every host."""
+    return (
+        getattr(info, "st_dev", None),
+        getattr(info, "st_ino", None),
+        getattr(info, "st_mode", None),
+        getattr(info, "st_file_attributes", None),
+        getattr(info, "st_reparse_tag", None),
+    )
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    """Compare physical paths with the host's case-sensitivity rules."""
+    path_text = os.path.normcase(str(path))
+    root_text = os.path.normcase(str(root))
+    try:
+        return os.path.commonpath((path_text, root_text)) == root_text
+    except ValueError:
+        return False
+
+
+def _capture_cleanup_target(
+    path: Path,
+    expected_parent_identity: tuple[object, ...] | None,
+) -> _CleanupTarget | None:
+    """Capture one present stop under its validated physical parent."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        if not _missing_path_has_usable_ancestor(path.parent):
+            raise OSError("stop path ancestry is not usable")
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return None
+
+    try:
+        physical_root = sentinel_path().parent.resolve(strict=True)
+        physical_parent = path.parent.resolve(strict=True)
+        parent_info = os.stat(physical_parent, follow_symlinks=False)
+    except (OSError, RuntimeError) as exc:
+        raise OSError("stop parent could not be resolved safely") from exc
+    if not _path_is_within(physical_parent, physical_root):
+        raise OSError("stop parent resolves outside the shared Hermes root")
+    if _is_unsafe_profile_redirect(parent_info):
+        raise OSError("resolved stop parent is redirected")
+
+    parent_identity = _stat_identity(parent_info)
+    if (
+        expected_parent_identity is not None
+        and parent_identity != expected_parent_identity
+    ):
+        raise OSError("profile directory changed during stop discovery")
+    return _CleanupTarget(path, physical_parent, parent_identity)
+
+
+def _sentinel_cleanup_targets() -> tuple[_CleanupTarget, ...]:
+    """Capture deletions so a later path replacement cannot redirect them."""
+    shared = sentinel_path()
+    legacy = _active_hermes_home() / SENTINEL_NAME
+    candidates: dict[Path, tuple[object, ...] | None] = {shared: None}
+    if legacy != shared:
+        candidates[legacy] = None
+    for entry in _legacy_profile_sentinel_entries(shared.parent):
+        candidates[entry.path] = entry.parent_identity
+
+    captured: list[_CleanupTarget] = []
+    for path, expected_parent_identity in candidates.items():
+        target = _capture_cleanup_target(path, expected_parent_identity)
+        if target is not None:
+            captured.append(target)
+    return tuple(captured)
+
+
+def _unlink_windows_cleanup_target(target: _CleanupTarget) -> None:
+    """Hold the validated Windows parent open so it cannot be replaced."""
+    import ctypes
+    from ctypes import wintypes
+
+    file_read_attributes = 0x00000080
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    open_existing = 3
+    file_flag_open_reparse_point = 0x00200000
+    file_flag_backup_semantics = 0x02000000
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = create_file(
+        str(target.physical_parent),
+        file_read_attributes,
+        file_share_read | file_share_write,
+        None,
+        open_existing,
+        file_flag_backup_semantics | file_flag_open_reparse_point,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    try:
+        current_info = os.stat(target.physical_parent, follow_symlinks=False)
+        if (
+            _is_unsafe_profile_redirect(current_info)
+            or _stat_identity(current_info) != target.parent_identity
+        ):
+            raise OSError("stop parent changed before cleanup")
+        (target.physical_parent / target.logical_path.name).unlink()
+    finally:
+        if not close_handle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _unlink_cleanup_target(target: _CleanupTarget) -> None:
+    """Delete a stop through a directory that still has captured identity."""
+    if target.logical_path.name != SENTINEL_NAME:
+        raise OSError("refusing to remove an unexpected stop filename")
+    if os.name == "nt":
+        _unlink_windows_cleanup_target(target)
+        return
+
+    supports_dir_fd = os.unlink in getattr(os, "supports_dir_fd", set())
+    if supports_dir_fd:
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        parent_fd = os.open(target.physical_parent, flags)
+        try:
+            if _stat_identity(os.fstat(parent_fd)) != target.parent_identity:
+                raise OSError("stop parent changed before cleanup")
+            os.unlink(target.logical_path.name, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+        return
+
+    current_info = os.stat(target.physical_parent, follow_symlinks=False)
+    if (
+        _is_unsafe_profile_redirect(current_info)
+        or _stat_identity(current_info) != target.parent_identity
+    ):
+        raise OSError("stop parent changed before cleanup")
+    (target.physical_parent / target.logical_path.name).unlink()
 
 
 def is_engaged() -> bool:
@@ -235,14 +419,14 @@ def disengage() -> bool:
     removed = False
     failed = False
     try:
-        paths = _sentinel_paths()
+        targets = _sentinel_cleanup_targets()
     except Exception as exc:
         raise DisengageError(
             "the shared or legacy profile stop paths could not be checked safely"
         ) from exc
-    for path in paths:
+    for target in targets:
         try:
-            path.unlink()
+            _unlink_cleanup_target(target)
             removed = True
         except FileNotFoundError:
             continue
