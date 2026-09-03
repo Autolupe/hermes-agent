@@ -1389,6 +1389,12 @@ def test_estop_arriving_during_default_spawn_setup_blocks_popen(
     task = kb.get_task(conn, task_id)
     estop_path = tmp_path / "ESTOP"
     popen_calls = []
+    log_dir = kb.worker_logs_dir()
+    log_dir.mkdir(parents=True)
+    log_path = log_dir / f"{task_id}.log"
+    backup_path = log_dir / f"{task_id}.log.1"
+    log_path.write_bytes(b"current worker log\n")
+    backup_path.write_bytes(b"previous backup\n")
 
     def engage_during_setup(*_args, **_kwargs):
         estop_path.write_text("{}\n", encoding="utf-8")
@@ -1404,7 +1410,7 @@ def test_estop_arriving_during_default_spawn_setup_blocks_popen(
     )
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
     monkeypatch.setattr(
-        kb, "worker_log_rotation_config", lambda *_args, **_kwargs: (2097152, 1)
+        kb, "worker_log_rotation_config", lambda *_args, **_kwargs: (1, 1)
     )
     monkeypatch.setattr(kb.subprocess, "Popen", forbidden_popen)
 
@@ -1413,6 +1419,8 @@ def test_estop_arriving_during_default_spawn_setup_blocks_popen(
 
     assert estop_path.is_file()
     assert popen_calls == []
+    assert log_path.read_bytes() == b"current worker log\n"
+    assert backup_path.read_bytes() == b"previous backup\n"
 
 
 @pytest.mark.parametrize(

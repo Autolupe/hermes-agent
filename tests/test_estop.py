@@ -288,6 +288,45 @@ def test_symlinked_profile_directory_fails_closed_without_external_delete(
 
 
 @pytest.mark.linux_only
+@pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])
+def test_legacy_stop_read_fails_closed_when_profile_replaced_after_discovery(
+    tmp_path, monkeypatch, replacement_kind
+):
+    """A profile swap cannot hide the stop found in the original directory."""
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profile = profiles_root / "coder"
+    profile.mkdir(parents=True)
+    (profile / "ESTOP").write_text("{}\n", encoding="utf-8")
+    moved_profile = tmp_path / "coder-original"
+    replacement_target = tmp_path / "replacement-target"
+    replacement_target.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+    discover_entries = estop._legacy_profile_sentinel_entries
+
+    def discover_then_replace(shared_root):
+        entries = discover_entries(shared_root)
+        profile.rename(moved_profile)
+        if replacement_kind == "symlink":
+            profile.symlink_to(replacement_target, target_is_directory=True)
+        else:
+            profile.mkdir()
+        return entries
+
+    monkeypatch.setattr(
+        estop,
+        "_legacy_profile_sentinel_entries",
+        discover_then_replace,
+    )
+
+    assert estop.is_engaged() is True
+    assert (moved_profile / "ESTOP").is_file()
+    assert not (profile / "ESTOP").exists()
+    assert not (replacement_target / "ESTOP").exists()
+
+
+@pytest.mark.linux_only
 @pytest.mark.asyncio
 async def test_gateway_pause_off_anchors_profile_during_symlink_swap(
     tmp_path, monkeypatch

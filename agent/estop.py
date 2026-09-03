@@ -63,6 +63,11 @@ class _LegacySentinelEntry(NamedTuple):
     parent_identity: tuple[object, ...]
 
 
+class _SentinelReadEntry(NamedTuple):
+    path: Path
+    parent_identity: tuple[object, ...] | None
+
+
 class _CleanupTarget(NamedTuple):
     logical_path: Path
     physical_parent: Path
@@ -93,8 +98,8 @@ def sentinel_path() -> Path:
     return _hermes_home() / SENTINEL_NAME
 
 
-def _sentinel_paths() -> tuple[Path, ...]:
-    """Return the global path plus every legacy named-profile path.
+def _sentinel_read_entries() -> tuple[_SentinelReadEntry, ...]:
+    """Return every stop path with its discovered profile identity.
 
     Older Hermes releases wrote ESTOP inside only the active profile. A
     default or sibling-profile gateway must therefore scan the shared
@@ -103,18 +108,19 @@ def _sentinel_paths() -> tuple[Path, ...]:
     """
     shared = sentinel_path()
     legacy = _active_hermes_home() / SENTINEL_NAME
-    paths = [shared]
+    entries: dict[Path, _SentinelReadEntry] = {
+        shared: _SentinelReadEntry(shared, None)
+    }
     if legacy != shared:
-        paths.append(legacy)
-    paths.extend(_legacy_profile_sentinel_paths(shared.parent))
-    return tuple(dict.fromkeys(paths))
-
-
-def _legacy_profile_sentinel_paths(shared_root: Path) -> tuple[Path, ...]:
-    """Return legacy paths after validating every profile directory."""
-    return tuple(
-        entry.path for entry in _legacy_profile_sentinel_entries(shared_root)
-    )
+        entries[legacy] = _SentinelReadEntry(legacy, None)
+    for entry in _legacy_profile_sentinel_entries(shared.parent):
+        # Replacing an existing key retains its original ordering while adding
+        # the directory identity captured during the profile scan.
+        entries[entry.path] = _SentinelReadEntry(
+            entry.path,
+            entry.parent_identity,
+        )
+    return tuple(entries.values())
 
 
 def _legacy_profile_sentinel_entries(
@@ -657,9 +663,44 @@ def is_engaged() -> bool:
     operator's emergency stop exactly when the filesystem is misbehaving.
     """
     try:
-        return any(_path_is_engaged(path) for path in _sentinel_paths())
+        return any(
+            _sentinel_entry_is_engaged(entry)
+            for entry in _sentinel_read_entries()
+        )
     except Exception:
         return True
+
+
+def _sentinel_parent_matches(entry: _SentinelReadEntry) -> bool:
+    """Verify that a discovered profile path still names the same directory."""
+    if entry.parent_identity is None:
+        return True
+    try:
+        parent_info = os.stat(entry.path.parent, follow_symlinks=False)
+        if (
+            not stat_module.S_ISDIR(parent_info.st_mode)
+            or _is_unsafe_profile_redirect(parent_info)
+            or _stat_identity(parent_info) != entry.parent_identity
+            or _is_profile_mount_point(
+                entry.path.parent,
+                _linux_mount_points(),
+            )
+        ):
+            return False
+    except (OSError, RuntimeError):
+        return False
+    return True
+
+
+def _sentinel_entry_is_engaged(entry: _SentinelReadEntry) -> bool:
+    """Check a stop without letting a replaced profile hide its old entry."""
+    if not _sentinel_parent_matches(entry):
+        return True
+    if _path_is_engaged(entry.path):
+        return True
+    # An absent leaf is safe only while it remains below the exact directory
+    # that the profile enumeration validated.
+    return not _sentinel_parent_matches(entry)
 
 
 def _path_is_engaged(path: Path) -> bool:
@@ -785,16 +826,23 @@ def get_state() -> Optional[dict]:
     both fields None — the pause is authoritative, the metadata is not.
     """
     try:
-        paths = _sentinel_paths()
+        entries = _sentinel_read_entries()
     except Exception:
         return {"reason": None, "engaged_at": None}
-    path = next((item for item in paths if _path_is_engaged(item)), None)
-    if path is None:
+    entry = next(
+        (item for item in entries if _sentinel_entry_is_engaged(item)),
+        None,
+    )
+    if entry is None:
         return None
     reason = None
     engaged_at = None
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not _sentinel_parent_matches(entry):
+            raise OSError("stop parent changed before metadata read")
+        raw = json.loads(entry.path.read_text(encoding="utf-8"))
+        if not _sentinel_parent_matches(entry):
+            raise OSError("stop parent changed during metadata read")
         if isinstance(raw, dict):
             reason = raw.get("reason") or None
             engaged_at = raw.get("engaged_at") or None

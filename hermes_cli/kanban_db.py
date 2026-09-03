@@ -13350,10 +13350,17 @@ def _default_spawn(
     # `hermes kanban log` on a specific board reads its own file and
     # logs don't collide across boards that happen to share task ids.
     log_dir = worker_logs_dir(board=board)
-    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
+    # Command, toolset, and log-policy resolution above may be slow enough for
+    # an operator stop to arrive. Check immediately before the first log write
+    # so a blocked attempt cannot change the previous worker's diagnostics.
+    _raise_if_dispatch_paused()
+    log_dir.mkdir(parents=True, exist_ok=True)
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    # Keep a second edge after log I/O so a stop that arrives during that short
+    # operation cannot create a new file or reach the process launch.
+    _raise_if_dispatch_paused()
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
