@@ -661,8 +661,14 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
-def _dashboard_allowed_hosts() -> set[str]:
-    """Resolve wildcard-bind Host names with env-over-config precedence."""
+def _dashboard_allowed_hosts() -> Optional[set[str]]:
+    """Resolve wildcard-bind Host names with env-over-config precedence.
+
+    ``None`` means the canonical list is absent or explicitly empty, which
+    preserves legacy wildcard behavior. A set means an allowlist was supplied;
+    an empty set is deliberately distinct and rejects every Host because the
+    supplied value was malformed or contained no usable string entries.
+    """
     env_raw = os.environ.get("HERMES_DASHBOARD_ALLOWED_HOSTS", "")
     if env_raw.strip():
         raw_values: Any = env_raw.split(",")
@@ -675,14 +681,16 @@ def _dashboard_allowed_hosts() -> set[str]:
                 default=[],
             )
         except Exception:  # noqa: BLE001 — malformed config must not crash HTTP
-            raw_values = []
+            return set()
 
-    if isinstance(raw_values, str):
-        values = raw_values.split(",")
-    elif isinstance(raw_values, (list, tuple, set)):
+    if isinstance(raw_values, list):
+        if not raw_values:
+            return None
         values = raw_values
     else:
-        values = []
+        # The canonical config shape is a YAML list. An unexpected scalar or
+        # object is configured-but-invalid and must not turn protection off.
+        return set()
     return {
         item.strip().lower().rstrip(".")
         for item in values
@@ -726,7 +734,7 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     # allow-any behavior only when no explicit allowlist is configured.
     if bound_host in {"0.0.0.0", "::"}:
         allowed_hosts = _dashboard_allowed_hosts()
-        if not allowed_hosts:
+        if allowed_hosts is None:
             return True
         return host_only.rstrip(".") in allowed_hosts
 

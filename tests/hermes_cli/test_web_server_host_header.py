@@ -25,10 +25,18 @@ class TestHostHeaderValidator:
 
 
 
-    def test_zero_zero_bind_accepts_anything_without_allowlist(self, monkeypatch):
+    def test_zero_zero_bind_accepts_anything_without_allowlist(
+        self, tmp_path, monkeypatch
+    ):
         """Preserve the legacy wildcard behavior without an explicit list."""
         from hermes_cli.web_server import _is_accepted_host
 
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "dashboard:\n  allowed_hosts: []\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
         for host in ("10.0.0.5", "evil.example", "my-server.corp.net"):
             assert _is_accepted_host(host, "0.0.0.0")
@@ -90,6 +98,25 @@ class TestHostHeaderValidator:
 
         assert _is_accepted_host("env-only.example", "0.0.0.0")
         assert not _is_accepted_host("config-only.example", "0.0.0.0")
+
+    def test_malformed_environment_allowlist_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli.web_server import _is_accepted_host
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "dashboard:\n"
+            "  allowed_hosts:\n"
+            "    - config-only.example\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_DASHBOARD_ALLOWED_HOSTS", " , ")
+
+        assert not _is_accepted_host("config-only.example", "0.0.0.0")
+        assert not _is_accepted_host("attacker.example", "0.0.0.0")
 
     def test_explicit_non_loopback_bind_requires_exact_match(self):
         """If the operator bound to a specific non-loopback hostname,
@@ -160,6 +187,33 @@ class TestHostHeaderMiddleware:
         assert response.headers["X-Frame-Options"] == "SAMEORIGIN"
         assert response.headers["Referrer-Policy"] == "no-referrer"
         assert response.headers["X-XSS-Protection"] == "0"
+
+    def test_malformed_config_allowlist_fails_closed_through_middleware(
+        self, tmp_path, monkeypatch
+    ):
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "dashboard:\n"
+            "  allowed_hosts:\n"
+            "    host: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
+        app.state.bound_host = "0.0.0.0"
+        try:
+            response = TestClient(app).get(
+                "/api/status", headers={"Host": "attacker.example"}
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"].startswith("Invalid Host header")
+        finally:
+            if hasattr(app.state, "bound_host"):
+                del app.state.bound_host
 
 
 class TestWebSocketHostOriginGuard:
