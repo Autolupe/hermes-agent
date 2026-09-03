@@ -403,6 +403,45 @@ def test_stop_engaged_during_ready_promotion_lock_wait_keeps_todos_parked(
     verify.close()
 
 
+@pytest.mark.parametrize("brake", ["halt", "estop"])
+def test_stop_engaged_during_dispatch_reclaim_skips_promotion_and_spawn(
+    tmp_path, monkeypatch, brake
+):
+    """A stop arriving after tick entry must end the tick before ready work."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(conn, title="stay parked", triage=True)
+    conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+    conn.commit()
+
+    def stop_during_reclaim(_conn):
+        if brake == "halt":
+            _halt(tmp_path, monkeypatch)
+        else:
+            (tmp_path / "ESTOP").write_text("{}\n", encoding="utf-8")
+        return []
+
+    spawn_calls = []
+    monkeypatch.setattr(kb, "release_stale_claims", stop_during_reclaim)
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args: spawn_calls.append(args),
+        max_spawn=1,
+    )
+
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "todo"
+    assert result.promoted == 0
+    assert result.spawned == []
+    assert spawn_calls == []
+    assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+    conn.close()
+
+
 @pytest.mark.linux_only
 def test_broken_estop_entry_blocks_dispatch_boundary(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

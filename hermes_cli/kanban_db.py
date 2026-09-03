@@ -11913,7 +11913,17 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    try:
+        result.promoted = recompute_ready(
+            conn,
+            failure_limit=failure_limit,
+            require_dispatch_allowed=True,
+        )
+    except DispatchPausedError:
+        # A stop can arrive after the tick entry check while reclaim and
+        # reconciliation are running. Keep their completed audit work, but end
+        # this tick before any card becomes runnable or any worker is claimed.
+        return result
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
