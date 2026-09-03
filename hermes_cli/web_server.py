@@ -68,6 +68,7 @@ from hermes_cli.config import (
     get_hermes_home,
     get_process_hermes_home,
     load_config,
+    load_config_readonly,
     load_env,
     read_raw_config,
     resolve_cron_model_drift_defaults,
@@ -660,6 +661,35 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
+def _dashboard_allowed_hosts() -> set[str]:
+    """Resolve wildcard-bind Host names with env-over-config precedence."""
+    env_raw = os.environ.get("HERMES_DASHBOARD_ALLOWED_HOSTS", "")
+    if env_raw.strip():
+        raw_values: Any = env_raw.split(",")
+    else:
+        try:
+            raw_values = cfg_get(
+                load_config_readonly(),
+                "dashboard",
+                "allowed_hosts",
+                default=[],
+            )
+        except Exception:  # noqa: BLE001 — malformed config must not crash HTTP
+            raw_values = []
+
+    if isinstance(raw_values, str):
+        values = raw_values.split(",")
+    elif isinstance(raw_values, (list, tuple, set)):
+        values = raw_values
+    else:
+        values = []
+    return {
+        item.strip().lower().rstrip(".")
+        for item in values
+        if isinstance(item, str) and item.strip().rstrip(".")
+    }
+
+
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     """True if the Host header targets the interface we bound to.
 
@@ -695,12 +725,7 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     # MagicDNS name while rejecting DNS-rebinding hostnames. Keep the old
     # allow-any behavior only when no explicit allowlist is configured.
     if bound_host in {"0.0.0.0", "::"}:
-        configured = os.environ.get("HERMES_DASHBOARD_ALLOWED_HOSTS", "")
-        allowed_hosts = {
-            item.strip().lower().rstrip(".")
-            for item in configured.split(",")
-            if item.strip()
-        }
+        allowed_hosts = _dashboard_allowed_hosts()
         if not allowed_hosts:
             return True
         return host_only.rstrip(".") in allowed_hosts

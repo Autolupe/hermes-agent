@@ -49,6 +49,48 @@ class TestHostHeaderValidator:
         )
         assert not _is_accepted_host("attacker.example", "0.0.0.0")
 
+    def test_wildcard_bind_uses_config_yaml_allowlist(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli.web_server import _is_accepted_host
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "dashboard:\n"
+            "  allowed_hosts:\n"
+            "    - config-only.example\n"
+            "    - 100.115.1.128\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
+
+        assert _is_accepted_host("config-only.example:9120", "0.0.0.0")
+        assert _is_accepted_host("100.115.1.128:9120", "0.0.0.0")
+        assert not _is_accepted_host("attacker.example", "0.0.0.0")
+
+    def test_environment_allowlist_overrides_config_yaml(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli.web_server import _is_accepted_host
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "dashboard:\n"
+            "  allowed_hosts:\n"
+            "    - config-only.example\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_ALLOWED_HOSTS", "env-only.example"
+        )
+
+        assert _is_accepted_host("env-only.example", "0.0.0.0")
+        assert not _is_accepted_host("config-only.example", "0.0.0.0")
+
     def test_explicit_non_loopback_bind_requires_exact_match(self):
         """If the operator bound to a specific non-loopback hostname,
         the Host header must match exactly."""
