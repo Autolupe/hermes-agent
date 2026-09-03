@@ -1223,7 +1223,11 @@ def _set_status_direct(
         kanban_db._terminate_reclaimed_worker(pid, claim_lock)
     # If we re-opened something, children may have gone stale.
     if effective_status in {"done", "ready", "review"}:
-        kanban_db.recompute_ready(conn)
+        try:
+            kanban_db.recompute_ready(conn)
+        except kanban_db.DispatchPausedError:
+            # Keep the edit, but do not create runnable work while paused.
+            pass
     return True
 
 

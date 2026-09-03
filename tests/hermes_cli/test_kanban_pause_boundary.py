@@ -73,6 +73,66 @@ def test_halt_blocks_ready_and_review_claims_without_run_rows(tmp_path, monkeypa
     assert kb.claim_review_task(conn, review_id) is not None
 
 
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_recompute_ready_checks_dispatch_brakes_by_default(
+    tmp_path, monkeypatch, brake
+):
+    """Every ready-promotion caller must opt out explicitly, never by accident."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(conn, title="parked todo", assignee="default")
+    conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+    conn.commit()
+    if brake == "dispatch_pause":
+        _pause(tmp_path, monkeypatch)
+    elif brake == "halt":
+        _halt(tmp_path, monkeypatch)
+    else:
+        (tmp_path / "ESTOP").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(kb.DispatchPausedError):
+        kb.recompute_ready(conn)
+
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "todo"
+    conn.close()
+
+
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_completion_commits_but_keeps_dependents_parked(
+    tmp_path, monkeypatch, brake
+):
+    """An in-flight completion remains valid without creating ready work."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    parent_id = kb.create_task(conn, title="finishing parent")
+    child_id = kb.create_task(
+        conn,
+        title="parked dependent",
+        parents=[parent_id],
+    )
+    if brake == "dispatch_pause":
+        _pause(tmp_path, monkeypatch)
+    elif brake == "halt":
+        _halt(tmp_path, monkeypatch)
+    else:
+        (tmp_path / "ESTOP").write_text("{}\n", encoding="utf-8")
+
+    assert kb.complete_task(conn, parent_id, summary="finished in flight") is True
+
+    parent = kb.get_task(conn, parent_id)
+    child = kb.get_task(conn, child_id)
+    assert parent is not None and parent.status == "done"
+    assert child is not None and child.status == "todo"
+    conn.close()
+
+
 def test_estop_blocks_ready_and_review_claims_without_run_rows(
     tmp_path, monkeypatch
 ):

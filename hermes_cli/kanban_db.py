@@ -5111,7 +5111,7 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
         # child immediately.  Matches the contract of complete_task and
         # unblock_task; without this the child stays stuck in todo until the
         # next dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
-        recompute_ready(conn)
+        _recompute_ready_after_committed_mutation(conn)
     return removed
 
 
@@ -5725,7 +5725,7 @@ def recompute_ready(
     conn: sqlite3.Connection,
     failure_limit: int = None,
     *,
-    require_dispatch_allowed: bool = False,
+    require_dispatch_allowed: bool = True,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -5756,10 +5756,11 @@ def recompute_ready(
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
 
-    ``require_dispatch_allowed`` protects automatic planning follow-ups. It
-    checks once before waiting for SQLite and again after the write transaction
-    is acquired, so a stop engaged during lock contention cannot promote new
-    runnable work.
+    Dispatch brakes protect every promotion by default. The check runs once
+    before waiting for SQLite and again after the write transaction is acquired,
+    so a stop engaged during lock contention cannot promote new runnable work.
+    Tests of the isolated dependency algorithm can explicitly set
+    ``require_dispatch_allowed=False``.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -5823,6 +5824,16 @@ def recompute_ready(
                 )
                 promoted += 1
     return promoted
+
+
+def _recompute_ready_after_committed_mutation(
+    conn: sqlite3.Connection,
+) -> int:
+    """Promote dependents unless a brake parked this committed mutation."""
+    try:
+        return recompute_ready(conn)
+    except DispatchPausedError:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -6831,7 +6842,7 @@ def complete_task(
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
+    _recompute_ready_after_committed_mutation(conn)
     # Release the finished worker's worktree lock, then clean up the
     # scratch workspace and any stale tmux session for the worker.
     _unlock_task_worktree(conn, task_id, _prior_pid)
@@ -8826,7 +8837,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
-    recompute_ready(conn)
+    _recompute_ready_after_committed_mutation(conn)
     # Reap the workspace on archive too — tasks archived without ever
     # completing previously kept their scratch dir / worktree forever.
     _cleanup_workspace(conn, task_id)
@@ -8878,7 +8889,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-    recompute_ready(conn)
+    _recompute_ready_after_committed_mutation(conn)
     return True
 
 

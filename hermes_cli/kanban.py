@@ -1649,7 +1649,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        try:
+            kb.recompute_ready(conn)
+        except kb.DispatchPausedError:
+            # Listing stays read-only while a brake parks new runnable work.
+            pass
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,
