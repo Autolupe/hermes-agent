@@ -327,6 +327,51 @@ def test_legacy_stop_read_fails_closed_when_profile_replaced_after_discovery(
 
 
 @pytest.mark.linux_only
+def test_legacy_stop_leaf_read_uses_anchored_profile_during_temporary_swaps(
+    tmp_path, monkeypatch
+):
+    """Two temporary empty replacements cannot hide the original stop leaf."""
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profile = profiles_root / "coder"
+    profile.mkdir(parents=True)
+    stop = profile / "ESTOP"
+    stop.write_text("{}\n", encoding="utf-8")
+    moved_profile = tmp_path / "coder-original"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+    real_lstat = estop.os.lstat
+    attacks = 0
+
+    def lstat_with_stop_temporarily_hidden(path, *args, **kwargs):
+        nonlocal attacks
+        if os.fspath(path) != os.fspath(stop):
+            return real_lstat(path, *args, **kwargs)
+        profile.rename(moved_profile)
+        profile.mkdir()
+        try:
+            return real_lstat(path, *args, **kwargs)
+        finally:
+            profile.rmdir()
+            moved_profile.rename(profile)
+            attacks += 1
+
+    monkeypatch.setattr(estop.os, "lstat", lstat_with_stop_temporarily_hidden)
+
+    # This recreates the old race: both path lookups miss while every parent
+    # validation sees the restored original directory.
+    assert estop._path_is_engaged(stop) is False
+    assert attacks == 2
+    attacks = 0
+
+    # The public gate reads ESTOP relative to its already-open, identity-
+    # checked profile directory and never performs the vulnerable path lookup.
+    assert estop.is_engaged() is True
+    assert attacks == 0
+    assert stop.is_file()
+
+
+@pytest.mark.linux_only
 def test_legacy_stop_scan_anchors_profiles_root_during_replacement(
     tmp_path, monkeypatch
 ):

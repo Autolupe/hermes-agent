@@ -66,6 +66,7 @@ class _LegacySentinelEntry(NamedTuple):
 class _SentinelReadEntry(NamedTuple):
     path: Path
     parent_identity: tuple[object, ...] | None
+    parent_fd: int | None = None
 
 
 class _CleanupTarget(NamedTuple):
@@ -113,14 +114,26 @@ def _sentinel_read_entries() -> tuple[_SentinelReadEntry, ...]:
     }
     if legacy != shared:
         entries[legacy] = _SentinelReadEntry(legacy, None)
-    for entry in _legacy_profile_sentinel_entries(shared.parent):
-        # Replacing an existing key retains its original ordering while adding
-        # the directory identity captured during the profile scan.
-        entries[entry.path] = _SentinelReadEntry(
-            entry.path,
-            entry.parent_identity,
-        )
-    return tuple(entries.values())
+    try:
+        for entry in _legacy_profile_sentinel_entries(shared.parent):
+            parent_fd = None
+            if _supports_anchored_profile_scan():
+                parent_fd = _open_validated_sentinel_parent(entry)
+            # Replacing an existing key retains its original ordering while
+            # adding the directory identity and, where supported, an open
+            # descriptor captured for the leaf read.
+            prior = entries.get(entry.path)
+            if prior is not None and prior.parent_fd is not None:
+                os.close(prior.parent_fd)
+            entries[entry.path] = _SentinelReadEntry(
+                entry.path,
+                entry.parent_identity,
+                parent_fd,
+            )
+        return tuple(entries.values())
+    except BaseException:
+        _close_sentinel_read_entry_fds(tuple(entries.values()))
+        raise
 
 
 def _legacy_profile_sentinel_entries(
@@ -464,6 +477,42 @@ def _optional_entry_info(parent_fd: int, name: str) -> object | None:
             return None
 
 
+def _open_validated_sentinel_parent(entry: _LegacySentinelEntry) -> int:
+    """Open the discovered profile so later leaf reads cannot be retargeted."""
+    parent_fd = os.open(entry.path.parent, _directory_open_flags())
+    try:
+        parent_info = os.fstat(parent_fd)
+        if (
+            not stat_module.S_ISDIR(parent_info.st_mode)
+            or _is_unsafe_profile_redirect(parent_info)
+            or _stat_identity(parent_info) != entry.parent_identity
+            or _is_profile_mount_point(
+                entry.path.parent,
+                _linux_mount_points(),
+            )
+        ):
+            raise OSError("profile directory changed before stop read")
+        return parent_fd
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _close_sentinel_read_entry_fds(
+    entries: tuple[_SentinelReadEntry, ...],
+) -> None:
+    """Close profile descriptors retained only for one stop-state read."""
+    closed: set[int] = set()
+    for entry in entries:
+        if entry.parent_fd is None or entry.parent_fd in closed:
+            continue
+        closed.add(entry.parent_fd)
+        try:
+            os.close(entry.parent_fd)
+        except OSError:
+            pass
+
+
 def _reject_child_mount(
     parent_fd: int,
     child_fd: int,
@@ -774,13 +823,14 @@ def is_engaged() -> bool:
     sentinel is unreadable — a fail-open here would silently lift an
     operator's emergency stop exactly when the filesystem is misbehaving.
     """
+    entries: tuple[_SentinelReadEntry, ...] = ()
     try:
-        return any(
-            _sentinel_entry_is_engaged(entry)
-            for entry in _sentinel_read_entries()
-        )
+        entries = _sentinel_read_entries()
+        return any(_sentinel_entry_is_engaged(entry) for entry in entries)
     except Exception:
         return True
+    finally:
+        _close_sentinel_read_entry_fds(entries)
 
 
 def _sentinel_parent_matches(entry: _SentinelReadEntry) -> bool:
@@ -788,6 +838,13 @@ def _sentinel_parent_matches(entry: _SentinelReadEntry) -> bool:
     if entry.parent_identity is None:
         return True
     try:
+        if entry.parent_fd is not None:
+            parent_info = os.fstat(entry.parent_fd)
+            return (
+                stat_module.S_ISDIR(parent_info.st_mode)
+                and not _is_unsafe_profile_redirect(parent_info)
+                and _stat_identity(parent_info) == entry.parent_identity
+            )
         parent_info = os.stat(entry.path.parent, follow_symlinks=False)
         if (
             not stat_module.S_ISDIR(parent_info.st_mode)
@@ -808,6 +865,16 @@ def _sentinel_entry_is_engaged(entry: _SentinelReadEntry) -> bool:
     """Check a stop without letting a replaced profile hide its old entry."""
     if not _sentinel_parent_matches(entry):
         return True
+    if entry.parent_fd is not None:
+        try:
+            present = _optional_entry_info(entry.parent_fd, entry.path.name)
+        except OSError:
+            return True
+        if present is not None:
+            return True
+        # The open directory, rather than its replaceable pathname, remains
+        # the authority for both absence checks.
+        return not _sentinel_parent_matches(entry)
     if _path_is_engaged(entry.path):
         return True
     # An absent leaf is safe only while it remains below the exact directory
@@ -937,30 +1004,58 @@ def get_state() -> Optional[dict]:
     A sentinel with an unreadable/corrupt body still reports engaged, with
     both fields None — the pause is authoritative, the metadata is not.
     """
+    entries: tuple[_SentinelReadEntry, ...] = ()
     try:
-        entries = _sentinel_read_entries()
-    except Exception:
-        return {"reason": None, "engaged_at": None}
-    entry = next(
-        (item for item in entries if _sentinel_entry_is_engaged(item)),
-        None,
+        try:
+            entries = _sentinel_read_entries()
+        except Exception:
+            return {"reason": None, "engaged_at": None}
+        entry = next(
+            (item for item in entries if _sentinel_entry_is_engaged(item)),
+            None,
+        )
+        if entry is None:
+            return None
+        reason = None
+        engaged_at = None
+        try:
+            if not _sentinel_parent_matches(entry):
+                raise OSError("stop parent changed before metadata read")
+            raw = json.loads(_read_sentinel_entry_text(entry))
+            if not _sentinel_parent_matches(entry):
+                raise OSError("stop parent changed during metadata read")
+            if isinstance(raw, dict):
+                reason = raw.get("reason") or None
+                engaged_at = raw.get("engaged_at") or None
+        except (OSError, ValueError):
+            pass
+        return {"reason": reason, "engaged_at": engaged_at}
+    finally:
+        _close_sentinel_read_entry_fds(entries)
+
+
+def _read_sentinel_entry_text(entry: _SentinelReadEntry) -> str:
+    """Read stop metadata through the same anchored parent used for presence."""
+    if entry.parent_fd is None:
+        return entry.path.read_text(encoding="utf-8")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
     )
-    if entry is None:
-        return None
-    reason = None
-    engaged_at = None
+    leaf_fd: int | None = os.open(
+        entry.path.name,
+        flags,
+        dir_fd=entry.parent_fd,
+    )
     try:
-        if not _sentinel_parent_matches(entry):
-            raise OSError("stop parent changed before metadata read")
-        raw = json.loads(entry.path.read_text(encoding="utf-8"))
-        if not _sentinel_parent_matches(entry):
-            raise OSError("stop parent changed during metadata read")
-        if isinstance(raw, dict):
-            reason = raw.get("reason") or None
-            engaged_at = raw.get("engaged_at") or None
-    except (OSError, ValueError):
-        pass
-    return {"reason": reason, "engaged_at": engaged_at}
+        stream = os.fdopen(leaf_fd, "r", encoding="utf-8")
+        leaf_fd = None
+        with stream:
+            return stream.read()
+    finally:
+        if leaf_fd is not None:
+            os.close(leaf_fd)
 
 
 def paused_reply() -> Optional[str]:
