@@ -243,8 +243,8 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # produces a fresh inode, so stat() sees a new mtime_ns and the next
 # load repopulates automatically — no explicit invalidation hook.
 # Cached tuple is (user_mtime_ns, user_size, managed_mtime_ns, managed_size,
-# merged_value, env_ref_snapshot, user_config_valid) — the managed-file
-# signature is folded in so
+# merged_value, env_ref_snapshot, user_config_valid, managed_config_valid) —
+# the managed-file signature is folded in so
 # editing the managed-scope config.yaml invalidates the cache (see
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
@@ -257,6 +257,7 @@ _LOAD_CONFIG_CACHE: Dict[
         int,
         Dict[str, Any],
         Dict[str, Optional[str]],
+        bool,
         bool,
     ],
 ] = {}
@@ -3472,17 +3473,18 @@ def load_config_readonly() -> Dict[str, Any]:
 
 
 def load_config_readonly_strict() -> Dict[str, Any]:
-    """Read merged config, raising when the user file cannot be parsed.
+    """Read merged config, preserving user and managed-source failures.
 
     Most Hermes callers deliberately keep a last-known-good config (or the
     defaults in a fresh process) while ``config.yaml`` is temporarily broken.
     Security boundaries that must distinguish an absent file from a malformed
-    or unreadable one use this variant. After a successful parse it preserves
-    the normal defaults, managed overlay, environment expansion, and cache.
+    or unreadable user or managed file use this variant. After successful
+    parses it preserves the normal defaults, managed overlay, environment
+    expansion, and cache.
     """
     return _load_config_impl(
         want_deepcopy=False,
-        fail_on_user_config_error=True,
+        fail_on_config_error=True,
     )
 
 
@@ -3641,7 +3643,7 @@ def apply_terminal_config_to_env(
 def _load_config_impl(
     *,
     want_deepcopy: bool,
-    fail_on_user_config_error: bool = False,
+    fail_on_config_error: bool = False,
 ) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         ensure_hermes_home()
@@ -3686,7 +3688,10 @@ def _load_config_impl(
             cached is not None
             and cache_sig is not None
             and cached[:4] == cache_sig
-            and (not fail_on_user_config_error or cached[6])
+            and (
+                not fail_on_config_error
+                or (cached[6] and cached[7])
+            )
         ):
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
@@ -3714,7 +3719,7 @@ def _load_config_impl(
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
-                if fail_on_user_config_error:
+                if fail_on_config_error:
                     raise
                 user_config_valid = False
                 # Last-known-good fallback (port of openai/codex#31188's
@@ -3753,7 +3758,7 @@ def _load_config_impl(
                         _LOAD_CONFIG_CACHE[path_key] = (
                             cache_sig[0], cache_sig[1],
                             cache_sig[2], cache_sig[3],
-                            lkg_copy, _empty_env, False,
+                            lkg_copy, _empty_env, False, False,
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
@@ -3764,7 +3769,14 @@ def _load_config_impl(
         # against the process environment, never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
-        managed_config = managed_scope.load_managed_config()
+        managed_config_valid = True
+        try:
+            managed_config = managed_scope.load_managed_config_strict()
+        except Exception:
+            if fail_on_config_error:
+                raise
+            managed_config = {}
+            managed_config_valid = False
         if managed_config:
             # Normalize the managed overlay through the same canonicalization as
             # the user config BEFORE merging (parity with
@@ -3786,10 +3798,10 @@ def _load_config_impl(
             # cached value, and ``load_config_readonly()`` (deepcopy=False)
             # callers all see the same stable cached object. The cached tuple is
             # (user_mtime, user_size, managed_mtime, managed_size, value,
-            # env_ref_snapshot, user_config_valid). The snapshot records the
-            # environment values this expansion was made against so later
-            # loads can detect env drift (late .env load, in-process rotation)
-            # — see cache hit above.
+            # env_ref_snapshot, user_config_valid, managed_config_valid). The
+            # snapshot records the environment values this expansion was made
+            # against so later loads can detect env drift (late .env load,
+            # in-process rotation) — see cache hit above.
             cached_copy = copy.deepcopy(expanded)
             env_snapshot = _env_ref_snapshot(normalized)
             if managed_config:
@@ -3799,6 +3811,7 @@ def _load_config_impl(
                 cached_copy,
                 env_snapshot,
                 user_config_valid,
+                managed_config_valid,
             )
             # On the readonly path return the same cached object subsequent
             # calls will see — keeps "two readonly calls return the same
