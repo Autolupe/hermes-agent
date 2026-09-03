@@ -12442,6 +12442,14 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        try:
+            _raise_if_dispatch_paused()
+        except DispatchPausedError:
+            # recompute_ready is guarded, but a brake can arrive after it
+            # returns and before this loop begins. End the tick before any
+            # ready-row diagnostics, assignments, claims, or spawns mutate
+            # state.
+            return result
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -12460,7 +12468,11 @@ def _dispatch_once_locked(
                 # 'assigned' event so the board state matches what just happened.
                 if not dry_run:
                     try:
+                        _raise_if_dispatch_paused()
                         with write_txn(conn):
+                            # BEGIN IMMEDIATE may wait for another writer. A
+                            # brake that wins that wait must beat assignment.
+                            _raise_if_dispatch_paused()
                             conn.execute(
                                 "UPDATE tasks SET assignee = ? WHERE id = ? "
                                 "AND (assignee IS NULL OR assignee = '')",
@@ -12473,6 +12485,11 @@ def _dispatch_once_locked(
                                     "source": "kanban.default_assignee",
                                 },
                             )
+                            # Roll back both the row and its audit event if a
+                            # brake arrives during either write.
+                            _raise_if_dispatch_paused()
+                    except DispatchPausedError:
+                        return result
                     except Exception:
                         _log.debug(
                             "kanban dispatch: failed to apply default_assignee=%r "

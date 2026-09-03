@@ -694,6 +694,76 @@ def test_stop_engaged_during_dispatch_reclaim_skips_promotion_and_spawn(
     conn.close()
 
 
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+@pytest.mark.parametrize(
+    "arrival", ["after_promotion", "after_write_lock", "during_assignment"]
+)
+def test_stop_prevents_default_assignment_before_or_inside_transaction(
+    tmp_path, monkeypatch, brake, arrival
+):
+    """A stopped tick cannot assign or audit an unassigned ready task."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(conn, title="remain unassigned", assignee=None)
+    real_recompute_ready = kb.recompute_ready
+    stop_created = False
+
+    def stop_during_assignment_transaction(statement):
+        nonlocal stop_created
+        normalized = " ".join(statement.lower().split())
+        if (
+            not stop_created
+            and (
+                (arrival == "after_write_lock" and normalized == "begin immediate")
+                or (
+                    arrival == "during_assignment"
+                    and normalized.startswith("update tasks")
+                    and "set assignee =" in normalized
+                )
+            )
+        ):
+            stop_created = True
+            _engage_brake(tmp_path, monkeypatch, brake)
+
+    def observed_recompute_ready(connection, *args, **kwargs):
+        nonlocal stop_created
+        promoted = real_recompute_ready(connection, *args, **kwargs)
+        if arrival == "after_promotion":
+            stop_created = True
+            _engage_brake(tmp_path, monkeypatch, brake)
+        else:
+            connection.set_trace_callback(stop_during_assignment_transaction)
+        return promoted
+
+    monkeypatch.setattr(kb, "recompute_ready", observed_recompute_ready)
+    spawn_calls = []
+    try:
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *args: spawn_calls.append(args),
+            default_assignee="default",
+            max_spawn=1,
+        )
+    finally:
+        conn.set_trace_callback(None)
+
+    task = kb.get_task(conn, task_id)
+    assert stop_created is True
+    assert task is not None and task.status == "ready"
+    assert task.assignee is None
+    assert result.auto_assigned_default == []
+    assert result.spawned == []
+    assert spawn_calls == []
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'assigned'",
+        (task_id,),
+    ).fetchone()[0] == 0
+    conn.close()
+
+
 @pytest.mark.linux_only
 def test_broken_estop_entry_blocks_dispatch_boundary(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
