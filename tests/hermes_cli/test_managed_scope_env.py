@@ -35,3 +35,28 @@ def test_no_managed_env_is_noop(env_homes, monkeypatch):
     (home / ".env").write_text("SOME_VALUE=from_user\n", encoding="utf-8")
     load_hermes_dotenv(hermes_home=str(home))
     assert os.environ["SOME_VALUE"] == "from_user"
+
+
+@pytest.mark.linux_only
+def test_unreadable_managed_env_does_not_block_user_env(env_homes, monkeypatch):
+    """A real unreadable managed directory must not block user env loading."""
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+
+    home, managed = env_homes
+    user_env = home / ".env"
+    managed_env = managed / ".env"
+    user_env.write_text("MANAGED_LOOKUP_TEST=from_user\n", encoding="utf-8")
+
+    managed.chmod(0o000)
+    try:
+        # Prove this host produced the real failure that the loader must absorb.
+        with pytest.raises(PermissionError):
+            os.stat(managed_env)
+        load_hermes_dotenv(hermes_home=str(home))
+    finally:
+        managed.chmod(0o700)
+
+    assert os.environ["MANAGED_LOOKUP_TEST"] == "from_user"
