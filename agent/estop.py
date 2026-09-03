@@ -67,6 +67,7 @@ class _SentinelReadEntry(NamedTuple):
     path: Path
     parent_identity: tuple[object, ...] | None
     parent_fd: int | None = None
+    recheck_logical_parent: bool = False
 
 
 class _CleanupTarget(NamedTuple):
@@ -115,6 +116,16 @@ def _sentinel_read_entries() -> tuple[_SentinelReadEntry, ...]:
     if legacy != shared:
         entries[legacy] = _SentinelReadEntry(legacy, None)
     try:
+        if _supports_anchored_profile_scan():
+            anchored_shared = _open_validated_shared_sentinel_parent(shared)
+            if anchored_shared is not None:
+                parent_fd, parent_identity = anchored_shared
+                entries[shared] = _SentinelReadEntry(
+                    shared,
+                    parent_identity,
+                    parent_fd,
+                    True,
+                )
         for entry in _legacy_profile_sentinel_entries(shared.parent):
             parent_fd = None
             if _supports_anchored_profile_scan():
@@ -498,6 +509,70 @@ def _open_validated_sentinel_parent(entry: _LegacySentinelEntry) -> int:
         raise
 
 
+def _open_validated_shared_sentinel_parent(
+    path: Path,
+) -> tuple[int, tuple[object, ...]] | None:
+    """Anchor the canonical stop below its configured shared-root target.
+
+    A configured Hermes root may deliberately be a directory symlink. Resolve
+    and open its current physical target once, then validate that the logical
+    path still reaches that same directory. Presence and metadata reads can
+    then use the retained descriptor instead of following a replaceable link.
+    A genuinely absent root remains the normal no-stop case; an existing but
+    broken or changing root fails closed.
+    """
+    logical_parent = path.parent
+    try:
+        physical_parent = logical_parent.resolve(strict=True)
+    except FileNotFoundError:
+        if not _missing_path_has_usable_ancestor(logical_parent.parent):
+            raise OSError("shared Hermes root ancestry is not usable") from None
+        try:
+            physical_parent = logical_parent.resolve(strict=True)
+        except FileNotFoundError:
+            try:
+                os.lstat(logical_parent)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise OSError(
+                    "shared Hermes root could not be checked safely"
+                ) from exc
+            raise OSError("shared Hermes root target is unavailable") from None
+        except (OSError, RuntimeError) as exc:
+            raise OSError("shared Hermes root could not be resolved safely") from exc
+    except (OSError, RuntimeError) as exc:
+        raise OSError("shared Hermes root could not be resolved safely") from exc
+
+    try:
+        expected_info = os.stat(physical_parent, follow_symlinks=False)
+    except OSError as exc:
+        raise OSError("shared Hermes root could not be checked safely") from exc
+    if (
+        not stat_module.S_ISDIR(expected_info.st_mode)
+        or _is_unsafe_profile_redirect(expected_info)
+    ):
+        raise OSError("shared Hermes root is not a real directory")
+
+    parent_fd = os.open(physical_parent, _directory_open_flags())
+    try:
+        opened_info = os.fstat(parent_fd)
+        parent_identity = _stat_identity(opened_info)
+        if (
+            not stat_module.S_ISDIR(opened_info.st_mode)
+            or _is_unsafe_profile_redirect(opened_info)
+            or parent_identity != _stat_identity(expected_info)
+        ):
+            raise OSError("shared Hermes root changed before stop read")
+        logical_info = os.stat(logical_parent)
+        if _stat_identity(logical_info) != parent_identity:
+            raise OSError("shared Hermes root changed before stop read")
+        return parent_fd, parent_identity
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
 def _close_sentinel_read_entry_fds(
     entries: tuple[_SentinelReadEntry, ...],
 ) -> None:
@@ -840,10 +915,17 @@ def _sentinel_parent_matches(entry: _SentinelReadEntry) -> bool:
     try:
         if entry.parent_fd is not None:
             parent_info = os.fstat(entry.parent_fd)
-            return (
+            matches_open_parent = (
                 stat_module.S_ISDIR(parent_info.st_mode)
                 and not _is_unsafe_profile_redirect(parent_info)
                 and _stat_identity(parent_info) == entry.parent_identity
+            )
+            if not matches_open_parent or not entry.recheck_logical_parent:
+                return matches_open_parent
+            logical_info = os.stat(entry.path.parent)
+            return (
+                stat_module.S_ISDIR(logical_info.st_mode)
+                and _stat_identity(logical_info) == entry.parent_identity
             )
         parent_info = os.stat(entry.path.parent, follow_symlinks=False)
         if (

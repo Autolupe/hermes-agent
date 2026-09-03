@@ -186,6 +186,83 @@ def test_missing_stop_rechecks_ancestor_after_home_symlink_breaks(
     assert checks == 2
 
 
+@pytest.mark.linux_only
+def test_canonical_stop_read_anchors_configured_home_during_temporary_swaps(
+    tmp_path, monkeypatch
+):
+    """Two temporary symlink retargets cannot hide the canonical stop."""
+    physical_home = tmp_path / "physical-home"
+    physical_home.mkdir()
+    stop = physical_home / "ESTOP"
+    stop.write_text(
+        json.dumps({"reason": "keep stopped", "engaged_at": "test"}) + "\n",
+        encoding="utf-8",
+    )
+    empty_home = tmp_path / "empty-home"
+    empty_home.mkdir()
+    configured_home = tmp_path / "configured-home"
+    configured_home.symlink_to(physical_home, target_is_directory=True)
+    logical_stop = configured_home / "ESTOP"
+    monkeypatch.setenv("HERMES_HOME", str(configured_home))
+    estop._reset_log_state_for_tests()
+    real_lstat = estop.os.lstat
+    real_optional_entry_info = estop._optional_entry_info
+    path_attacks = 0
+    anchored_attacks = 0
+
+    def lstat_with_root_temporarily_retargeted(path, *args, **kwargs):
+        nonlocal path_attacks
+        if os.fspath(path) != os.fspath(logical_stop):
+            return real_lstat(path, *args, **kwargs)
+        configured_home.unlink()
+        configured_home.symlink_to(empty_home, target_is_directory=True)
+        try:
+            return real_lstat(path, *args, **kwargs)
+        finally:
+            configured_home.unlink()
+            configured_home.symlink_to(physical_home, target_is_directory=True)
+            path_attacks += 1
+
+    def anchored_stat_with_root_temporarily_retargeted(parent_fd, name):
+        nonlocal anchored_attacks
+        if name != estop.SENTINEL_NAME:
+            return real_optional_entry_info(parent_fd, name)
+        configured_home.unlink()
+        configured_home.symlink_to(empty_home, target_is_directory=True)
+        try:
+            return real_optional_entry_info(parent_fd, name)
+        finally:
+            configured_home.unlink()
+            configured_home.symlink_to(physical_home, target_is_directory=True)
+            anchored_attacks += 1
+
+    monkeypatch.setattr(estop.os, "lstat", lstat_with_root_temporarily_retargeted)
+
+    # Reproduce the old path race: both leaf lookups miss while each ancestor
+    # validation sees the restored, valid shared-root link.
+    assert estop._path_is_engaged(logical_stop) is False
+    assert path_attacks == 2
+    path_attacks = 0
+
+    monkeypatch.setattr(
+        estop,
+        "_optional_entry_info",
+        anchored_stat_with_root_temporarily_retargeted,
+    )
+
+    # The public checks open the physical shared root once and read ESTOP
+    # relative to that retained directory. Even while the logical root points
+    # at the empty replacement during each leaf lookup, the stop remains seen.
+    assert estop.is_engaged() is True
+    assert estop.get_state() == {
+        "reason": "keep stopped",
+        "engaged_at": "test",
+    }
+    assert path_attacks == 0
+    assert anchored_attacks == 2
+    assert stop.is_file()
+
+
 def test_genuinely_missing_hermes_home_below_real_parent_is_not_engaged(
     hermes_home, monkeypatch
 ):
@@ -918,13 +995,20 @@ def test_is_engaged_fails_safe_on_stat_error(hermes_home, monkeypatch):
     corrupt-sentinel doctrine."""
     sentinel = hermes_home / "ESTOP"
     real_lstat = estop.os.lstat
+    real_optional_entry_info = estop._optional_entry_info
 
     def denied_lstat(path, *args, **kwargs):
         if path == sentinel:
             raise PermissionError("permission denied")
         return real_lstat(path, *args, **kwargs)
 
+    def denied_anchored_stat(parent_fd, name):
+        if name == estop.SENTINEL_NAME:
+            raise PermissionError("permission denied")
+        return real_optional_entry_info(parent_fd, name)
+
     monkeypatch.setattr(estop.os, "lstat", denied_lstat)
+    monkeypatch.setattr(estop, "_optional_entry_info", denied_anchored_stat)
     assert estop.is_engaged() is True
     assert estop.get_state() == {"reason": None, "engaged_at": None}
 

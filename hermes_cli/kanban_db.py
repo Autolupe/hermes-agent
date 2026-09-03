@@ -1325,6 +1325,7 @@ brake = root / __BRAKE_RELATIVE__
 brake_mode = __BRAKE_MODE__
 popen_calls = []
 real_lstat = os.lstat
+real_stat = os.stat
 original_hermes_home = os.environ["HERMES_HOME"]
 broken_home_link = root / "broken-hermes-home"
 profile_home = root / "profiles" / "planner"
@@ -1332,6 +1333,7 @@ legacy_profile_brake = root / "profiles" / "coder" / "ESTOP"
 
 def disarm_brake():
     os.lstat = real_lstat
+    os.stat = real_stat
     os.environ["HERMES_HOME"] = original_hermes_home
     if brake_mode == "broken_ancestor":
         try:
@@ -1362,7 +1364,15 @@ def arm_brake():
             if Path(path) == brake:
                 raise PermissionError("ESTOP lookup denied")
             return real_lstat(path, *args, **kwargs)
+        def failed_stat(path, *args, **kwargs):
+            if (
+                os.fspath(path) == brake.name
+                and kwargs.get("dir_fd") is not None
+            ):
+                raise PermissionError("ESTOP lookup denied")
+            return real_stat(path, *args, **kwargs)
         os.lstat = failed_lstat
+        os.stat = failed_stat
     elif brake_mode == "broken_ancestor":
         try:
             broken_home_link.symlink_to(

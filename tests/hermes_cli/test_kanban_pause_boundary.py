@@ -1035,18 +1035,25 @@ def test_broken_estop_entry_blocks_dispatch_boundary(tmp_path, monkeypatch):
         kb._raise_if_dispatch_paused()
 
 
-def test_estop_lstat_error_blocks_dispatch_boundary(tmp_path, monkeypatch):
+def test_estop_lookup_error_blocks_dispatch_boundary(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     target = tmp_path / "ESTOP"
     real_lstat = estop.os.lstat
+    real_optional_entry_info = estop._optional_entry_info
 
     def denied_lstat(path, *args, **kwargs):
         if path == target:
             raise PermissionError("ESTOP lookup denied")
         return real_lstat(path, *args, **kwargs)
 
+    def denied_anchored_stat(parent_fd, name):
+        if name == estop.SENTINEL_NAME:
+            raise PermissionError("ESTOP lookup denied")
+        return real_optional_entry_info(parent_fd, name)
+
     monkeypatch.setattr(estop.os, "lstat", denied_lstat)
+    monkeypatch.setattr(estop, "_optional_entry_info", denied_anchored_stat)
 
     with pytest.raises(kb.DispatchPausedError, match="emergency stop"):
         kb._raise_if_dispatch_paused()
