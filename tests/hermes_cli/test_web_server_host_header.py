@@ -25,15 +25,29 @@ class TestHostHeaderValidator:
 
 
 
-    def test_zero_zero_bind_accepts_anything(self):
-        """0.0.0.0 means operator explicitly opted into all-interfaces
-        (requires --insecure). No Host-layer defence is possible — rely
-        on operator network controls."""
+    def test_zero_zero_bind_accepts_anything_without_allowlist(self, monkeypatch):
+        """Preserve the legacy wildcard behavior without an explicit list."""
         from hermes_cli.web_server import _is_accepted_host
 
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
         for host in ("10.0.0.5", "evil.example", "my-server.corp.net"):
             assert _is_accepted_host(host, "0.0.0.0")
             assert _is_accepted_host(host + ":9119", "0.0.0.0")
+
+    def test_wildcard_bind_uses_configured_host_allowlist(self, monkeypatch):
+        from hermes_cli.web_server import _is_accepted_host
+
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_ALLOWED_HOSTS",
+            "127.0.0.1,100.115.1.128,openclaw-cax41.tail465e59.ts.net",
+        )
+
+        assert _is_accepted_host("127.0.0.1:9120", "0.0.0.0")
+        assert _is_accepted_host("100.115.1.128:9120", "0.0.0.0")
+        assert _is_accepted_host(
+            "openclaw-cax41.tail465e59.ts.net.:9120", "0.0.0.0"
+        )
+        assert not _is_accepted_host("attacker.example", "0.0.0.0")
 
     def test_explicit_non_loopback_bind_requires_exact_match(self):
         """If the operator bound to a specific non-loopback hostname,
@@ -90,6 +104,20 @@ class TestHostHeaderMiddleware:
         resp = client.get("/api/status")
         # Should get through to the status endpoint, not a 400
         assert resp.status_code != 400
+
+    def test_dashboard_responses_include_browser_security_headers(self):
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        if hasattr(app.state, "bound_host"):
+            del app.state.bound_host
+
+        response = TestClient(app).get("/api/status")
+
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
+        assert response.headers["X-Frame-Options"] == "SAMEORIGIN"
+        assert response.headers["Referrer-Policy"] == "no-referrer"
+        assert response.headers["X-XSS-Protection"] == "0"
 
 
 class TestWebSocketHostOriginGuard:
