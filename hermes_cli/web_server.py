@@ -68,7 +68,7 @@ from hermes_cli.config import (
     get_hermes_home,
     get_process_hermes_home,
     load_config,
-    load_config_readonly,
+    load_config_readonly_strict,
     load_env,
     read_raw_config,
     resolve_cron_model_drift_defaults,
@@ -675,7 +675,7 @@ def _dashboard_allowed_hosts() -> Optional[set[str]]:
     else:
         try:
             raw_values = cfg_get(
-                load_config_readonly(),
+                load_config_readonly_strict(),
                 "dashboard",
                 "allowed_hosts",
                 default=[],

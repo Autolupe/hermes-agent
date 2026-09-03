@@ -243,11 +243,23 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # produces a fresh inode, so stat() sees a new mtime_ns and the next
 # load repopulates automatically — no explicit invalidation hook.
 # Cached tuple is (user_mtime_ns, user_size, managed_mtime_ns, managed_size,
-# merged_value, env_ref_snapshot) — the managed-file signature is folded in so
+# merged_value, env_ref_snapshot, user_config_valid) — the managed-file
+# signature is folded in so
 # editing the managed-scope config.yaml invalidates the cache (see
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+_LOAD_CONFIG_CACHE: Dict[
+    str,
+    Tuple[
+        int,
+        int,
+        int,
+        int,
+        Dict[str, Any],
+        Dict[str, Optional[str]],
+        bool,
+    ],
+] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -3459,6 +3471,21 @@ def load_config_readonly() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=False)
 
 
+def load_config_readonly_strict() -> Dict[str, Any]:
+    """Read merged config, raising when the user file cannot be parsed.
+
+    Most Hermes callers deliberately keep a last-known-good config (or the
+    defaults in a fresh process) while ``config.yaml`` is temporarily broken.
+    Security boundaries that must distinguish an absent file from a malformed
+    or unreadable one use this variant. After a successful parse it preserves
+    the normal defaults, managed overlay, environment expansion, and cache.
+    """
+    return _load_config_impl(
+        want_deepcopy=False,
+        fail_on_user_config_error=True,
+    )
+
+
 def write_platform_config_field(
     platform_key: str,
     field_key: str,
@@ -3611,7 +3638,11 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(
+    *,
+    want_deepcopy: bool,
+    fail_on_user_config_error: bool = False,
+) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         ensure_hermes_home()
         config_path = get_config_path()
@@ -3651,7 +3682,12 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             cache_sig = None
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if (
+            cached is not None
+            and cache_sig is not None
+            and cached[:4] == cache_sig
+            and (not fail_on_user_config_error or cached[6])
+        ):
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
@@ -3662,6 +3698,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
+        user_config_valid = True
 
         if user_sig is not None:
             try:
@@ -3677,6 +3714,9 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
+                if fail_on_user_config_error:
+                    raise
+                user_config_valid = False
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
                 # silently replace the effective policy with an empty/default
@@ -3713,7 +3753,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         _LOAD_CONFIG_CACHE[path_key] = (
                             cache_sig[0], cache_sig[1],
                             cache_sig[2], cache_sig[3],
-                            lkg_copy, _empty_env,
+                            lkg_copy, _empty_env, False,
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
@@ -3746,14 +3786,20 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # cached value, and ``load_config_readonly()`` (deepcopy=False)
             # callers all see the same stable cached object. The cached tuple is
             # (user_mtime, user_size, managed_mtime, managed_size, value,
-            # env_ref_snapshot). The snapshot records the environment values
-            # this expansion was made against so later loads can detect env
-            # drift (late .env load, in-process rotation) — see cache hit above.
+            # env_ref_snapshot, user_config_valid). The snapshot records the
+            # environment values this expansion was made against so later
+            # loads can detect env drift (late .env load, in-process rotation)
+            # — see cache hit above.
             cached_copy = copy.deepcopy(expanded)
             env_snapshot = _env_ref_snapshot(normalized)
             if managed_config:
                 _env_ref_snapshot(managed_config, env_snapshot)
-            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
+            _LOAD_CONFIG_CACHE[path_key] = (
+                *cache_sig,
+                cached_copy,
+                env_snapshot,
+                user_config_valid,
+            )
             # On the readonly path return the same cached object subsequent
             # calls will see — keeps "two readonly calls return the same
             # object" invariant that callers may rely on for identity checks.

@@ -215,6 +215,41 @@ class TestHostHeaderMiddleware:
             if hasattr(app.state, "bound_host"):
                 del app.state.bound_host
 
+    def test_malformed_config_file_fails_closed_through_middleware(
+        self, tmp_path, monkeypatch
+    ):
+        """A fresh process must not turn a YAML parse error into allow-any."""
+        from fastapi.testclient import TestClient
+
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.web_server import app
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "dashboard:\n  allowed_hosts: [unterminated\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
+
+        # Reproduce the dangerous ordering too: an ordinary caller first
+        # caches the fresh-process defaults after the shared loader swallows
+        # the parse failure. The strict Host boundary must not trust that
+        # fallback cache entry.
+        load_config_readonly()
+
+        app.state.bound_host = "0.0.0.0"
+        try:
+            response = TestClient(app).get(
+                "/api/status", headers={"Host": "attacker.example"}
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"].startswith("Invalid Host header")
+        finally:
+            if hasattr(app.state, "bound_host"):
+                del app.state.bound_host
+
 
 class TestWebSocketHostOriginGuard:
     """WebSocket upgrades must enforce the same dashboard boundary as HTTP."""
