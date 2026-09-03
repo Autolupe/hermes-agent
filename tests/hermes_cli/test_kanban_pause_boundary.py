@@ -2,6 +2,7 @@ import builtins
 import contextlib
 import inspect
 import json
+import subprocess
 import threading
 
 import pytest
@@ -25,6 +26,33 @@ def _halt(tmp_path, monkeypatch):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"reason": "test halt"}), encoding="utf-8")
     return path
+
+
+def _engage_brake(tmp_path, monkeypatch, brake):
+    if brake == "dispatch_pause":
+        return _pause(tmp_path, monkeypatch)
+    if brake == "halt":
+        return _halt(tmp_path, monkeypatch)
+    path = tmp_path / "ESTOP"
+    path.write_text("{}\n", encoding="utf-8")
+    return path
+
+
+def _init_git_repo(path):
+    path.mkdir()
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "config", "user.name", "Test User"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "commit", "--allow-empty", "-qm", "base"],
+        check=True,
+    )
 
 
 def test_pause_blocks_ready_and_review_claims_without_run_rows(tmp_path, monkeypatch):
@@ -863,10 +891,12 @@ def test_stop_after_claim_blocks_workspace_materialization(
         materialized.mkdir()
         return materialized
 
-    def resolve_scratch(_task, *, board=None):
+    def resolve_scratch(_task, *, board=None, materialization=None):
         return materialize_workspace()
 
-    def resolve_worktree(_task, *, board=None, conn=None):
+    def resolve_worktree(
+        _task, *, board=None, conn=None, materialization=None
+    ):
         return materialize_workspace(), "hermes/test/materialized"
 
     monkeypatch.setattr(kb, "resolve_workspace", resolve_scratch)
@@ -911,6 +941,204 @@ def test_stop_after_claim_blocks_workspace_materialization(
     assert run is not None
     assert (run["status"], run["outcome"]) == ("reclaimed", "reclaimed")
     assert run["ended_at"] is not None
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("lane", "expected_status"),
+    [("ready", "ready"), ("review", "review")],
+)
+@pytest.mark.parametrize("workspace_kind", ["scratch", "dir"])
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_stop_during_directory_resolution_rolls_back_new_workspace(
+    tmp_path, monkeypatch, lane, expected_status, workspace_kind, brake
+):
+    """A stop won during mkdir removes only the empty directory just made."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    explicit_path = tmp_path / "new-dir-workspace"
+    task_id = kb.create_task(
+        conn,
+        title=f"{lane} {workspace_kind}",
+        assignee="default",
+        workspace_kind=workspace_kind,
+        workspace_path=str(explicit_path) if workspace_kind == "dir" else None,
+    )
+    if lane == "review":
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+        monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+
+    expected_path = (
+        explicit_path if workspace_kind == "dir" else kb.workspaces_root() / task_id
+    )
+    real_resolve = kb.resolve_workspace
+
+    def resolve_then_stop(task, *, board=None, materialization=None):
+        workspace = real_resolve(
+            task, board=board, materialization=materialization
+        )
+        assert workspace == expected_path
+        assert workspace.is_dir()
+        _engage_brake(tmp_path, monkeypatch, brake)
+        return workspace
+
+    monkeypatch.setattr(kb, "resolve_workspace", resolve_then_stop)
+    spawn_calls = []
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args, **kwargs: spawn_calls.append((args, kwargs)),
+        max_spawn=1,
+    )
+
+    task = kb.get_task(conn, task_id)
+    run = conn.execute(
+        "SELECT status, outcome, ended_at FROM task_runs WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    assert not expected_path.exists()
+    assert spawn_calls == []
+    assert result.spawned == []
+    assert task is not None and task.status == expected_status
+    expected_stored_path = str(explicit_path) if workspace_kind == "dir" else None
+    assert task.workspace_path == expected_stored_path
+    assert task.branch_name is None
+    assert task.consecutive_failures == 0
+    assert run is not None
+    assert (run["status"], run["outcome"]) == ("reclaimed", "reclaimed")
+    assert run["ended_at"] is not None
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("lane", "expected_status"),
+    [("ready", "ready"), ("review", "review")],
+)
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_stop_during_worktree_resolution_removes_new_worktree_and_branch(
+    tmp_path, monkeypatch, lane, expected_status, brake
+):
+    """A stop won during git worktree add rolls back its exact new artifacts."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "hermes-home"))
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    monkeypatch.setattr(
+        kb, "read_board_metadata", lambda _board: {"default_workdir": str(repo)}
+    )
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(
+        conn,
+        title=f"{lane} worktree",
+        assignee="default",
+        workspace_kind="worktree",
+    )
+    original_workspace_path = kb.get_task(conn, task_id).workspace_path
+    if lane == "review":
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+        monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+
+    expected_path = repo / ".worktrees" / task_id
+    branch_name = kb.default_task_branch_name(task_id)
+    real_resolve = kb._resolve_worktree_workspace
+
+    def resolve_then_stop(
+        task, *, board=None, conn=None, materialization=None
+    ):
+        outcome = real_resolve(
+            task,
+            board=board,
+            conn=conn,
+            materialization=materialization,
+        )
+        assert outcome == (expected_path, branch_name)
+        assert expected_path.is_dir()
+        _engage_brake(tmp_path / "hermes-home", monkeypatch, brake)
+        return outcome
+
+    monkeypatch.setattr(kb, "_resolve_worktree_workspace", resolve_then_stop)
+    spawn_calls = []
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args, **kwargs: spawn_calls.append((args, kwargs)),
+        max_spawn=1,
+    )
+
+    task = kb.get_task(conn, task_id)
+    run = conn.execute(
+        "SELECT status, outcome, ended_at FROM task_runs WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "show-ref", "--verify", f"refs/heads/{branch_name}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert not expected_path.exists()
+    assert f"worktree {expected_path}" not in listed
+    assert branch.returncode != 0
+    assert spawn_calls == []
+    assert result.spawned == []
+    assert task is not None and task.status == expected_status
+    assert task.workspace_path == original_workspace_path
+    assert task.branch_name is None
+    assert task.consecutive_failures == 0
+    assert run is not None
+    assert (run["status"], run["outcome"]) == ("reclaimed", "reclaimed")
+    assert run["ended_at"] is not None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+        "AND kind = 'worktree_base_fallback'",
+        (task_id,),
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_stop_during_resolution_preserves_preexisting_workspace(
+    tmp_path, monkeypatch
+):
+    """Rollback never removes a workspace that existed before this claim."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(conn, title="existing scratch", assignee="default")
+    existing = kb.workspaces_root() / task_id
+    existing.mkdir(parents=True)
+    marker = existing / "owned-before-dispatch.txt"
+    marker.write_text("preserve me", encoding="utf-8")
+    real_resolve = kb.resolve_workspace
+
+    def resolve_then_stop(task, *, board=None, materialization=None):
+        workspace = real_resolve(
+            task, board=board, materialization=materialization
+        )
+        _halt(tmp_path, monkeypatch)
+        return workspace
+
+    monkeypatch.setattr(kb, "resolve_workspace", resolve_then_stop)
+
+    result = kb.dispatch_once(conn, spawn_fn=lambda *_args: 4242, max_spawn=1)
+
+    task = kb.get_task(conn, task_id)
+    assert result.spawned == []
+    assert task is not None and task.status == "ready"
+    assert task.workspace_path is None
+    assert marker.read_text(encoding="utf-8") == "preserve me"
     conn.close()
 
 

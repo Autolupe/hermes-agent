@@ -8897,6 +8897,65 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 # Workspace resolution
 # ---------------------------------------------------------------------------
 
+
+@dataclass
+class _WorkspaceMaterialization:
+    """A workspace created by one unresolved dispatch attempt.
+
+    The record stays in memory until the workspace metadata is committed.
+    If a dispatch brake closes while resolution is running, rollback uses the
+    captured directory identity and Git ref value so it cannot remove a
+    pre-existing or subsequently replaced workspace.
+    """
+
+    kind: Optional[str] = None
+    path: Optional[Path] = None
+    identity: Optional[tuple[int, int]] = None
+    repo_root: Optional[Path] = None
+    branch_name: Optional[str] = None
+    branch_oid: Optional[str] = None
+    created_branch: bool = False
+    base_fell_back: bool = False
+
+
+def _directory_identity(path: Path) -> Optional[tuple[int, int]]:
+    """Return a no-follow directory identity, or ``None`` when untrusted."""
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return None
+    if not stat_module.S_ISDIR(metadata.st_mode):
+        return None
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _mkdir_workspace(path: Path) -> bool:
+    """Create ``path`` and report whether this call created the leaf."""
+    try:
+        path.mkdir(parents=True, exist_ok=False)
+        return True
+    except FileExistsError:
+        if not path.is_dir():
+            raise
+        return False
+
+
+def _record_created_directory(
+    materialization: Optional[_WorkspaceMaterialization],
+    *,
+    kind: str,
+    path: Path,
+    created: bool,
+) -> None:
+    if materialization is None or not created:
+        return
+    identity = _directory_identity(path)
+    if identity is None:
+        return
+    materialization.kind = kind
+    materialization.path = path
+    materialization.identity = identity
+
 def _git_toplevel(path: Path) -> Optional[Path]:
     """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
     try:
@@ -8932,6 +8991,25 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     except Exception:
         return False
     return result.returncode == 0
+
+
+def _git_branch_oid(repo_root: Path, branch_name: str) -> Optional[str]:
+    """Return the exact local branch object id without accepting ambiguity."""
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "rev-parse", "--verify",
+                f"refs/heads/{branch_name}",
+            ],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    value = (result.stdout or "").strip()
+    return value if result.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40,64}", value) else None
 
 
 def _git_common_dir(path: Path) -> Optional[Path]:
@@ -9305,7 +9383,13 @@ def _worktree_base_ref(repo_root: Path) -> tuple[str, bool]:
     return "HEAD", True
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> bool:
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    materialization: Optional[_WorkspaceMaterialization] = None,
+) -> bool:
     """Materialize ``target`` as a linked git worktree under ``repo_root``.
 
     Returns True when a NEW branch had to be based on ``HEAD`` because no
@@ -9314,6 +9398,13 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> boo
     the tree already exists and a live hermes process holds its lock.
     """
     target = target.expanduser()
+    target_was_missing = False
+    try:
+        os.lstat(target)
+    except FileNotFoundError:
+        target_was_missing = True
+    except OSError:
+        pass
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
@@ -9322,7 +9413,8 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> boo
             return False
     target.parent.mkdir(parents=True, exist_ok=True)
     fell_back = False
-    if _git_branch_exists(repo_root, branch_name):
+    branch_existed = _git_branch_exists(repo_root, branch_name)
+    if branch_existed:
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
         base_ref, fell_back = _worktree_base_ref(repo_root)
@@ -9343,6 +9435,18 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> boo
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    if materialization is not None and target_was_missing:
+        identity = _directory_identity(target)
+        if identity is not None:
+            materialization.kind = "worktree"
+            materialization.path = target
+            materialization.identity = identity
+            materialization.repo_root = repo_root.expanduser().resolve(strict=False)
+            materialization.branch_name = branch_name
+            materialization.created_branch = not branch_existed
+            materialization.branch_oid = _git_branch_oid(repo_root, branch_name)
+    if materialization is not None and fell_back:
+        materialization.base_fell_back = True
     return fell_back
 
 
@@ -9363,7 +9467,11 @@ def _note_worktree_base_fallback(
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None, conn: Optional[sqlite3.Connection] = None,
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+    materialization: Optional[_WorkspaceMaterialization] = None,
 ) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``.
 
@@ -9402,7 +9510,9 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        if _ensure_git_worktree(repo_root, target, branch_name):
+        if _ensure_git_worktree(
+            repo_root, target, branch_name, materialization=materialization
+        ) and materialization is None:
             _note_worktree_base_fallback(conn, task.id, branch_name)
         return target, branch_name
 
@@ -9431,7 +9541,12 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                if _ensure_git_worktree(fallback_root, fallback, branch_name):
+                if _ensure_git_worktree(
+                    fallback_root,
+                    fallback,
+                    branch_name,
+                    materialization=materialization,
+                ) and materialization is None:
                     _note_worktree_base_fallback(conn, task.id, branch_name)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
@@ -9443,7 +9558,9 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        if _ensure_git_worktree(repo_root, target, branch_name):
+        if _ensure_git_worktree(
+            repo_root, target, branch_name, materialization=materialization
+        ) and materialization is None:
             _note_worktree_base_fallback(conn, task.id, branch_name)
         return target, branch_name
 
@@ -9453,12 +9570,19 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    if _ensure_git_worktree(repo_root, requested, branch_name):
+    if _ensure_git_worktree(
+        repo_root, requested, branch_name, materialization=materialization
+    ) and materialization is None:
         _note_worktree_base_fallback(conn, task.id, branch_name)
     return requested, branch_name
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+def resolve_workspace(
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    materialization: Optional[_WorkspaceMaterialization] = None,
+) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     - ``scratch``: a fresh dir under ``<board-root>/workspaces/<id>/``,
@@ -9498,7 +9622,10 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 )
         else:
             p = workspaces_root(board=board) / task.id
-        p.mkdir(parents=True, exist_ok=True)
+        created = _mkdir_workspace(p)
+        _record_created_directory(
+            materialization, kind="scratch", path=p, created=created
+        )
         return p
     if kind == "dir":
         if not task.workspace_path:
@@ -9512,10 +9639,15 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"{task.workspace_path!r}; use an absolute path "
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
             )
-        p.mkdir(parents=True, exist_ok=True)
+        created = _mkdir_workspace(p)
+        _record_created_directory(
+            materialization, kind="dir", path=p, created=created
+        )
         return p
     if kind == "worktree":
-        p, _branch_name = _resolve_worktree_workspace(task, board=board)
+        p, _branch_name = _resolve_worktree_workspace(
+            task, board=board, materialization=materialization
+        )
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
@@ -9538,6 +9670,171 @@ def set_branch_name(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
             (str(branch_name), task_id),
         )
+
+
+def _remove_created_empty_directory(
+    path: Path, expected_identity: tuple[int, int]
+) -> bool:
+    """Remove one newly-created empty directory without following its leaf."""
+    try:
+        if os.rmdir in os.supports_dir_fd:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            parent_fd = os.open(path.parent, flags)
+            try:
+                metadata = os.stat(
+                    path.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if (
+                    not stat_module.S_ISDIR(metadata.st_mode)
+                    or (metadata.st_dev, metadata.st_ino) != expected_identity
+                ):
+                    return False
+                os.rmdir(path.name, dir_fd=parent_fd)
+                return True
+            finally:
+                os.close(parent_fd)
+        if _directory_identity(path) != expected_identity:
+            return False
+        # Native Windows has no dir_fd form. rmdir still refuses symlinks and
+        # non-empty directories, and the identity check keeps replacement
+        # races fail-closed as far as that platform's API permits.
+        path.rmdir()
+        return True
+    except Exception:
+        return False
+
+
+def _remove_created_worktree(materialization: _WorkspaceMaterialization) -> bool:
+    """Remove only the exact clean worktree and unchanged branch just created."""
+    path = materialization.path
+    repo_root = materialization.repo_root
+    identity = materialization.identity
+    if path is None or repo_root is None or identity is None:
+        return False
+    if _directory_identity(path) != identity:
+        return False
+    branch_name = materialization.branch_name
+    branch_oid = materialization.branch_oid
+    if not branch_name or not branch_oid:
+        return False
+    try:
+        path_common = _git_common_dir(path)
+        repo_common = _git_common_dir(repo_root)
+        if (
+            path_common is None
+            or repo_common is None
+            or path_common != repo_common
+            or _git_current_branch(path) != branch_name
+            or _git_branch_oid(repo_root, branch_name) != branch_oid
+        ):
+            return False
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "remove", str(path)],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=60,
+            check=False,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        _log.warning(
+            "Could not roll back newly-created worktree %s after dispatch paused: %s",
+            path,
+            (result.stderr or result.stdout or "").strip(),
+        )
+        return False
+    if materialization.created_branch:
+        # update-ref's old-value argument makes deletion atomic: a branch that
+        # another actor advanced after materialization is preserved.
+        try:
+            deleted = subprocess.run(
+                [
+                    "git", "-C", str(repo_root), "update-ref", "-d",
+                    f"refs/heads/{branch_name}", branch_oid,
+                ],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            _log.warning(
+                "Preserved branch %s because its paused-worktree cleanup failed",
+                branch_name,
+                exc_info=True,
+            )
+            return True
+        if deleted.returncode != 0:
+            _log.warning(
+                "Preserved changed branch %s after removing paused worktree %s",
+                branch_name,
+                path,
+            )
+    return True
+
+
+def _rollback_workspace_materialization(
+    materialization: _WorkspaceMaterialization,
+) -> bool:
+    """Best-effort rollback for a workspace created after a dispatch claim."""
+    path = materialization.path
+    identity = materialization.identity
+    if path is None or identity is None:
+        return False
+    if materialization.kind == "worktree":
+        removed = _remove_created_worktree(materialization)
+    else:
+        removed = _remove_created_empty_directory(path, identity)
+    if not removed:
+        _log.warning(
+            "Preserved workspace %s because paused-dispatch rollback could not "
+            "prove it was still the unchanged workspace just created",
+            path,
+        )
+    return removed
+
+
+def _persist_dispatch_workspace(
+    conn: sqlite3.Connection,
+    claimed: Task,
+    workspace: Path,
+    resolved_branch_name: Optional[str],
+    materialization: _WorkspaceMaterialization,
+    *,
+    board: Optional[str],
+) -> None:
+    """Persist one resolved workspace only while every dispatch brake is open."""
+    branch_name: Optional[str] = None
+    if claimed.workspace_kind == "worktree":
+        branch_name = (
+            resolved_branch_name or (claimed.branch_name or "")
+        ).strip() or default_task_branch_name(claimed.id, board=board)
+    with write_txn(conn):
+        _raise_if_dispatch_paused()
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(workspace), claimed.id),
+        )
+        if branch_name is not None:
+            conn.execute(
+                "UPDATE tasks SET branch_name = ? WHERE id = ?",
+                (branch_name, claimed.id),
+            )
+        if materialization.base_fell_back and branch_name is not None:
+            _append_event(
+                conn,
+                claimed.id,
+                "worktree_base_fallback",
+                {"branch": branch_name, "base": "HEAD"},
+            )
+        # A brake that closed while this transaction was writing rolls every
+        # workspace, branch, and fallback-event change back together.
+        _raise_if_dispatch_paused()
+    claimed.workspace_path = str(workspace)
+    if branch_name is not None:
+        claimed.branch_name = branch_name
 
 
 # ---------------------------------------------------------------------------
@@ -12228,6 +12525,7 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        materialization = _WorkspaceMaterialization()
         try:
             # A stop may arrive after claim_task commits its running row.
             # Check again before scratch directories or git worktrees are
@@ -12237,11 +12535,25 @@ def _dispatch_once_locked(
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(
-                    claimed, board=board, conn=conn,
+                    claimed,
+                    board=board,
+                    conn=conn,
+                    materialization=materialization,
                 )
             else:
-                workspace = resolve_workspace(claimed, board=board)
+                workspace = resolve_workspace(
+                    claimed, board=board, materialization=materialization
+                )
+            _persist_dispatch_workspace(
+                conn,
+                claimed,
+                workspace,
+                resolved_branch_name,
+                materialization,
+                board=board,
+            )
         except DispatchPausedError:
+            _rollback_workspace_materialization(materialization)
             _release_paused_claim(conn, claimed.id)
             continue
         except WorkspaceBusyError as busy:
@@ -12256,6 +12568,13 @@ def _dispatch_once_locked(
             result.claim_guarded.append((claimed.id, f"workspace_busy:{busy.pid}"))
             continue
         except Exception as exc:
+            try:
+                _raise_if_dispatch_paused()
+            except DispatchPausedError:
+                _rollback_workspace_materialization(materialization)
+                _release_paused_claim(conn, claimed.id)
+                continue
+            _rollback_workspace_materialization(materialization)
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -12263,10 +12582,6 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            _persist_resolved_branch(conn, claimed, resolved_branch_name, board=board)
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -12381,6 +12696,7 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        materialization = _WorkspaceMaterialization()
         try:
             # Match the ready lane: no review workspace or branch may be
             # created after a stop wins the post-claim race.
@@ -12388,11 +12704,25 @@ def _dispatch_once_locked(
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(
-                    claimed, board=board, conn=conn,
+                    claimed,
+                    board=board,
+                    conn=conn,
+                    materialization=materialization,
                 )
             else:
-                workspace = resolve_workspace(claimed, board=board)
+                workspace = resolve_workspace(
+                    claimed, board=board, materialization=materialization
+                )
+            _persist_dispatch_workspace(
+                conn,
+                claimed,
+                workspace,
+                resolved_branch_name,
+                materialization,
+                board=board,
+            )
         except DispatchPausedError:
+            _rollback_workspace_materialization(materialization)
             _release_paused_claim(conn, claimed.id)
             continue
         except WorkspaceBusyError as busy:
@@ -12407,6 +12737,13 @@ def _dispatch_once_locked(
             result.claim_guarded.append((claimed.id, f"workspace_busy:{busy.pid}"))
             continue
         except Exception as exc:
+            try:
+                _raise_if_dispatch_paused()
+            except DispatchPausedError:
+                _rollback_workspace_materialization(materialization)
+                _release_paused_claim(conn, claimed.id)
+                continue
+            _rollback_workspace_materialization(materialization)
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -12414,10 +12751,6 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            _persist_resolved_branch(conn, claimed, resolved_branch_name, board=board)
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
