@@ -829,6 +829,91 @@ def test_halt_arriving_after_claim_requeues_without_failure(tmp_path, monkeypatc
     assert run["ended_at"] is not None
 
 
+@pytest.mark.parametrize(
+    ("lane", "expected_status"),
+    [("ready", "ready"), ("review", "review")],
+)
+@pytest.mark.parametrize("workspace_kind", ["scratch", "worktree"])
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_stop_after_claim_blocks_workspace_materialization(
+    tmp_path, monkeypatch, lane, expected_status, workspace_kind, brake
+):
+    """A claimed card must be parked before any directory or branch is made."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(
+        conn,
+        title=f"{lane} {workspace_kind}",
+        assignee="default",
+        workspace_kind=workspace_kind,
+    )
+    if lane == "review":
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+        monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+
+    materialized = tmp_path / "materialized-workspace"
+    resolver_calls = []
+
+    def materialize_workspace():
+        resolver_calls.append(True)
+        materialized.mkdir()
+        return materialized
+
+    def resolve_scratch(_task, *, board=None):
+        return materialize_workspace()
+
+    def resolve_worktree(_task, *, board=None, conn=None):
+        return materialize_workspace(), "hermes/test/materialized"
+
+    monkeypatch.setattr(kb, "resolve_workspace", resolve_scratch)
+    monkeypatch.setattr(kb, "_resolve_worktree_workspace", resolve_worktree)
+
+    claim_name = "claim_task" if lane == "ready" else "claim_review_task"
+    real_claim = getattr(kb, claim_name)
+
+    def claim_then_stop(*args, **kwargs):
+        claimed = real_claim(*args, **kwargs)
+        if claimed is not None:
+            if brake == "dispatch_pause":
+                _pause(tmp_path, monkeypatch)
+            elif brake == "halt":
+                _halt(tmp_path, monkeypatch)
+            else:
+                (tmp_path / "ESTOP").write_text("{}\n", encoding="utf-8")
+        return claimed
+
+    monkeypatch.setattr(kb, claim_name, claim_then_stop)
+    spawn_calls = []
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args, **kwargs: spawn_calls.append((args, kwargs)),
+        max_spawn=1,
+    )
+
+    task = kb.get_task(conn, task_id)
+    run = conn.execute(
+        "SELECT status, outcome, ended_at FROM task_runs WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    assert resolver_calls == []
+    assert not materialized.exists()
+    assert spawn_calls == []
+    assert result.spawned == []
+    assert task is not None and task.status == expected_status
+    assert task.workspace_path is None
+    assert task.branch_name is None
+    assert task.consecutive_failures == 0
+    assert run is not None
+    assert (run["status"], run["outcome"]) == ("reclaimed", "reclaimed")
+    assert run["ended_at"] is not None
+    conn.close()
+
+
 def test_estop_arriving_during_default_spawn_setup_blocks_popen(
     tmp_path, monkeypatch
 ):

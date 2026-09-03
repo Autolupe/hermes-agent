@@ -12229,6 +12229,11 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         try:
+            # A stop may arrive after claim_task commits its running row.
+            # Check again before scratch directories or git worktrees are
+            # materialized; the later process-edge check remains the final
+            # guard immediately before spawn.
+            _raise_if_dispatch_paused()
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(
@@ -12377,6 +12382,9 @@ def _dispatch_once_locked(
         if claimed is None:
             continue
         try:
+            # Match the ready lane: no review workspace or branch may be
+            # created after a stop wins the post-claim race.
+            _raise_if_dispatch_paused()
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(
