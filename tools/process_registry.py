@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shlex
 import signal
 import subprocess
@@ -111,6 +112,15 @@ _SYSTEMD_UNIT_FAILED = "failed"
 _MIN_WORKER_MEMORY_MAX_BYTES = 64 * 1024 * 1024
 _DEFAULT_WORKER_MEMORY_MAX_BYTES = 1024 * 1024 * 1024
 _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
+
+_GATEWAY_SYSTEMD_UNIT_RE = re.compile(
+    r"^hermes-gateway(?:-[a-z0-9][a-z0-9_-]{0,63})?\.service$"
+)
+
+
+def _is_gateway_service_unit_name(unit: str) -> bool:
+    """Return whether *unit* is a supported profile-scoped gateway service."""
+    return _GATEWAY_SYSTEMD_UNIT_RE.fullmatch(unit) is not None
 
 
 def _worker_memory_max_bytes() -> int:
@@ -341,16 +351,15 @@ def _supervised_runtime_owner() -> tuple[str, bool]:
 
     for line in cgroup_text.splitlines():
         components = line.strip().split("/")
-        for unit in (
-            "hermes-dashboard.service",
-            "hermes-serve.service",
-            "hermes-gateway.service",
-        ):
-            if unit not in components:
+        for unit_index, unit in enumerate(components):
+            if unit not in (
+                "hermes-dashboard.service",
+                "hermes-serve.service",
+            ) and not _is_gateway_service_unit_name(unit):
                 continue
             is_user_unit = any(
                 component.startswith("user@") and component.endswith(".service")
-                for component in components[: components.index(unit)]
+                for component in components[:unit_index]
             )
             return unit, is_user_unit
     return "", False

@@ -153,6 +153,51 @@ def test_web_runtime_owner_records_the_correct_systemd_manager(
 
 
 @pytest.mark.linux_only
+@pytest.mark.parametrize(
+    "unit",
+    [
+        "hermes-gateway.service",
+        "hermes-gateway-coder.service",
+        "hermes-gateway-a1b2c3d4.service",
+    ],
+)
+def test_profile_scoped_gateway_owner_is_recognized(monkeypatch, unit):
+    _set_cgroup(monkeypatch, unit)
+
+    assert local_mod._may_need_foreground_systemd_scope() is True
+    assert process_registry_mod._supervised_runtime_owner() == (unit, True)
+
+
+@pytest.mark.linux_only
+def test_profile_scoped_gateway_foreground_scope_binds_to_exact_owner(monkeypatch):
+    unit = "hermes-gateway-coder.service"
+    _set_cgroup(monkeypatch, unit)
+    monkeypatch.setattr(
+        process_registry_mod, "_is_supervised_gateway_process", lambda: True
+    )
+    monkeypatch.setattr(
+        process_registry_mod, "_systemd_run_user_scope_available", lambda: True
+    )
+    monkeypatch.setattr(
+        process_registry_mod,
+        "_systemd_scope_stop_propagation_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None,
+    )
+
+    direct = ["/bin/bash", "-c", "printf scoped"]
+    argv, scope_unit = local_mod._foreground_systemd_scope_argv(direct)
+
+    assert scope_unit.startswith(f"hermes-worker-foreground-{os.getpid()}-")
+    assert f"BindsTo={unit}" in argv
+    assert f"After={unit}" in argv
+    assert f"StopPropagatedFrom={unit}" in argv
+
+
+@pytest.mark.linux_only
 def test_foreground_spawn_binds_scope_to_owner_and_preserves_result_contract(
     bare_local_env,
     monkeypatch,

@@ -28,6 +28,15 @@ _FOREGROUND_SCOPE_POST_REAP_RECHECK_SECONDS = 1.0
 _FOREGROUND_SCOPE_RETRY_INTERVAL_SECONDS = 0.05
 _FOREGROUND_SCOPE_WRAPPER_REAP_SECONDS = 2.0
 
+_GATEWAY_SYSTEMD_UNIT_RE = re.compile(
+    r"^hermes-gateway(?:-[a-z0-9][a-z0-9_-]{0,63})?\.service$"
+)
+
+
+def _is_gateway_service_unit_name(unit: str) -> bool:
+    """Return whether *unit* is a supported profile-scoped gateway service."""
+    return _GATEWAY_SYSTEMD_UNIT_RE.fullmatch(unit) is not None
+
 
 def _may_need_foreground_systemd_scope() -> bool:
     """Cheaply identify runtimes that may need a transient worker scope.
@@ -46,15 +55,14 @@ def _may_need_foreground_systemd_scope() -> bool:
         )
     except OSError:
         return False
-    supervised_units = {
-        "hermes-dashboard.service",
-        "hermes-serve.service",
-        "hermes-gateway.service",
-    }
-    return any(
-        supervised_units.intersection(line.strip().split("/"))
-        for line in cgroup_text.splitlines()
-    )
+    for line in cgroup_text.splitlines():
+        for unit in line.strip().split("/"):
+            if unit in (
+                "hermes-dashboard.service",
+                "hermes-serve.service",
+            ) or _is_gateway_service_unit_name(unit):
+                return True
+    return False
 
 
 def _foreground_systemd_scope_argv(args: list[str]) -> tuple[list[str], str]:
@@ -77,6 +85,7 @@ def _foreground_systemd_scope_argv(args: list[str]) -> tuple[list[str], str]:
     try:
         from tools.process_registry import (
             _build_systemd_scope_argv,
+            _is_gateway_service_unit_name as _registry_gateway_service_unit,
             _is_supervised_gateway_process,
             _supervised_runtime_owner,
             _systemd_run_user_scope_available,
@@ -84,7 +93,7 @@ def _foreground_systemd_scope_argv(args: list[str]) -> tuple[list[str], str]:
         )
 
         owner_unit, owner_is_user_unit = _supervised_runtime_owner()
-        if owner_unit == "hermes-gateway.service":
+        if _registry_gateway_service_unit(owner_unit):
             # Keep the gateway's existing marker + live-PID identity check;
             # inherited gateway markers must not make descendants supervisors.
             if not _is_supervised_gateway_process():
