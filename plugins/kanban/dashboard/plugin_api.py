@@ -1130,6 +1130,20 @@ def _set_status_direct(
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
+    try:
+        if new_status in {"ready", "review"}:
+            kanban_db._raise_if_dispatch_paused()
+        return _set_status_direct_guarded(conn, task_id, new_status)
+    except kanban_db.DispatchPausedError:
+        # The dashboard already maps False to a conflict response. A brake
+        # should refuse this status action without leaking an internal error.
+        return False
+
+
+def _set_status_direct_guarded(
+    conn: sqlite3.Connection, task_id: str, new_status: str,
+) -> bool:
+    """Apply a direct status write with in-transaction brake checks."""
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
@@ -1152,6 +1166,11 @@ def _set_status_direct(
                     if kanban_db._parents_satisfied(conn, task_id)
                     else "todo"
                 )
+
+        if effective_status in {"ready", "review"}:
+            # Repeat after BEGIN IMMEDIATE: a stop may have appeared while the
+            # dashboard waited behind another writer.
+            kanban_db._raise_if_dispatch_paused()
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.
         # Prevents the dispatcher from spawning a child whose upstream work
@@ -1219,6 +1238,10 @@ def _set_status_direct(
                 task_id,
                 terminations,
             )
+        if effective_status in {"ready", "review"}:
+            # A brake raised by a trace hook or concurrent operator during the
+            # writes rolls the task update and its audit event back together.
+            kanban_db._raise_if_dispatch_paused()
     for pid, claim_lock in terminations:
         kanban_db._terminate_reclaimed_worker(pid, claim_lock)
     # If we re-opened something, children may have gone stale.

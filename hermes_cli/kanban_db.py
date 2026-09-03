@@ -825,6 +825,23 @@ def _raise_if_dispatch_paused() -> None:
         )
 
 
+def _park_runnable_status_if_dispatch_paused(status: str) -> tuple[str, bool]:
+    """Return ``todo`` instead of creating runnable work while stopped.
+
+    Completion-like transitions still need to commit their audit trail while a
+    brake is engaged. They use this helper after acquiring their write lock,
+    persist the intended lane as ``resume_status``, and let
+    :func:`recompute_ready` restore that lane after the brake is removed.
+    """
+    if status not in {"ready", "review"}:
+        return status, False
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
+        return "todo", True
+    return status, False
+
+
 def _dispatch_brake_description() -> str:
     """Return a safe operator-facing description of both dispatch brakes."""
     try:
@@ -4677,6 +4694,10 @@ def create_task(
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
                             task_status = "todo"
+                resume_status = task_status
+                task_status, parked_by_dispatch_brake = (
+                    _park_runnable_status_if_dispatch_paused(task_status)
+                )
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
@@ -4766,9 +4787,20 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "resume_status": (
+                            resume_status if parked_by_dispatch_brake else None
+                        ),
+                        "parked_by_dispatch_brake": (
+                            True if parked_by_dispatch_brake else None
+                        ),
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if task_status in {"ready", "review"}:
+                    # A brake can appear after the first check but before the
+                    # INSERT/event writes. Roll the whole creation back rather
+                    # than commit newly runnable work.
+                    _raise_if_dispatch_paused()
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -5704,7 +5736,8 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
-        "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
+        "'unblocked', 'changes_requested', 'review_requested', 'review_reopened', "
+        "'status', 'reclaimed', "
         "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
@@ -7872,22 +7905,29 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        landing_status, parked_by_dispatch_brake = (
+            _park_runnable_status_if_dispatch_paused("review")
+        )
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
-            params = (reviewer, task_id) if reviewer is not None else (task_id,)
+            params = (
+                (landing_status, reviewer, task_id)
+                if reviewer is not None
+                else (landing_status, task_id)
+            )
             run_guard = ""
         else:
             params = (
-                (reviewer, task_id, int(expected_run_id))
+                (landing_status, reviewer, task_id, int(expected_run_id))
                 if reviewer is not None
-                else (task_id, int(expected_run_id))
+                else (landing_status, task_id, int(expected_run_id))
             )
             run_guard = " AND current_run_id = ?"
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'review',
+               SET status        = ?,
                    claim_lock    = NULL,
                    claim_expires = NULL,
                    worker_pid    = NULL
@@ -7907,7 +7947,7 @@ def request_review(
             conn,
             task_id,
             outcome="review_requested",
-            status="review",
+            status=landing_status,
             summary=summary,
             metadata=metadata,
         )
@@ -7929,9 +7969,18 @@ def request_review(
                 "summary": event_summary or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                "status": landing_status,
+                "resume_status": (
+                    "review" if parked_by_dispatch_brake else None
+                ),
+                "parked_by_dispatch_brake": (
+                    True if parked_by_dispatch_brake else None
+                ),
             },
             run_id=run_id,
         )
+        if landing_status == "review":
+            _raise_if_dispatch_paused()
     return _ret(True)
 
 
@@ -8013,7 +8062,10 @@ def request_changes(
         else:
             reviewer = None
 
-        new_status = _landing_status_after_parents(conn, task_id)
+        desired_status = _landing_status_after_parents(conn, task_id)
+        new_status, parked_by_dispatch_brake = (
+            _park_runnable_status_if_dispatch_paused(desired_status)
+        )
         # NOTE: consecutive_failures is deliberately PRESERVED (neither
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
@@ -8048,9 +8100,17 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "resume_status": (
+                    desired_status if parked_by_dispatch_brake else None
+                ),
+                "parked_by_dispatch_brake": (
+                    True if parked_by_dispatch_brake else None
+                ),
             },
             run_id=run_id,
         )
+        if new_status in {"ready", "review"}:
+            _raise_if_dispatch_paused()
     return True, implementer
 
 
@@ -8106,20 +8166,26 @@ def promote_task(
     if dry_run:
         return True, None
 
-    with write_txn(conn):
-        upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
-            (task_id,),
-        )
-        if upd.rowcount != 1:
-            return False, f"task {task_id} status changed during promotion"
-        _append_event(
-            conn,
-            task_id,
-            "promoted_manual",
-            {"actor": actor, "reason": reason, "forced": force},
-        )
+    try:
+        _raise_if_dispatch_paused()
+        with write_txn(conn):
+            _raise_if_dispatch_paused()
+            upd = conn.execute(
+                "UPDATE tasks SET status = 'ready' "
+                "WHERE id = ? AND status IN ('todo', 'blocked')",
+                (task_id,),
+            )
+            if upd.rowcount != 1:
+                return False, f"task {task_id} status changed during promotion"
+            _append_event(
+                conn,
+                task_id,
+                "promoted_manual",
+                {"actor": actor, "reason": reason, "forced": force},
+            )
+            _raise_if_dispatch_paused()
+    except DispatchPausedError as exc:
+        return False, str(exc)
 
     return True, None
 
@@ -8205,6 +8271,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
+        new_status, parked_by_dispatch_brake = (
+            _park_runnable_status_if_dispatch_paused(new_status)
+        )
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -8226,11 +8295,19 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _append_event(
             conn, task_id, "unblocked",
             (
-                {"status": new_status, "resume_status": resume_status}
+                {
+                    "status": new_status,
+                    "resume_status": resume_status,
+                    "parked_by_dispatch_brake": (
+                        True if parked_by_dispatch_brake else None
+                    ),
+                }
                 if new_status != "ready" or resume_status != "ready"
                 else None
             ),
         )
+        if new_status in {"ready", "review"}:
+            _raise_if_dispatch_paused()
         return True
 
 
@@ -8254,7 +8331,10 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
         )
-        new_status = _landing_status_after_parents(conn, task_id)
+        desired_status = _landing_status_after_parents(conn, task_id)
+        new_status, parked_by_dispatch_brake = (
+            _park_runnable_status_if_dispatch_paused(desired_status)
+        )
         review_event = conn.execute(
             "SELECT payload FROM task_events "
             "WHERE task_id = ? AND kind = 'review_requested' "
@@ -8291,6 +8371,9 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if cur.rowcount != 1:
             return False
         payload: dict[str, Any] = {"status": new_status}
+        if parked_by_dispatch_brake:
+            payload["resume_status"] = desired_status
+            payload["parked_by_dispatch_brake"] = True
         if implementer:
             payload["implementer"] = implementer
         _append_event(
@@ -8299,6 +8382,8 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "review_reopened",
             payload if payload != {"status": "ready"} else None,
         )
+        if new_status in {"ready", "review"}:
+            _raise_if_dispatch_paused()
         return True
 
 

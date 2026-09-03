@@ -38,6 +38,16 @@ def _engage_brake(tmp_path, monkeypatch, brake):
     return path
 
 
+def _latest_event_payload(conn, task_id, kind):
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, kind),
+    ).fetchone()
+    assert row is not None
+    return json.loads(row["payload"]) if row["payload"] else {}
+
+
 def _init_git_repo(path):
     path.mkdir()
     subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
@@ -158,6 +168,257 @@ def test_completion_commits_but_keeps_dependents_parked(
     child = kb.get_task(conn, child_id)
     assert parent is not None and parent.status == "done"
     assert child is not None and child.status == "todo"
+    conn.close()
+
+
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_direct_runnable_transitions_park_or_refuse_while_stopped(
+    tmp_path, monkeypatch, brake
+):
+    """Every public transition into ready/review honors all three brakes."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+
+    promote_id = kb.create_task(conn, title="manual promotion", triage=True)
+    conn.execute(
+        "UPDATE tasks SET status = 'todo' WHERE id = ?", (promote_id,)
+    )
+    conn.commit()
+    unblock_id = kb.create_task(
+        conn,
+        title="manual unblock",
+        initial_status="blocked",
+    )
+    reopen_id = kb.create_task(conn, title="review reopen", assignee="builder")
+    assert kb.request_review(conn, reopen_id, reviewer="reviewer")
+    review_request_id = kb.create_task(
+        conn,
+        title="review request",
+        assignee="builder",
+    )
+    changes_id = kb.create_task(conn, title="review changes", assignee="builder")
+    implementation = kb.claim_task(conn, changes_id)
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        changes_id,
+        reviewer="reviewer",
+        expected_run_id=implementation.current_run_id,
+    )
+    review_run = kb.claim_review_task(conn, changes_id)
+    assert review_run is not None
+
+    brake_path = _engage_brake(tmp_path, monkeypatch, brake)
+
+    created_id = kb.create_task(conn, title="created while stopped")
+    promoted, reason = kb.promote_task(
+        conn,
+        promote_id,
+        actor="test",
+    )
+    assert promoted is False
+    assert reason is not None and "paused" in reason.lower()
+    assert kb.unblock_task(conn, unblock_id) is True
+    assert kb.reopen_review_task(conn, reopen_id) is True
+    assert kb.request_review(
+        conn,
+        review_request_id,
+        reviewer="reviewer",
+    ) is True
+    assert kb.request_changes(
+        conn,
+        changes_id,
+        reason="fix the stopped handoff",
+        expected_run_id=review_run.current_run_id,
+    ) == (True, "builder")
+
+    parked_ids = {
+        created_id,
+        promote_id,
+        unblock_id,
+        reopen_id,
+        review_request_id,
+        changes_id,
+    }
+    statuses = {
+        row["id"]: row["status"]
+        for row in conn.execute(
+            "SELECT id, status FROM tasks WHERE id IN ("
+            + ",".join("?" * len(parked_ids))
+            + ")",
+            tuple(parked_ids),
+        ).fetchall()
+    }
+    assert set(statuses) == parked_ids
+    assert set(statuses.values()) == {"todo"}
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events "
+        "WHERE task_id = ? AND kind = 'promoted_manual'",
+        (promote_id,),
+    ).fetchone()[0] == 0
+
+    expected_events = {
+        created_id: ("created", "ready"),
+        unblock_id: ("unblocked", "ready"),
+        reopen_id: ("review_reopened", "ready"),
+        review_request_id: ("review_requested", "review"),
+        changes_id: ("changes_requested", "ready"),
+    }
+    for task_id, (kind, resume_status) in expected_events.items():
+        payload = _latest_event_payload(conn, task_id, kind)
+        assert payload["status"] == "todo"
+        assert payload["resume_status"] == resume_status
+        assert payload["parked_by_dispatch_brake"] is True
+
+    brake_path.unlink()
+    assert kb.recompute_ready(conn) == len(parked_ids)
+    assert kb.get_task(conn, review_request_id).status == "review"
+    for task_id in parked_ids - {review_request_id}:
+        assert kb.get_task(conn, task_id).status == "ready"
+    conn.close()
+
+
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "create",
+        "promote",
+        "unblock",
+        "reopen_review",
+        "request_review",
+        "request_changes",
+    ],
+)
+def test_stop_engaged_during_direct_runnable_write_rolls_back(
+    tmp_path, monkeypatch, brake, operation
+):
+    """A brake that appears during a direct status write wins before commit."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+
+    task_id = None
+    expected_status = None
+    expected_event = {
+        "create": "created",
+        "promote": "promoted_manual",
+        "unblock": "unblocked",
+        "reopen_review": "review_reopened",
+        "request_review": "review_requested",
+        "request_changes": "changes_requested",
+    }[operation]
+    expected_write_status = "review" if operation == "request_review" else "ready"
+    expected_run_id = None
+
+    if operation == "create":
+        expected_status = None
+    elif operation == "promote":
+        task_id = kb.create_task(conn, title="late promote", triage=True)
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+        conn.commit()
+        expected_status = "todo"
+    elif operation == "unblock":
+        task_id = kb.create_task(
+            conn,
+            title="late unblock",
+            initial_status="blocked",
+        )
+        expected_status = "blocked"
+    elif operation == "reopen_review":
+        task_id = kb.create_task(conn, title="late reopen", assignee="builder")
+        assert kb.request_review(conn, task_id, reviewer="reviewer")
+        expected_status = "review"
+    elif operation == "request_review":
+        task_id = kb.create_task(conn, title="late review", assignee="builder")
+        expected_status = "ready"
+    else:
+        task_id = kb.create_task(conn, title="late changes", assignee="builder")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        review_run = kb.claim_review_task(conn, task_id)
+        assert review_run is not None
+        expected_run_id = review_run.current_run_id
+        expected_status = "running"
+
+    task_count_before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    event_count_before = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = ?",
+        (expected_event,),
+    ).fetchone()[0]
+    stop_created = False
+
+    def stop_on_runnable_write(statement):
+        nonlocal stop_created
+        normalized = " ".join(statement.lower().split())
+        if stop_created:
+            return
+        if operation == "create":
+            matches = (
+                normalized.startswith("insert into tasks")
+                and "created during write" in normalized
+            )
+        else:
+            matches = (
+                normalized.startswith("update tasks")
+                and f"set status = '{expected_write_status}'" in normalized
+                and (task_id or "") in normalized
+            )
+        if matches:
+            stop_created = True
+            _engage_brake(tmp_path, monkeypatch, brake)
+
+    conn.set_trace_callback(stop_on_runnable_write)
+    try:
+        if operation == "create":
+            with pytest.raises(kb.DispatchPausedError):
+                kb.create_task(conn, title="created during write")
+        elif operation == "promote":
+            ok, reason = kb.promote_task(conn, task_id, actor="test")
+            assert ok is False
+            assert reason is not None and "paused" in reason.lower()
+        elif operation == "unblock":
+            with pytest.raises(kb.DispatchPausedError):
+                kb.unblock_task(conn, task_id)
+        elif operation == "reopen_review":
+            with pytest.raises(kb.DispatchPausedError):
+                kb.reopen_review_task(conn, task_id)
+        elif operation == "request_review":
+            with pytest.raises(kb.DispatchPausedError):
+                kb.request_review(conn, task_id, reviewer="reviewer")
+        else:
+            with pytest.raises(kb.DispatchPausedError):
+                kb.request_changes(
+                    conn,
+                    task_id,
+                    reason="must roll back",
+                    expected_run_id=expected_run_id,
+                )
+    finally:
+        conn.set_trace_callback(None)
+
+    assert stop_created is True
+    assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == task_count_before
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE kind = ?",
+        (expected_event,),
+    ).fetchone()[0] == event_count_before
+    if task_id is not None:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == expected_status
+        if operation == "request_changes":
+            assert task.current_run_id == expected_run_id
     conn.close()
 
 

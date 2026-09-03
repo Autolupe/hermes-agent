@@ -61,6 +61,17 @@ def client(kanban_home):
     return TestClient(app)
 
 
+def _engage_dashboard_brake(home: Path, brake: str) -> Path:
+    if brake == "estop":
+        path = home / "ESTOP"
+    else:
+        filename = "dispatch_pause.json" if brake == "dispatch_pause" else "halt.json"
+        path = home / "state" / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n", encoding="utf-8")
+    return path
+
+
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------
@@ -271,6 +282,87 @@ def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
             event.kind == "review_reopened"
             for event in kb.list_events(conn, task["id"])
         )
+
+
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_dashboard_refuses_direct_ready_move_while_stopped(
+    client, kanban_home, monkeypatch, brake
+):
+    """Drag/drop cannot put a todo card into ready under any brake."""
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "keep parked"},
+    ).json()["task"]
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "todo"},
+    )
+    assert response.status_code == 200, response.text
+
+    _engage_dashboard_brake(kanban_home, brake)
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "ready"},
+    )
+
+    assert response.status_code == 409
+    with kb.connect() as conn:
+        parked = kb.get_task(conn, task["id"])
+        assert parked is not None and parked.status == "todo"
+
+
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_dashboard_ready_move_rolls_back_when_stop_arrives_during_write(
+    client, kanban_home, monkeypatch, brake
+):
+    """The dashboard's final brake check rolls back its event and status."""
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "late dashboard stop"},
+    ).json()["task"]
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "todo"},
+    )
+    assert response.status_code == 200, response.text
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+
+    with kb.connect() as conn:
+        status_events_before = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'status'",
+            (task["id"],),
+        ).fetchone()[0]
+        stop_created = False
+
+        def stop_on_ready_update(statement):
+            nonlocal stop_created
+            normalized = " ".join(statement.lower().split())
+            if (
+                not stop_created
+                and normalized.startswith("update tasks")
+                and "set status = 'ready'" in normalized
+                and task["id"] in normalized
+            ):
+                stop_created = True
+                _engage_dashboard_brake(kanban_home, brake)
+
+        conn.set_trace_callback(stop_on_ready_update)
+        try:
+            assert plugin._set_status_direct(conn, task["id"], "ready") is False
+        finally:
+            conn.set_trace_callback(None)
+
+        parked = kb.get_task(conn, task["id"])
+        assert stop_created is True
+        assert parked is not None and parked.status == "todo"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id = ? AND kind = 'status'",
+            (task["id"],),
+        ).fetchone()[0] == status_events_before
 
 
 def test_reopening_parent_demotes_ready_child(client):
@@ -1306,4 +1398,3 @@ def test_dashboard_marks_parked_planning_as_a_visible_warning():
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
