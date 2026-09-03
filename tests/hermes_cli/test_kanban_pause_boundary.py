@@ -71,6 +71,30 @@ def test_halt_blocks_ready_and_review_claims_without_run_rows(tmp_path, monkeypa
     assert kb.claim_review_task(conn, review_id) is not None
 
 
+def test_estop_blocks_ready_and_review_claims_without_run_rows(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    ready_id = kb.create_task(conn, title="ready", assignee="default")
+    review_id = kb.create_task(conn, title="review", assignee="default")
+    conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,))
+    conn.commit()
+    estop_path = tmp_path / "ESTOP"
+    estop_path.write_text("{}\n", encoding="utf-8")
+
+    assert kb.claim_task(conn, ready_id) is None
+    assert kb.claim_review_task(conn, review_id) is None
+    assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+
+    estop_path.unlink()
+    assert kb.claim_task(conn, ready_id) is not None
+    assert kb.claim_review_task(conn, review_id) is not None
+
+
 @pytest.mark.parametrize("brake_name", ["dispatch_pause.json", "halt.json"])
 def test_dispatch_brake_directory_entry_blocks(tmp_path, monkeypatch, brake_name):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
@@ -512,6 +536,28 @@ def test_dispatch_boundary_probe_fails_closed_when_symlinks_cannot_be_created(
     assert payload["state"] == "failed"
     assert payload["checks"]["dispatch_pause_broken_symlink_blocks"] is False
     assert payload["checks"]["halt_broken_symlink_blocks"] is False
+
+
+def test_dispatch_boundary_probe_accepts_windows_symlink_privilege_limit(
+    monkeypatch, capsys
+):
+    class WindowsSymlinkPrivilegeError(PermissionError):
+        winerror = 1314
+
+    def symlink_privilege_unavailable(*_args, **_kwargs):
+        raise WindowsSymlinkPrivilegeError("symlink privilege unavailable")
+
+    monkeypatch.setattr(kb.Path, "symlink_to", symlink_privilege_unavailable)
+
+    assert boundary_probe.run_probe() == 0
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert captured.out.count("\n") == 1
+    payload = json.loads(captured.out)
+    assert payload["state"] == "verified"
+    assert payload["checks"]["dispatch_pause_broken_symlink_blocks"] is True
+    assert payload["checks"]["halt_broken_symlink_blocks"] is True
+    assert payload["checks"]["lookup_errors_fail_closed"] is True
 
 
 def test_dispatch_boundary_probe_returns_nonzero_when_any_check_fails(

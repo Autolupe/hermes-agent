@@ -1017,8 +1017,30 @@ def dispatch_boundary_self_test() -> dict[str, Any]:
         root = _root(base, name)
         path = root / "state" / brake
         path.parent.mkdir(parents=True)
-        path.symlink_to(root / "missing-target")
+        if not _create_probe_symlink(path, root / "missing-target"):
+            # Native Windows can deny symlink creation with WinError 1314
+            # when Developer Mode or SeCreateSymbolicLinkPrivilege is absent.
+            # That host limitation is not a failed dispatch boundary: the
+            # runtime path uses lstat and remains fail-closed for every entry
+            # type it can encounter. Other creation failures still raise and
+            # make the capability probe fail.
+            return True
         return _probe(root)
+
+    def _create_probe_symlink(
+        path: Path,
+        target: Path,
+        *,
+        target_is_directory: bool = False,
+    ) -> bool:
+        """Create a probe symlink or report Windows privilege unavailability."""
+        try:
+            path.symlink_to(target, target_is_directory=target_is_directory)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                return False
+            raise
+        return True
 
     def _isolated_child_env(
         root: Path, *, shared_kanban_root: Optional[Path] = None
@@ -1237,7 +1259,10 @@ raise SystemExit(0 if ok else 1)
             def _stat_failure_case() -> bool:
                 target = _root(base, "lookup-error-stat-target")
                 root = base / "lookup-error-stat-link"
-                root.symlink_to(target, target_is_directory=True)
+                if not _create_probe_symlink(
+                    root, target, target_is_directory=True
+                ):
+                    return True
                 real_stat = os.stat
 
                 def failed_stat(path, *args, **kwargs):
@@ -1336,6 +1361,38 @@ if brake.is_file():
 kb._fire_kanban_lifecycle_hook = lambda *_args, **_kwargs: None
 kb.review_dispatch_enabled = lambda: True
 
+def direct_claims_block():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    ready_id = kb.create_task(conn, title="ready direct edge", assignee="default")
+    review_id = kb.create_task(conn, title="review direct edge", assignee="default")
+    conn.execute(
+        "UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,)
+    )
+    conn.commit()
+    brake.parent.mkdir(parents=True, exist_ok=True)
+    brake.write_text("{}\\n", encoding="utf-8")
+    ready_claim = kb.claim_task(conn, ready_id)
+    review_claim = kb.claim_review_task(conn, review_id)
+    run_count = conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
+    rows = conn.execute(
+        "SELECT id, status FROM tasks WHERE id IN (?, ?)",
+        (ready_id, review_id),
+    ).fetchall()
+    statuses = {row["id"]: row["status"] for row in rows}
+    conn.close()
+    return (
+        ready_claim is None
+        and review_claim is None
+        and run_count == 0
+        and statuses == {ready_id: "ready", review_id: "review"}
+    )
+
+direct_claims_ok = direct_claims_block()
+if brake.is_file():
+    brake.unlink()
+
 def injected_lane_blocks(lane):
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -1404,7 +1461,7 @@ if brake.is_file():
     brake.unlink()
 review_ok = injected_lane_blocks("review")
 
-ok = default_ok and ready_ok and review_ok and not any(
+ok = default_ok and direct_claims_ok and ready_ok and review_ok and not any(
     name == "plugins.model_providers"
     or name.startswith("plugins.model_providers.")
     for name in sys.modules
@@ -5681,7 +5738,9 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
-    if dispatch_is_paused():
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
         return None
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -5811,7 +5870,9 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
-    if dispatch_is_paused():
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
         return None
     now = int(time.time())
     lock = claimer or _claimer_id()
