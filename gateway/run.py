@@ -16275,7 +16275,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         args = (event.get_command_args() or "").strip()
         if args.lower() in {"off", "resume", "stop", "disengage"}:
-            if estop.disengage():
+            try:
+                removed = estop.disengage()
+            except estop.DisengageError as exc:
+                return f"⏸️ Hermes is still paused — {exc}."
+            if removed:
                 return "▶️ Resumed — new work is accepted again."
             return "Hermes wasn't paused."
         state = estop.get_state()

@@ -528,6 +528,27 @@ async def test_gateway_pause_command_engages_and_resumes(hermes_home):
     assert "wasn't paused" in reply.lower()
 
 
+@pytest.mark.asyncio
+async def test_gateway_pause_off_reports_unsafe_cleanup(hermes_home, monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    estop.engage(reason="maintenance")
+
+    def unsafe_disengage():
+        raise estop.DisengageError("the stop paths could not be checked safely")
+
+    monkeypatch.setattr(estop, "disengage", unsafe_disengage)
+
+    reply = await runner._handle_pause_command(_FakePauseEvent("off"))
+
+    assert reply == (
+        "⏸️ Hermes is still paused — "
+        "the stop paths could not be checked safely."
+    )
+    assert estop.is_engaged() is True
+
+
 def test_pause_command_registered_for_gateway():
     from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS, resolve_command
 
