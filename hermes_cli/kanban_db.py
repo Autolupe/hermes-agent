@@ -5796,6 +5796,12 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # BEGIN IMMEDIATE may wait behind another writer. A stop engaged during
+        # that wait must win before this transaction changes a task or run.
+        try:
+            _raise_if_dispatch_paused()
+        except DispatchPausedError:
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -5928,6 +5934,12 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Match the ready lane: the acquired transaction is the final claim
+        # boundary after any SQLite busy wait.
+        try:
+            _raise_if_dispatch_paused()
+        except DispatchPausedError:
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "

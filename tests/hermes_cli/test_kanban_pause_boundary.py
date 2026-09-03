@@ -1,6 +1,8 @@
 import builtins
+import contextlib
 import inspect
 import json
+import threading
 
 import pytest
 
@@ -93,6 +95,70 @@ def test_estop_blocks_ready_and_review_claims_without_run_rows(
     estop_path.unlink()
     assert kb.claim_task(conn, ready_id) is not None
     assert kb.claim_review_task(conn, review_id) is not None
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+@pytest.mark.parametrize("brake", ["halt", "estop"])
+def test_stop_engaged_during_claim_lock_wait_blocks_transaction(
+    tmp_path, monkeypatch, lane, brake
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    setup = kb.connect(db_path=db_path)
+    task_id = kb.create_task(setup, title=f"{lane} lock wait", assignee="default")
+    if lane == "review":
+        setup.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        setup.commit()
+    setup.close()
+
+    blocker = kb.connect(db_path=db_path)
+    blocker.execute("BEGIN IMMEDIATE")
+    entering_transaction = threading.Event()
+    real_write_txn = kb.write_txn
+
+    @contextlib.contextmanager
+    def observed_write_txn(conn, *args, **kwargs):
+        entering_transaction.set()
+        with real_write_txn(conn, *args, **kwargs):
+            yield
+
+    monkeypatch.setattr(kb, "write_txn", observed_write_txn)
+    outcome = []
+    failures = []
+
+    def claim_after_lock_release():
+        conn = kb.connect(db_path=db_path)
+        try:
+            claim = kb.claim_task if lane == "ready" else kb.claim_review_task
+            outcome.append(claim(conn, task_id))
+        except Exception as exc:
+            failures.append(exc)
+        finally:
+            conn.close()
+
+    worker = threading.Thread(target=claim_after_lock_release)
+    worker.start()
+    try:
+        assert entering_transaction.wait(timeout=2)
+        if brake == "halt":
+            _halt(tmp_path, monkeypatch)
+        else:
+            (tmp_path / "ESTOP").write_text("{}\n", encoding="utf-8")
+    finally:
+        blocker.rollback()
+        blocker.close()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert outcome == [None]
+    verify = kb.connect(db_path=db_path)
+    task = kb.get_task(verify, task_id)
+    assert task is not None and task.status == lane
+    assert verify.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+    verify.close()
 
 
 @pytest.mark.linux_only
