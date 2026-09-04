@@ -79,6 +79,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat as stat_module
 import subprocess
 import sys
 import threading
@@ -136,7 +137,7 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
 class DispatchPausedError(RuntimeError):
-    """Raised when a manual pause closes the final worker-spawn edge."""
+    """Raised when a shared-root brake closes the final worker-spawn edge."""
 
 
 class WorkspaceBusyError(RuntimeError):
@@ -559,6 +560,10 @@ _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override",
     default=None,
 )
+_KANBAN_HOME_OVERRIDE: ContextVar[Path | None] = ContextVar(
+    "hermes_kanban_home_override",
+    default=None,
+)
 
 
 @contextlib.contextmanager
@@ -569,6 +574,16 @@ def scoped_current_board(slug: str):
         yield
     finally:
         _CURRENT_BOARD_OVERRIDE.reset(token)
+
+
+@contextlib.contextmanager
+def _scoped_kanban_home(path: Path):
+    """Temporarily pin the shared root for an isolated behavior probe."""
+    token: Token[Path | None] = _KANBAN_HOME_OVERRIDE.set(Path(path))
+    try:
+        yield
+    finally:
+        _KANBAN_HOME_OVERRIDE.reset(token)
 
 # Slug validator: lowercase alphanumerics, digits, hyphens; 1–64 chars.
 # Strict enough to stop traversal (`..`) and embedded path separators, loose
@@ -609,6 +624,9 @@ def kanban_home() -> Path:
     profile's ``HERMES_HOME`` would silently fork the board per profile,
     which breaks the dispatcher / worker handoff.
     """
+    scoped = _KANBAN_HOME_OVERRIDE.get()
+    if scoped is not None:
+        return scoped
     override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
     if override:
         return Path(override).expanduser()
@@ -621,12 +639,1677 @@ def dispatch_pause_path() -> Path:
     return kanban_home() / "state" / "dispatch_pause.json"
 
 
-def dispatch_is_paused() -> bool:
-    """Fail closed while the shared-root manual dispatch pause exists."""
+def dispatch_halt_path() -> Path:
+    """Return the shared-root full-halt sentinel path."""
+    return kanban_home() / "state" / "halt.json"
+
+
+def _dispatch_brake_entry_exists(path: Path) -> bool:
+    """Return whether any entry occupies *path*, failing closed on errors.
+
+    ``Path.exists()`` follows symlinks and reports a broken symlink as absent.
+    A dispatch brake is authoritative by directory entry, so use ``lstat``:
+    regular files, directories, and intact or broken symlinks all block.  Only
+    a definite ``FileNotFoundError`` means the brake is absent; permission and
+    other filesystem errors must keep dispatch stopped.
+    """
     try:
-        return dispatch_pause_path().exists()
+        os.lstat(path)
+    except FileNotFoundError:
+        # ENOENT is ambiguous when an ancestor is a broken symlink.  Only
+        # accept it as a genuinely absent brake when walking upward reaches a
+        # usable directory.  Then retry the leaf: an entry may have appeared
+        # between the first lookup and ancestor validation, and every entry
+        # type at a brake path is authoritative.
+        if not _missing_path_has_usable_ancestor(path.parent):
+            return True
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        return True
     except OSError:
         return True
+    return True
+
+
+def _missing_path_has_usable_ancestor(path: Path) -> bool:
+    """Return True only when *path* is missing below a usable directory.
+
+    ``lstat(path)`` reports ``ENOENT`` both for an absent leaf and when a
+    parent symlink is broken.  Walk upward without following entries until an
+    existing ancestor is found, then follow that one entry only to prove it is
+    a directory.  Any lookup failure remains fail-closed.
+    """
+    candidate = path
+    while True:
+        try:
+            info = os.lstat(candidate)
+        except FileNotFoundError:
+            parent = candidate.parent
+            if parent == candidate:
+                return False
+            candidate = parent
+            continue
+        except OSError:
+            return False
+        if stat_module.S_ISLNK(info.st_mode):
+            try:
+                followed = os.stat(candidate)
+            except OSError:
+                return False
+            return stat_module.S_ISDIR(followed.st_mode)
+        return stat_module.S_ISDIR(info.st_mode)
+
+
+def _dispatch_state_snapshot(state_dir: Path) -> Optional[tuple[Any, ...]]:
+    """Describe a usable dispatch-state directory without following it.
+
+    A real directory (or a genuinely absent root/state directory) is usable.
+    A symlink or non-directory at ``state`` is not: otherwise a replaced or
+    broken ancestor can make both brake lookups report a misleading ENOENT.
+    The configured root may be an intact directory symlink for compatibility,
+    but broken root links and non-directories fail closed.
+    """
+    root = state_dir.parent
+    try:
+        root_info = os.lstat(root)
+    except FileNotFoundError:
+        if not _missing_path_has_usable_ancestor(root):
+            return None
+        root_identity: tuple[Any, ...] = ("missing",)
+    except OSError:
+        return None
+    else:
+        identity = (
+            root_info.st_mode,
+            root_info.st_dev,
+            root_info.st_ino,
+            root_info.st_mtime_ns,
+            root_info.st_ctime_ns,
+            root_info.st_size,
+            root_info.st_nlink,
+        )
+        if stat_module.S_ISLNK(root_info.st_mode):
+            try:
+                followed = os.stat(root)
+            except OSError:
+                return None
+            if not stat_module.S_ISDIR(followed.st_mode):
+                return None
+            root_identity = (
+                "symlink-directory",
+                *identity,
+                followed.st_mode,
+                followed.st_dev,
+                followed.st_ino,
+                followed.st_mtime_ns,
+                followed.st_ctime_ns,
+                followed.st_size,
+                followed.st_nlink,
+            )
+        elif stat_module.S_ISDIR(root_info.st_mode):
+            root_identity = ("directory", *identity)
+        else:
+            return None
+
+    try:
+        state_info = os.lstat(state_dir)
+    except FileNotFoundError:
+        if not _missing_path_has_usable_ancestor(state_dir):
+            return None
+        return (root_identity, "missing")
+    except OSError:
+        return None
+    if not stat_module.S_ISDIR(state_info.st_mode):
+        return None
+    return (
+        root_identity,
+        "directory",
+        state_info.st_mode,
+        state_info.st_dev,
+        state_info.st_ino,
+        state_info.st_mtime_ns,
+        state_info.st_ctime_ns,
+        state_info.st_size,
+        state_info.st_nlink,
+    )
+
+
+def _supports_anchored_dispatch_state_read() -> bool:
+    """Return whether brake reads can stay below open directories."""
+    supports_dir_fd = getattr(os, "supports_dir_fd", set())
+    return (
+        os.name != "nt"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and os.open in supports_dir_fd
+        and os.stat in supports_dir_fd
+    )
+
+
+def _dispatch_directory_open_flags() -> int:
+    """Open a real directory without following its final path component."""
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _dispatch_stat_identity(info: object) -> tuple[Any, ...]:
+    """Return the stable identity fields for an open dispatch directory."""
+    return (
+        getattr(info, "st_dev", None),
+        getattr(info, "st_ino", None),
+        getattr(info, "st_mode", None),
+        getattr(info, "st_file_attributes", None),
+        getattr(info, "st_reparse_tag", None),
+    )
+
+
+def _dispatch_stat_fingerprint(info: object) -> tuple[Any, ...]:
+    """Include directory-change fields used to catch late brake writes."""
+    return (
+        *_dispatch_stat_identity(info),
+        getattr(info, "st_mtime_ns", None),
+        getattr(info, "st_ctime_ns", None),
+        getattr(info, "st_size", None),
+        getattr(info, "st_nlink", None),
+    )
+
+
+def _dispatch_is_unsafe_redirect(info: object) -> bool:
+    """Reject symlinks and native Windows directory reparse points."""
+    mode = getattr(info, "st_mode", 0)
+    reparse_flag = getattr(
+        stat_module,
+        "FILE_ATTRIBUTE_REPARSE_POINT",
+        0x400,
+    )
+    file_attributes = getattr(info, "st_file_attributes", 0)
+    return stat_module.S_ISLNK(mode) or bool(file_attributes & reparse_flag)
+
+
+def _dispatch_optional_entry_info(parent_fd: int, name: str) -> object | None:
+    """Read one entry below an open directory, retrying absence once."""
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+
+def _dispatch_fd_mount_id(fd: int) -> int | None:
+    """Return the Linux mount identity for an already-open directory."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        lines = Path(f"/proc/self/fdinfo/{fd}").read_text(
+            encoding="utf-8",
+            errors="strict",
+        ).splitlines()
+        values = [
+            line.partition(":")[2].strip()
+            for line in lines
+            if line.startswith("mnt_id:")
+        ]
+        if len(values) != 1:
+            raise ValueError("missing or repeated mount ID")
+        return int(values[0])
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise OSError(
+            "dispatch-state mount identity could not be checked safely"
+        ) from exc
+
+
+def _dispatch_state_shares_root_mount(root_fd: int, state_fd: int) -> bool:
+    """Reject mounted state folders, including same-filesystem bind mounts."""
+    root_info = os.fstat(root_fd)
+    state_info = os.fstat(state_fd)
+    if getattr(root_info, "st_dev", None) != getattr(
+        state_info,
+        "st_dev",
+        None,
+    ):
+        return False
+    root_mount_id = _dispatch_fd_mount_id(root_fd)
+    state_mount_id = _dispatch_fd_mount_id(state_fd)
+    return root_mount_id is None or state_mount_id == root_mount_id
+
+
+def _anchored_dispatch_brakes_present(
+    state_dir: Path,
+    brake_names: tuple[str, ...],
+    expected_snapshot: tuple[Any, ...],
+) -> Optional[bool]:
+    """Read both brakes through a fixed, unmounted state-directory handle.
+
+    ``None`` means the shared root is genuinely absent and the caller should
+    use its path-snapshot fallback. Every unsafe or changing state returns
+    ``True`` (paused), while ``False`` means both anchored leaf reads and all
+    identity checks proved stable absence.
+    """
+    root = state_dir.parent
+    try:
+        physical_root = root.resolve(strict=True)
+    except FileNotFoundError:
+        return None
+    except (OSError, RuntimeError):
+        return True
+
+    try:
+        expected_root = os.stat(physical_root, follow_symlinks=False)
+    except OSError:
+        return True
+    if (
+        not stat_module.S_ISDIR(expected_root.st_mode)
+        or stat_module.S_ISLNK(expected_root.st_mode)
+    ):
+        return True
+
+    root_fd: int | None = None
+    state_fd: int | None = None
+    try:
+        root_fd = os.open(physical_root, _dispatch_directory_open_flags())
+        opened_root = os.fstat(root_fd)
+        root_identity = _dispatch_stat_identity(opened_root)
+        root_fingerprint = _dispatch_stat_fingerprint(opened_root)
+        if (
+            not stat_module.S_ISDIR(opened_root.st_mode)
+            or root_fingerprint != _dispatch_stat_fingerprint(expected_root)
+            or _dispatch_stat_identity(os.stat(root)) != root_identity
+            or _dispatch_state_snapshot(state_dir) != expected_snapshot
+        ):
+            return True
+
+        state_info = _dispatch_optional_entry_info(root_fd, state_dir.name)
+        if state_info is None:
+            return (
+                _dispatch_stat_fingerprint(os.fstat(root_fd))
+                != root_fingerprint
+                or _dispatch_stat_identity(os.stat(root)) != root_identity
+            )
+        if (
+            not stat_module.S_ISDIR(state_info.st_mode)
+            or stat_module.S_ISLNK(state_info.st_mode)
+        ):
+            return True
+
+        state_fd = os.open(
+            state_dir.name,
+            _dispatch_directory_open_flags(),
+            dir_fd=root_fd,
+        )
+        opened_state = os.fstat(state_fd)
+        state_fingerprint = _dispatch_stat_fingerprint(opened_state)
+        if (
+            not stat_module.S_ISDIR(opened_state.st_mode)
+            or state_fingerprint != _dispatch_stat_fingerprint(state_info)
+            or not _dispatch_state_shares_root_mount(root_fd, state_fd)
+        ):
+            return True
+
+        for brake_name in brake_names:
+            if _dispatch_optional_entry_info(state_fd, brake_name) is not None:
+                return True
+
+        final_state_info = _dispatch_optional_entry_info(
+            root_fd,
+            state_dir.name,
+        )
+        return (
+            _dispatch_stat_fingerprint(os.fstat(state_fd))
+            != state_fingerprint
+            or final_state_info is None
+            or _dispatch_stat_fingerprint(final_state_info)
+            != state_fingerprint
+            or not _dispatch_state_shares_root_mount(root_fd, state_fd)
+            or _dispatch_stat_fingerprint(os.fstat(root_fd))
+            != root_fingerprint
+            or _dispatch_stat_identity(os.stat(root)) != root_identity
+        )
+    except (OSError, RuntimeError):
+        return True
+    finally:
+        if state_fd is not None:
+            os.close(state_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def _windows_optional_dispatch_entry_info(path: Path) -> object | None:
+    """Read one Windows entry without following redirects, retrying absence."""
+    try:
+        return os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            return os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+
+def _windows_dispatch_root_matches(
+    anchor: object,
+    root_fingerprint: tuple[Any, ...],
+) -> bool:
+    """Verify that a locked Windows root still backs its configured path."""
+    physical_root = getattr(anchor, "physical_parent")
+    logical_root = getattr(anchor, "logical_parent")
+    parent_identity = getattr(anchor, "parent_identity")
+    physical_info = os.stat(physical_root, follow_symlinks=False)
+    logical_info = os.stat(logical_root)
+    return (
+        stat_module.S_ISDIR(physical_info.st_mode)
+        and not _dispatch_is_unsafe_redirect(physical_info)
+        and _dispatch_stat_fingerprint(physical_info) == root_fingerprint
+        and stat_module.S_ISDIR(logical_info.st_mode)
+        and _dispatch_stat_identity(logical_info) == parent_identity
+    )
+
+
+def _windows_anchored_dispatch_brakes_present(
+    state_dir: Path,
+    brake_names: tuple[str, ...],
+    expected_snapshot: tuple[Any, ...],
+) -> Optional[bool]:
+    """Read Windows brakes below locked physical root and state folders.
+
+    Native Windows does not support Python's ``dir_fd`` leaf operations.
+    Retaining handles opened without delete sharing prevents a real root or
+    state directory from being renamed during the read. A configured root
+    junction may still be retargeted, so every leaf lookup uses the resolved
+    physical path and the logical path is checked again before returning.
+
+    ``None`` has the same meaning as the POSIX helper: the shared root is
+    genuinely absent, so the caller may use the snapshot fallback. Every
+    unsafe, changing, or unreadable state fails closed as ``True``.
+    """
+    try:
+        from agent.estop import (
+            _close_windows_directory_handle,
+            _open_windows_directory_handle,
+            _open_windows_shared_sentinel_parent,
+        )
+    except Exception:
+        return True
+
+    root_anchor = None
+    state_handle: int | None = None
+    try:
+        root_anchor = _open_windows_shared_sentinel_parent(
+            state_dir.parent / "ESTOP"
+        )
+        if root_anchor is None:
+            return None
+
+        physical_root = root_anchor.physical_parent
+        root_info = os.stat(physical_root, follow_symlinks=False)
+        root_fingerprint = _dispatch_stat_fingerprint(root_info)
+        if (
+            _dispatch_is_unsafe_redirect(root_info)
+            or _dispatch_stat_identity(root_info) != root_anchor.parent_identity
+            or not _windows_dispatch_root_matches(
+                root_anchor,
+                root_fingerprint,
+            )
+            or _dispatch_state_snapshot(state_dir) != expected_snapshot
+        ):
+            return True
+
+        physical_state = physical_root / state_dir.name
+        state_info = _windows_optional_dispatch_entry_info(physical_state)
+        if state_info is None:
+            return (
+                not _windows_dispatch_root_matches(
+                    root_anchor,
+                    root_fingerprint,
+                )
+                or _dispatch_state_snapshot(state_dir) != expected_snapshot
+            )
+        if (
+            not stat_module.S_ISDIR(state_info.st_mode)
+            or _dispatch_is_unsafe_redirect(state_info)
+        ):
+            return True
+
+        state_handle = _open_windows_directory_handle(physical_state)
+        opened_state = os.stat(physical_state, follow_symlinks=False)
+        state_fingerprint = _dispatch_stat_fingerprint(opened_state)
+        if (
+            not stat_module.S_ISDIR(opened_state.st_mode)
+            or _dispatch_is_unsafe_redirect(opened_state)
+            or state_fingerprint != _dispatch_stat_fingerprint(state_info)
+        ):
+            return True
+
+        for brake_name in brake_names:
+            if _dispatch_brake_entry_exists(physical_state / brake_name):
+                return True
+
+        final_state = os.stat(physical_state, follow_symlinks=False)
+        return (
+            not stat_module.S_ISDIR(final_state.st_mode)
+            or _dispatch_is_unsafe_redirect(final_state)
+            or _dispatch_stat_fingerprint(final_state) != state_fingerprint
+            or not _windows_dispatch_root_matches(
+                root_anchor,
+                root_fingerprint,
+            )
+            or _dispatch_state_snapshot(state_dir) != expected_snapshot
+        )
+    except (OSError, RuntimeError):
+        return True
+    finally:
+        try:
+            if state_handle is not None:
+                _close_windows_directory_handle(state_handle)
+        finally:
+            if root_anchor is not None:
+                _close_windows_directory_handle(root_anchor.handle)
+
+
+def dispatch_is_paused() -> bool:
+    """Fail closed while a shared-root dispatch pause or full halt exists."""
+    try:
+        pause_path = dispatch_pause_path()
+        halt_path = dispatch_halt_path()
+        if pause_path.parent != halt_path.parent:
+            return True
+        state_dir = pause_path.parent
+        before = _dispatch_state_snapshot(state_dir)
+        if before is None:
+            return True
+        anchored_result: Optional[bool] = None
+        if _supports_anchored_dispatch_state_read():
+            anchored_result = _anchored_dispatch_brakes_present(
+                state_dir,
+                (pause_path.name, halt_path.name),
+                before,
+            )
+        elif os.name == "nt":
+            anchored_result = _windows_anchored_dispatch_brakes_present(
+                state_dir,
+                (pause_path.name, halt_path.name),
+                before,
+            )
+        if anchored_result is None:
+            if (
+                _dispatch_brake_entry_exists(pause_path)
+                or _dispatch_brake_entry_exists(halt_path)
+            ):
+                return True
+        elif anchored_result:
+            return True
+        # Detect an ancestor replacement during the two child lookups.  A
+        # changed state directory is not proof that both brakes were absent.
+        return _dispatch_state_snapshot(state_dir) != before
+    except Exception:
+        # Path resolution is part of the trust decision.  If the shared root
+        # cannot be resolved, dispatch must not silently fall through.
+        return True
+
+
+def _raise_if_dispatch_paused() -> None:
+    """Raise the shared exception used to release a late-paused claim."""
+    try:
+        from agent.estop import check_paused
+    except Exception:
+        estop_paused = True
+    else:
+        try:
+            estop_paused = check_paused("kanban", _log)
+        except Exception:
+            estop_paused = True
+    if estop_paused:
+        raise DispatchPausedError(
+            "Kanban dispatch is paused by the global emergency stop "
+            "(or its state could not be read)"
+        )
+    if dispatch_is_paused():
+        raise DispatchPausedError(
+            f"Kanban dispatch is paused by {_dispatch_brake_description()}"
+        )
+
+
+def _park_runnable_status_if_dispatch_paused(status: str) -> tuple[str, bool]:
+    """Return ``todo`` instead of creating runnable work while stopped.
+
+    Completion-like transitions still need to commit their audit trail while a
+    brake is engaged. They use this helper after acquiring their write lock,
+    persist the intended lane as ``resume_status``, and let
+    :func:`recompute_ready` restore that lane after the brake is removed.
+    """
+    if status not in {"ready", "review"}:
+        return status, False
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
+        return "todo", True
+    return status, False
+
+
+def _annotate_parked_retry_payload(
+    payload: dict[str, Any],
+    *,
+    retry_status: str,
+    landing_status: str,
+    parked: bool,
+) -> None:
+    """Record how a stopped retry can safely recover after resume."""
+    if not parked:
+        return
+    payload["status"] = landing_status
+    payload["resume_status"] = retry_status
+    payload["parked_by_dispatch_brake"] = True
+
+
+def _park_retry_transitions_before_commit(
+    conn: sqlite3.Connection,
+    transitions: Iterable[tuple[str, str, str]],
+) -> set[str]:
+    """Turn newly runnable retries into durable ``todo`` work if stopped.
+
+    Recovery paths must commit worker cleanup and audit rows even when a
+    brake arrives, so they cannot use the runnable-transition pattern that
+    rolls the whole transaction back. Callers first choose a safe landing
+    after acquiring their write lock, then call this immediately before the
+    transaction commits. A late brake changes any ``ready``/``review`` row to
+    ``todo`` and records the intended source lane for ``recompute_ready``.
+    """
+    pending = [
+        (task_id, retry_status, source_event)
+        for task_id, retry_status, source_event in transitions
+        if retry_status in {"ready", "review"}
+    ]
+    if not pending:
+        return set()
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
+        return _park_retry_transitions_locked(conn, pending)
+    return set()
+
+
+def _park_retry_transitions_locked(
+    conn: sqlite3.Connection,
+    transitions: Iterable[tuple[str, str, str]],
+) -> set[str]:
+    """Park runnable retries while the caller owns a SQLite write lock."""
+    parked: set[str] = set()
+    for task_id, retry_status, source_event in transitions:
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = ?",
+            (task_id, retry_status),
+        )
+        if cur.rowcount != 1:
+            continue
+        _append_event(
+            conn,
+            task_id,
+            "dispatch_parked",
+            {
+                "source_event": source_event,
+                "status": "todo",
+                "resume_status": retry_status,
+                "parked_by_dispatch_brake": True,
+            },
+        )
+        parked.add(task_id)
+    return parked
+
+
+def _park_runnable_transitions_after_commit(
+    conn: sqlite3.Connection,
+    transitions: Iterable[tuple[str, str, str]],
+) -> set[str]:
+    """Compensate when a brake arrives during SQLite's COMMIT boundary.
+
+    The in-transaction check runs immediately before control returns to
+    :func:`write_txn`, but SQLite can still wait or invoke trace hooks while
+    executing ``COMMIT``. Recheck after that statement becomes durable. If a
+    brake appeared at that exact edge, take a new write lock and park only
+    rows that are still runnable. Claim paths independently check the same
+    brakes, so no stopped worker can start during this short compensation
+    window.
+    """
+    pending = tuple(
+        (task_id, retry_status, source_event)
+        for task_id, retry_status, source_event in transitions
+        if retry_status in {"ready", "review"}
+    )
+    if not pending:
+        return set()
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
+        with write_txn(conn):
+            return _park_retry_transitions_locked(conn, pending)
+    return set()
+
+
+def _park_retry_transitions_after_commit(
+    conn: sqlite3.Connection,
+    transitions: Iterable[tuple[str, str, str]],
+) -> set[str]:
+    """Backward-compatible name for recovery-path commit compensation."""
+    return _park_runnable_transitions_after_commit(conn, transitions)
+
+
+def _dispatch_brake_description() -> str:
+    """Return a safe operator-facing description of both dispatch brakes."""
+    try:
+        return f"{dispatch_pause_path()} or {dispatch_halt_path()}"
+    except Exception:
+        return "the unreadable shared-root dispatch state"
+
+
+DISPATCH_BOUNDARY_CONTRACT = "hermes-kanban-dispatch-boundary"
+DISPATCH_BOUNDARY_SCHEMA_VERSION = 1
+DISPATCH_BOUNDARY_CHECKS = (
+    "absent_brakes_allow",
+    "dispatch_pause_regular_blocks",
+    "dispatch_pause_broken_symlink_blocks",
+    "halt_regular_blocks",
+    "halt_broken_symlink_blocks",
+    "profile_shared_root_halt_blocks",
+    "lookup_errors_fail_closed",
+    "halt_blocks_final_spawn_edge",
+    "estop_blocks_final_spawn_edge",
+    "halt_blocks_gateway_auto_decompose_edge",
+)
+
+
+def normalize_dispatch_boundary_self_test(
+    candidate: object,
+) -> tuple[dict[str, Any], bool]:
+    """Return the strict v1 capability payload and whether it verified.
+
+    Keep validation beside the contract constants so the standalone probe
+    fails closed in one place when a behavior check crashes or returns a
+    malformed result.
+    """
+    expected_top = {
+        "schema_version",
+        "contract",
+        "state",
+        "probe_scope",
+        "shared_halt_path",
+        "live_writes_performed",
+        "checks",
+    }
+    expected_checks = set(DISPATCH_BOUNDARY_CHECKS)
+    raw_checks = candidate.get("checks") if isinstance(candidate, dict) else None
+    checks_shape_ok = (
+        isinstance(raw_checks, dict)
+        and set(raw_checks) == expected_checks
+        and all(type(raw_checks[name]) is bool for name in DISPATCH_BOUNDARY_CHECKS)
+    )
+    normalized_checks = {
+        name: raw_checks[name] if checks_shape_ok else False
+        for name in DISPATCH_BOUNDARY_CHECKS
+    }
+    all_checks_pass = all(normalized_checks.values())
+    shape_ok = (
+        isinstance(candidate, dict)
+        and set(candidate) == expected_top
+        and type(candidate.get("schema_version")) is int
+        and candidate.get("schema_version") == DISPATCH_BOUNDARY_SCHEMA_VERSION
+        and candidate.get("contract") == DISPATCH_BOUNDARY_CONTRACT
+        and candidate.get("probe_scope") == "temporary_shared_root"
+        and candidate.get("shared_halt_path") == "state/halt.json"
+        and type(candidate.get("live_writes_performed")) is bool
+        and candidate.get("live_writes_performed") is False
+        and checks_shape_ok
+        and candidate.get("state")
+        == ("verified" if all_checks_pass else "failed")
+    )
+    verified = shape_ok and all_checks_pass
+    if not shape_ok:
+        normalized_checks = {name: False for name in DISPATCH_BOUNDARY_CHECKS}
+    return (
+        {
+            "schema_version": DISPATCH_BOUNDARY_SCHEMA_VERSION,
+            "contract": DISPATCH_BOUNDARY_CONTRACT,
+            "state": "verified" if verified else "failed",
+            "probe_scope": "temporary_shared_root",
+            "shared_halt_path": "state/halt.json",
+            "live_writes_performed": False,
+            "checks": normalized_checks,
+        },
+        verified,
+    )
+
+
+def run_dispatch_boundary_self_test() -> tuple[dict[str, Any], bool]:
+    """Run and normalize the capability without ever leaking a traceback."""
+    try:
+        candidate: object = dispatch_boundary_self_test()
+    except BaseException:
+        candidate = None
+    return normalize_dispatch_boundary_self_test(candidate)
+
+
+def _dispatch_probe_temp_parent() -> Path:
+    """Choose a writable temp parent that is outside every live Hermes root.
+
+    ``tempfile`` normally honors ``TMPDIR``/``TEMP``/``TMP``. A service can
+    legitimately point one of those variables at ``HERMES_HOME``; creating
+    and deleting the probe directory there would mutate live directory
+    metadata even when the final tree contents looked unchanged. Resolve and
+    validate candidates before passing an explicit parent to ``tempfile``.
+    If no safe parent exists, the outer normalizer emits a failed contract
+    without creating anything.
+    """
+    configured_roots: list[Path] = []
+    raw_hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    raw_kanban_home = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    for raw in (raw_hermes_home, raw_kanban_home):
+        if not raw:
+            continue
+        configured_roots.append(Path(raw).expanduser().resolve(strict=False))
+    # ``kanban_home`` also folds a profile-scoped HERMES_HOME back to its
+    # shared root, which is wider than the literal environment value.
+    configured_roots.append(kanban_home().expanduser().resolve(strict=False))
+
+    raw_candidates: list[str] = []
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot", "").strip()
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        user_profile = os.environ.get("USERPROFILE", "").strip()
+        if system_root:
+            raw_candidates.append(str(Path(system_root) / "Temp"))
+        if local_app_data:
+            raw_candidates.append(str(Path(local_app_data) / "Temp"))
+        if user_profile:
+            raw_candidates.append(
+                str(Path(user_profile) / "AppData" / "Local" / "Temp")
+            )
+    else:
+        raw_candidates.extend(("/tmp", "/var/tmp", "/dev/shm", "/usr/tmp"))
+    raw_candidates.extend(
+        os.environ.get(name, "").strip() for name in ("TMPDIR", "TEMP", "TMP")
+    )
+
+    seen: set[Path] = set()
+    for raw in raw_candidates:
+        if not raw:
+            continue
+        try:
+            candidate = Path(raw).expanduser().resolve(strict=True)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if not candidate.is_dir():
+                continue
+            if any(
+                candidate == live_root or live_root in candidate.parents
+                for live_root in configured_roots
+            ):
+                continue
+            if not os.access(candidate, os.W_OK | os.X_OK):
+                continue
+        except (OSError, RuntimeError):
+            continue
+        return candidate
+    raise RuntimeError("no temporary directory exists outside live Hermes roots")
+
+
+def dispatch_boundary_self_test() -> dict[str, Any]:
+    """Prove the dispatch brake contract entirely under a temporary root.
+
+    This is the machine-readable capability behind
+    ``python3 -m hermes_cli.dispatch_boundary_probe``. It never reads or writes
+    the live shared root. The context-local root override also avoids mutating
+    process-wide environment variables if the probe is invoked from a
+    long-lived process.
+    """
+    import tempfile
+
+    checks = {name: False for name in DISPATCH_BOUNDARY_CHECKS}
+
+    def _probe(root: Path) -> bool:
+        with _scoped_kanban_home(root):
+            return dispatch_is_paused()
+
+    def _root(base: Path, name: str) -> Path:
+        path = base / name
+        path.mkdir(parents=True)
+        return path
+
+    def _regular_brake(base: Path, name: str, brake: str) -> bool:
+        root = _root(base, name)
+        path = root / "state" / brake
+        path.parent.mkdir(parents=True)
+        path.write_text("{}\n", encoding="utf-8")
+        return _probe(root)
+
+    def _broken_symlink_brake(base: Path, name: str, brake: str) -> bool:
+        root = _root(base, name)
+        path = root / "state" / brake
+        path.parent.mkdir(parents=True)
+        if not _create_probe_symlink(path, root / "missing-target"):
+            # Native Windows can deny symlink creation with WinError 1314
+            # when Developer Mode or SeCreateSymbolicLinkPrivilege is absent.
+            # That host limitation is not a failed dispatch boundary: the
+            # runtime path uses lstat and remains fail-closed for every entry
+            # type it can encounter. Other creation failures still raise and
+            # make the capability probe fail.
+            return True
+        return _probe(root)
+
+    def _create_probe_symlink(
+        path: Path,
+        target: Path,
+        *,
+        target_is_directory: bool = False,
+    ) -> bool:
+        """Create a probe symlink or report Windows privilege unavailability."""
+        try:
+            path.symlink_to(target, target_is_directory=target_is_directory)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                return False
+            raise
+        return True
+
+    def _isolated_child_env(
+        root: Path, *, shared_kanban_root: Optional[Path] = None
+    ) -> dict[str, str]:
+        """Pin every runtime path used by a behavior probe under *root*.
+
+        The probe is deliberately stricter than ``_scoped_kanban_home``. Some
+        database helpers load normal Hermes configuration while selecting a
+        SQLite journal mode, and that configuration path follows
+        ``HERMES_HOME`` rather than the Kanban-only context override. Running
+        those helpers in a child with an isolated environment prevents both
+        reads and startup repairs from reaching the caller's live home. Clear
+        inherited board/task pins as well so a service environment cannot
+        redirect a probe back to its live database or workspace.
+        """
+        child_env = dict(os.environ)
+        for name in (
+            "HERMES_CONFIG",
+            "HERMES_ENV",
+            "HERMES_PROFILE",
+            "HERMES_GATEWAY_LOCK_DIR",
+            "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_DB",
+            "HERMES_KANBAN_WORKSPACES_ROOT",
+            "HERMES_KANBAN_ATTACHMENTS_ROOT",
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_CLAIM_LOCK",
+            "HERMES_DELEGATED_CHILD_CONTEXT",
+            "HERMES_SHARED_AUTH_DIR",
+        ):
+            child_env.pop(name, None)
+        user_home = root / "probe-home"
+        xdg_root = root / "probe-xdg"
+        for path in (
+            user_home,
+            xdg_root / "cache",
+            xdg_root / "config",
+            xdg_root / "data",
+            xdg_root / "runtime",
+            xdg_root / "state",
+            root / "probe-tmp",
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+        os.chmod(xdg_root / "runtime", 0o700)
+        child_env["HOME"] = str(user_home)
+        child_env["USERPROFILE"] = str(user_home)
+        child_env["XDG_CACHE_HOME"] = str(xdg_root / "cache")
+        child_env["XDG_CONFIG_HOME"] = str(xdg_root / "config")
+        child_env["XDG_DATA_HOME"] = str(xdg_root / "data")
+        child_env["XDG_RUNTIME_DIR"] = str(xdg_root / "runtime")
+        child_env["XDG_STATE_HOME"] = str(xdg_root / "state")
+        child_env["TMPDIR"] = str(root / "probe-tmp")
+        child_env["HERMES_HOME"] = str(root)
+        if shared_kanban_root is None:
+            child_env.pop("HERMES_KANBAN_HOME", None)
+        else:
+            child_env["HERMES_KANBAN_HOME"] = str(shared_kanban_root)
+        child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        return child_env
+
+    def _halt_runtime_boundaries_probe() -> bool:
+        root = _root(base, "halt-runtime-boundaries")
+        halt = root / "state" / "halt.json"
+        halt.parent.mkdir(parents=True)
+        halt.write_text("{}\n", encoding="utf-8")
+        child_code = """
+import contextlib
+import logging
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+logging.disable(logging.CRITICAL)
+
+from hermes_cli import kanban_db as kb
+
+root = Path(os.environ["HERMES_KANBAN_HOME"])
+spawned = []
+with contextlib.closing(sqlite3.connect(":memory:")) as conn:
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    ready_id = kb.create_task(conn, title="ready self-test", assignee="default")
+    review_id = kb.create_task(conn, title="review self-test", assignee="default")
+    conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,))
+    conn.commit()
+    ready_claim = kb.claim_task(conn, ready_id)
+    review_claim = kb.claim_review_task(conn, review_id)
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args, **kwargs: spawned.append((args, kwargs)),
+        max_spawn=1,
+        _emit_tick_hook=False,
+    )
+    run_count = conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
+
+ok = (
+    ready_claim is None
+    and review_claim is None
+    and result.spawned == []
+    and spawned == []
+    and run_count == 0
+    and not any(
+        name == "plugins.model_providers"
+        or name.startswith("plugins.model_providers.")
+        for name in sys.modules
+    )
+)
+raise SystemExit(0 if ok else 1)
+"""
+        child = subprocess.run(
+            [sys.executable, "-c", child_code],
+            env=_isolated_child_env(root, shared_kanban_root=root),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return (
+            child.returncode == 0
+            and child.stdout == ""
+            and child.stderr == ""
+        )
+
+    def _run(name: str, probe) -> None:
+        try:
+            checks[name] = probe() is True
+        except Exception:
+            checks[name] = False
+
+    with tempfile.TemporaryDirectory(
+        prefix="hermes-dispatch-boundary-",
+        dir=_dispatch_probe_temp_parent(),
+    ) as td:
+        base = Path(td)
+        _run(
+            "absent_brakes_allow",
+            lambda: not _probe(_root(base, "absent")),
+        )
+        _run(
+            "dispatch_pause_regular_blocks",
+            lambda: _regular_brake(
+                base, "pause-regular", "dispatch_pause.json"
+            ),
+        )
+        _run(
+            "dispatch_pause_broken_symlink_blocks",
+            lambda: _broken_symlink_brake(
+                base, "pause-broken-symlink", "dispatch_pause.json"
+            ),
+        )
+        _run(
+            "halt_regular_blocks",
+            lambda: _halt_runtime_boundaries_probe(),
+        )
+        _run(
+            "halt_broken_symlink_blocks",
+            lambda: _broken_symlink_brake(
+                base, "halt-broken-symlink", "halt.json"
+            ),
+        )
+
+        def _profile_shared_root_probe() -> bool:
+            shared_root = _root(base, "profile-shared-root")
+            profile_home = shared_root / "profiles" / "planner"
+            profile_home.mkdir(parents=True)
+            halt = shared_root / "state" / "halt.json"
+            halt.parent.mkdir(parents=True)
+            halt.write_text("{}\n", encoding="utf-8")
+            child = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from hermes_cli import kanban_db as kb; "
+                        "raise SystemExit(0 if kb.dispatch_is_paused() else 1)"
+                    ),
+                ],
+                env=_isolated_child_env(profile_home),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return (
+                child.returncode == 0
+                and child.stdout == ""
+                and child.stderr == ""
+            )
+
+        _run("profile_shared_root_halt_blocks", _profile_shared_root_probe)
+
+        def _lookup_error_probe() -> bool:
+            def _lstat_failure_case(name: str, target_kind: str) -> bool:
+                root = _root(base, name)
+                state = root / "state"
+                state.mkdir()
+                targets = {
+                    "root": root,
+                    "state": state,
+                    "brake": state / "dispatch_pause.json",
+                }
+                target = targets[target_kind]
+                real_lstat = os.lstat
+                real_stat = os.stat
+
+                def failed_lstat(path, *args, **kwargs):
+                    if Path(path) == target:
+                        raise PermissionError("dispatch lookup denied")
+                    return real_lstat(path, *args, **kwargs)
+
+                def failed_stat(path, *args, **kwargs):
+                    if (
+                        target_kind == "brake"
+                        and kwargs.get("dir_fd") is not None
+                        and os.fspath(path) == target.name
+                    ):
+                        raise PermissionError("dispatch lookup denied")
+                    return real_stat(path, *args, **kwargs)
+
+                os.lstat = failed_lstat
+                os.stat = failed_stat
+                try:
+                    return _probe(root)
+                finally:
+                    os.lstat = real_lstat
+                    os.stat = real_stat
+
+            def _stat_failure_case() -> bool:
+                target = _root(base, "lookup-error-stat-target")
+                root = base / "lookup-error-stat-link"
+                if not _create_probe_symlink(
+                    root, target, target_is_directory=True
+                ):
+                    return True
+                real_stat = os.stat
+
+                def failed_stat(path, *args, **kwargs):
+                    if Path(path) == root:
+                        raise OSError("dispatch symlink target unavailable")
+                    return real_stat(path, *args, **kwargs)
+
+                os.stat = failed_stat
+                try:
+                    return _probe(root)
+                finally:
+                    os.stat = real_stat
+
+            return all(
+                (
+                    _lstat_failure_case("lookup-error-root", "root"),
+                    _lstat_failure_case("lookup-error-state", "state"),
+                    _lstat_failure_case("lookup-error-brake", "brake"),
+                    _stat_failure_case(),
+                )
+            )
+
+        _run("lookup_errors_fail_closed", _lookup_error_probe)
+
+        def _final_spawn_probe(
+            name: str,
+            brake_relative: str,
+            *,
+            brake_mode: str = "regular",
+        ) -> bool:
+            root = _root(base, name)
+            child_code = """
+import inspect
+import json
+import os
+import sqlite3
+import sys
+import types
+from pathlib import Path
+from hermes_cli import kanban_db as kb
+
+root = Path(kb.os.environ["HERMES_KANBAN_HOME"])
+brake = root / __BRAKE_RELATIVE__
+brake_mode = __BRAKE_MODE__
+popen_calls = []
+real_lstat = os.lstat
+real_stat = os.stat
+original_hermes_home = os.environ["HERMES_HOME"]
+broken_home_link = root / "broken-hermes-home"
+profile_home = root / "profiles" / "planner"
+legacy_profile_brake = root / "profiles" / "coder" / "ESTOP"
+
+def disarm_brake():
+    os.lstat = real_lstat
+    os.stat = real_stat
+    os.environ["HERMES_HOME"] = original_hermes_home
+    if brake_mode == "broken_ancestor":
+        try:
+            broken_home_link.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    for candidate in (brake, legacy_profile_brake):
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+
+def arm_brake():
+    disarm_brake()
+    brake.parent.mkdir(parents=True, exist_ok=True)
+    if brake_mode == "regular":
+        brake.write_text("{}\\n", encoding="utf-8")
+    elif brake_mode == "broken_symlink":
+        try:
+            brake.symlink_to(root / "missing-estop-target")
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                raise SystemExit(0)
+            raise
+    elif brake_mode == "lookup_error":
+        def failed_lstat(path, *args, **kwargs):
+            if Path(path) == brake:
+                raise PermissionError("ESTOP lookup denied")
+            return real_lstat(path, *args, **kwargs)
+        def failed_stat(path, *args, **kwargs):
+            if (
+                os.fspath(path) == brake.name
+                and kwargs.get("dir_fd") is not None
+            ):
+                raise PermissionError("ESTOP lookup denied")
+            return real_stat(path, *args, **kwargs)
+        os.lstat = failed_lstat
+        os.stat = failed_stat
+    elif brake_mode == "broken_ancestor":
+        try:
+            broken_home_link.symlink_to(
+                root / "missing-hermes-home", target_is_directory=True
+            )
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 1314:
+                raise SystemExit(0)
+            raise
+        os.environ["HERMES_HOME"] = str(
+            broken_home_link / "profiles" / "planner"
+        )
+    elif brake_mode == "shared_profile_root":
+        profile_home.mkdir(parents=True, exist_ok=True)
+        brake.write_text("{}\\n", encoding="utf-8")
+        os.environ["HERMES_HOME"] = str(profile_home)
+    elif brake_mode == "legacy_sibling_profile":
+        profile_home.mkdir(parents=True, exist_ok=True)
+        legacy_profile_brake.parent.mkdir(parents=True, exist_ok=True)
+        legacy_profile_brake.write_text("{}\\n", encoding="utf-8")
+        os.environ["HERMES_HOME"] = str(profile_home)
+    else:
+        raise RuntimeError("unknown brake mode")
+
+def brake_is_armed():
+    if brake_mode == "lookup_error":
+        return True
+    if brake_mode == "broken_ancestor":
+        from agent import estop
+        try:
+            os.lstat(broken_home_link)
+        except OSError:
+            return False
+        return estop.is_engaged()
+    target = (
+        legacy_profile_brake
+        if brake_mode == "legacy_sibling_profile"
+        else brake
+    )
+    try:
+        os.lstat(target)
+    except OSError:
+        return False
+    return True
+
+# Exercise the real final Popen edge without importing the normal gateway or
+# profile/config startup graphs. Those graphs can discover user plugins, which
+# is outside a no-live-effects capability probe.
+profiles = types.ModuleType("hermes_cli.profiles")
+profiles.normalize_profile_name = lambda profile: profile
+profiles.resolve_profile_env = lambda _profile: str(root)
+sys.modules["hermes_cli.profiles"] = profiles
+gateway = types.ModuleType("gateway")
+gateway.__path__ = []
+session_context = types.ModuleType("gateway.session_context")
+session_context._VAR_MAP = {}
+gateway.session_context = session_context
+sys.modules["gateway"] = gateway
+sys.modules["gateway.session_context"] = session_context
+
+def brake_during_setup(*_args, **_kwargs):
+    arm_brake()
+    return None
+
+def fake_popen(*_args, **_kwargs):
+    popen_calls.append(True)
+    return type("Proc", (), {"pid": 4242})()
+
+kb._resolve_worker_cli_toolsets = brake_during_setup
+kb._retag_legacy_worker_sessions = lambda *_args, **_kwargs: None
+kb._resolve_hermes_argv = lambda: ["hermes"]
+kb.worker_log_rotation_config = lambda *_args, **_kwargs: (2097152, 1)
+kb.subprocess.Popen = fake_popen
+task = kb.Task(
+    id="t_dispatch_boundary_self_test",
+    title="dispatch boundary self-test",
+    body=None,
+    assignee="default",
+    status="ready",
+    priority=0,
+    created_by=None,
+    created_at=0,
+    started_at=None,
+    completed_at=None,
+    workspace_kind="scratch",
+    workspace_path=None,
+    claim_lock=None,
+    claim_expires=None,
+    tenant=None,
+)
+try:
+    kb._default_spawn(task, str(root))
+except kb.DispatchPausedError:
+    default_ok = brake_is_armed() and popen_calls == []
+except Exception:
+    default_ok = False
+else:
+    default_ok = False
+
+disarm_brake()
+kb._fire_kanban_lifecycle_hook = lambda *_args, **_kwargs: None
+kb.review_dispatch_enabled = lambda: True
+
+def direct_claims_block():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    ready_id = kb.create_task(conn, title="ready direct edge", assignee="default")
+    review_id = kb.create_task(conn, title="review direct edge", assignee="default")
+    conn.execute(
+        "UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,)
+    )
+    conn.commit()
+    arm_brake()
+    ready_claim = kb.claim_task(conn, ready_id)
+    review_claim = kb.claim_review_task(conn, review_id)
+    run_count = conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0]
+    rows = conn.execute(
+        "SELECT id, status FROM tasks WHERE id IN (?, ?)",
+        (ready_id, review_id),
+    ).fetchall()
+    statuses = {row["id"]: row["status"] for row in rows}
+    conn.close()
+    return (
+        ready_claim is None
+        and review_claim is None
+        and run_count == 0
+        and statuses == {ready_id: "ready", review_id: "review"}
+    )
+
+direct_claims_ok = direct_claims_block()
+disarm_brake()
+
+def injected_lane_blocks(lane):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    task_id = kb.create_task(
+        conn,
+        title=f"{lane} injected edge",
+        assignee="default",
+        workspace_kind="dir",
+        workspace_path=str(root),
+    )
+    if lane == "review":
+        conn.execute(
+            "UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,)
+        )
+        conn.commit()
+    spawn_calls = []
+
+    def injected_spawn(*_args, **_kwargs):
+        spawn_calls.append(True)
+        return 4242
+
+    real_signature = inspect.signature
+
+    def brake_before_guard(callable_obj):
+        signature = real_signature(callable_obj)
+        if callable_obj is injected_spawn:
+            arm_brake()
+        return signature
+
+    inspect.signature = brake_before_guard
+    try:
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=injected_spawn,
+            max_spawn=1,
+            _emit_tick_hook=False,
+        )
+    finally:
+        inspect.signature = real_signature
+    row = conn.execute(
+        "SELECT status, consecutive_failures FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    run = conn.execute(
+        "SELECT status, outcome, ended_at FROM task_runs WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    parked_event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'dispatch_paused' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    parked_payload = (
+        json.loads(parked_event["payload"])
+        if parked_event is not None and parked_event["payload"]
+        else {}
+    )
+    lane_ok = (
+        result.spawned == []
+        and spawn_calls == []
+        and row is not None
+        and row["status"] == "todo"
+        and row["consecutive_failures"] == 0
+        and parked_payload.get("resume_status") == lane
+        and parked_payload.get("parked_by_dispatch_brake") is True
+        and run is not None
+        and run["status"] == "reclaimed"
+        and run["outcome"] == "reclaimed"
+        and run["ended_at"] is not None
+    )
+    conn.close()
+    return lane_ok
+
+ready_ok = injected_lane_blocks("ready")
+disarm_brake()
+review_ok = injected_lane_blocks("review")
+disarm_brake()
+
+ok = default_ok and direct_claims_ok and ready_ok and review_ok and not any(
+    name == "plugins.model_providers"
+    or name.startswith("plugins.model_providers.")
+    for name in sys.modules
+)
+raise SystemExit(0 if ok else 1)
+"""
+            child_code = child_code.replace(
+                "__BRAKE_RELATIVE__", repr(brake_relative)
+            )
+            child_code = child_code.replace(
+                "__BRAKE_MODE__", repr(brake_mode)
+            )
+            child = subprocess.run(
+                [sys.executable, "-c", child_code],
+                env=_isolated_child_env(root, shared_kanban_root=root),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            return (
+                child.returncode == 0
+                and child.stdout == ""
+                and child.stderr == ""
+            )
+
+        _run(
+            "halt_blocks_final_spawn_edge",
+            lambda: _final_spawn_probe(
+                "final-spawn-halt", "state/halt.json"
+            ),
+        )
+        _run(
+            "estop_blocks_final_spawn_edge",
+            lambda: all(
+                _final_spawn_probe(
+                    f"final-spawn-estop-{mode}",
+                    "ESTOP",
+                    brake_mode=mode,
+                )
+                for mode in (
+                    "regular",
+                    "broken_symlink",
+                    "lookup_error",
+                    "broken_ancestor",
+                    "shared_profile_root",
+                    "legacy_sibling_profile",
+                )
+            ),
+        )
+
+        def _gateway_auto_decompose_edge_probe() -> bool:
+            allow_root = _root(base, "gateway-auto-decompose-allow")
+            allow_code = """
+import importlib.util
+import sys
+from pathlib import Path
+
+from hermes_cli import kanban_db as kb
+
+watcher_path = (
+    Path(kb.__file__).resolve().parent.parent / "gateway" / "kanban_watchers.py"
+)
+spec = importlib.util.spec_from_file_location(
+    "_hermes_dispatch_boundary_gateway_watchers", watcher_path
+)
+if spec is None or spec.loader is None:
+    raise SystemExit(1)
+watchers = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(watchers)
+calls = []
+result = watchers._decompose_if_dispatch_allowed(
+    lambda *args, **kwargs: calls.append((args, kwargs)) or "called",
+    "t_probe",
+    author="auto-decomposer",
+)
+provider_plugins_loaded = any(
+    name == "plugins.model_providers"
+    or name.startswith("plugins.model_providers.")
+    for name in sys.modules
+)
+raise SystemExit(
+    0 if result == "called" and len(calls) == 1 and not provider_plugins_loaded
+    else 1
+)
+"""
+            before = subprocess.run(
+                [sys.executable, "-c", allow_code],
+                env=_isolated_child_env(
+                    allow_root, shared_kanban_root=allow_root
+                ),
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            edge_root = _root(base, "gateway-auto-decompose-edges")
+            block_code = """
+import contextlib
+import importlib.util
+import json
+import logging
+import os
+import sqlite3
+import sys
+import types
+from pathlib import Path
+
+logging.disable(logging.CRITICAL)
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_decompose as decomp
+
+watcher_path = (
+    Path(kb.__file__).resolve().parent.parent / "gateway" / "kanban_watchers.py"
+)
+spec = importlib.util.spec_from_file_location(
+    "_hermes_dispatch_boundary_gateway_watchers", watcher_path
+)
+if spec is None or spec.loader is None:
+    raise SystemExit(1)
+watchers = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(watchers)
+_decompose_if_dispatch_allowed = watchers._decompose_if_dispatch_allowed
+
+root = Path(os.environ["HERMES_KANBAN_HOME"])
+halt = root / "state" / "halt.json"
+conn = sqlite3.connect(":memory:")
+conn.row_factory = sqlite3.Row
+conn.executescript(kb.SCHEMA_SQL)
+pre_id = kb.create_task(conn, title="pre-call edge", triage=True)
+
+@contextlib.contextmanager
+def raw_connect_closing(*_args, **_kwargs):
+    yield conn
+
+kb.connect_closing = raw_connect_closing
+
+decomp._load_config = lambda: {}
+decomp._resolve_orchestrator_profile = lambda _cfg: "default"
+decomp._resolve_default_assignee = lambda _cfg: "default"
+
+fake_aux = types.ModuleType("agent.auxiliary_client")
+model_calls = []
+
+def response():
+    content = json.dumps({
+        "fanout": False,
+        "rationale": "single test task",
+        "title": "tightened test task",
+        "body": "must remain in triage while halted",
+        "assignee": "default",
+    })
+    message = types.SimpleNamespace(content=content)
+    return types.SimpleNamespace(
+        choices=[types.SimpleNamespace(message=message)]
+    )
+
+def forbidden_pre_call(**_kwargs):
+    model_calls.append("pre")
+    return response()
+
+fake_aux.call_llm = forbidden_pre_call
+sys.modules["agent.auxiliary_client"] = fake_aux
+
+def halt_during_roster():
+    halt.parent.mkdir(parents=True, exist_ok=True)
+    halt.write_text("{}\\n", encoding="utf-8")
+    return ([{"name": "default", "description": "test", "has_description": True}], {"default"})
+
+decomp._build_roster = halt_during_roster
+pre_outcome = _decompose_if_dispatch_allowed(
+    decomp.decompose_task, pre_id, author="auto-decomposer"
+)
+with raw_connect_closing() as conn:
+    pre_task = kb.get_task(conn, pre_id)
+pre_ok = (
+    pre_outcome is not None
+    and not pre_outcome.ok
+    and model_calls == []
+    and pre_task is not None
+    and pre_task.status == "triage"
+)
+
+halt.unlink()
+with raw_connect_closing() as conn:
+    post_id = kb.create_task(conn, title="post-call edge", triage=True)
+
+decomp._build_roster = lambda: (
+    [{"name": "default", "description": "test", "has_description": True}],
+    {"default"},
+)
+
+def halt_during_model(**_kwargs):
+    model_calls.append("post")
+    halt.parent.mkdir(parents=True, exist_ok=True)
+    halt.write_text("{}\\n", encoding="utf-8")
+    return response()
+
+fake_aux.call_llm = halt_during_model
+post_outcome = _decompose_if_dispatch_allowed(
+    decomp.decompose_task, post_id, author="auto-decomposer"
+)
+with raw_connect_closing() as conn:
+    post_task = kb.get_task(conn, post_id)
+    task_count = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+post_ok = (
+    post_outcome is not None
+    and not post_outcome.ok
+    and model_calls == ["post"]
+    and post_task is not None
+    and post_task.status == "triage"
+    and task_count == 2
+    and not any(
+        name == "plugins.model_providers"
+        or name.startswith("plugins.model_providers.")
+        for name in sys.modules
+    )
+)
+
+raise SystemExit(0 if pre_ok and post_ok else 1)
+"""
+            after = subprocess.run(
+                [sys.executable, "-c", block_code],
+                env=_isolated_child_env(
+                    edge_root, shared_kanban_root=edge_root
+                ),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return all(
+                proc.returncode == 0
+                and proc.stdout == ""
+                and proc.stderr == ""
+                for proc in (before, after)
+            )
+
+        _run(
+            "halt_blocks_gateway_auto_decompose_edge",
+            _gateway_auto_decompose_edge_probe,
+        )
+
+    verified = all(checks.values())
+    return {
+        "schema_version": DISPATCH_BOUNDARY_SCHEMA_VERSION,
+        "contract": DISPATCH_BOUNDARY_CONTRACT,
+        "state": "verified" if verified else "failed",
+        "probe_scope": "temporary_shared_root",
+        "shared_halt_path": "state/halt.json",
+        "live_writes_performed": False,
+        "checks": checks,
+    }
 
 
 def boards_root() -> Path:
@@ -3452,6 +5135,7 @@ def create_task(
             return row["id"]
 
     now = int(time.time())
+    caller_owns_txn = bool(getattr(conn, "in_transaction", False))
 
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
@@ -3506,6 +5190,10 @@ def create_task(
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
                             task_status = "todo"
+                resume_status = task_status
+                task_status, parked_by_dispatch_brake = (
+                    _park_runnable_status_if_dispatch_paused(task_status)
+                )
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
@@ -3595,9 +5283,25 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "resume_status": (
+                            resume_status if parked_by_dispatch_brake else None
+                        ),
+                        "parked_by_dispatch_brake": (
+                            True if parked_by_dispatch_brake else None
+                        ),
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if task_status in {"ready", "review"}:
+                    # A brake can appear after the first check but before the
+                    # INSERT/event writes. Roll the whole creation back rather
+                    # than commit newly runnable work.
+                    _raise_if_dispatch_paused()
+            if not caller_owns_txn and task_status in {"ready", "review"}:
+                _park_runnable_transitions_after_commit(
+                    conn,
+                    ((task_id, resume_status, "created"),),
+                )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3940,7 +5644,7 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
         # child immediately.  Matches the contract of complete_task and
         # unblock_task; without this the child stays stuck in todo until the
         # next dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
-        recompute_ready(conn)
+        _recompute_ready_after_committed_mutation(conn)
     return removed
 
 
@@ -4533,8 +6237,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
-        "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'unblocked', 'changes_requested', 'review_requested', 'review_reopened', "
+        "'status', 'reclaimed', 'reconciled', 'dispatch_parked', "
+        "'dispatch_paused', 'workspace_busy', 'stale', 'timed_out', "
+        "'crashed', 'protocol_violation', 'spawn_failed', 'rate_limited'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -4551,7 +6257,10 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
 
 
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection,
+    failure_limit: int = None,
+    *,
+    require_dispatch_allowed: bool = True,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -4581,11 +6290,22 @@ def recompute_ready(
       2. caller-supplied ``failure_limit`` (the dispatcher passes the
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
+
+    Dispatch brakes protect every promotion by default. Checks run before
+    waiting for SQLite, after the write transaction is acquired, and again
+    immediately before commit. A stop engaged during lock contention or the
+    promotion writes cannot create new runnable work. Tests of the isolated
+    dependency algorithm can explicitly set ``require_dispatch_allowed=False``.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    if require_dispatch_allowed:
+        _raise_if_dispatch_paused()
     promoted = 0
+    runnable_transitions: list[tuple[str, str, str]] = []
     with write_txn(conn):
+        if require_dispatch_allowed:
+            _raise_if_dispatch_paused()
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
@@ -4639,7 +6359,25 @@ def recompute_ready(
                     {"status": resume_status} if resume_status != "ready" else None,
                 )
                 promoted += 1
+                if resume_status in {"ready", "review"}:
+                    runnable_transitions.append(
+                        (task_id, resume_status, "promoted")
+                    )
+        if require_dispatch_allowed:
+            _raise_if_dispatch_paused()
+    if require_dispatch_allowed:
+        _park_runnable_transitions_after_commit(conn, runnable_transitions)
     return promoted
+
+
+def _recompute_ready_after_committed_mutation(
+    conn: sqlite3.Connection,
+) -> int:
+    """Promote dependents unless a brake parked this committed mutation."""
+    try:
+        return recompute_ready(conn)
+    except DispatchPausedError:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -4657,6 +6395,29 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _claim_survives_commit_boundary(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    claim_lock: str,
+    run_id: int,
+) -> bool:
+    """Undo a claim if a brake arrived during SQLite's actual COMMIT."""
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
+        _release_paused_claim(
+            conn,
+            task_id,
+            summary="dispatch paused during claim commit",
+            payload_extra={"boundary": "claim_commit"},
+            expected_claim_lock=claim_lock,
+            expected_run_id=run_id,
+        )
+        return False
+    return True
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4669,12 +6430,18 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
-    if dispatch_is_paused():
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
         return None
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
+    claim_completed = False
+    with contextlib.suppress(DispatchPausedError), write_txn(conn):
+        # BEGIN IMMEDIATE may wait behind another writer. A stop engaged during
+        # that wait must win before this transaction changes a task or run.
+        _raise_if_dispatch_paused()
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4771,6 +6538,20 @@ def claim_task(
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
+        # A stop can arrive after the first in-transaction check while the
+        # claim writes are running. Let it escape through write_txn so every
+        # task, run, and event mutation rolls back before it is suppressed.
+        _raise_if_dispatch_paused()
+        claim_completed = True
+    if not claim_completed:
+        return None
+    if not _claim_survives_commit_boundary(
+        conn,
+        task_id,
+        claim_lock=lock,
+        run_id=run_id,
+    ):
+        return None
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -4799,12 +6580,19 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
-    if dispatch_is_paused():
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
         return None
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
-    with write_txn(conn):
+    claim_completed = False
+    claimed = None
+    with contextlib.suppress(DispatchPausedError), write_txn(conn):
+        # Match the ready lane: the acquired transaction is the final claim
+        # boundary after any SQLite busy wait.
+        _raise_if_dispatch_paused()
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4871,7 +6659,19 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+        _raise_if_dispatch_paused()
+        claim_completed = True
+    if not claim_completed:
+        return None
+    if not _claim_survives_commit_boundary(
+        conn,
+        task_id,
+        claim_lock=lock,
+        run_id=run_id,
+    ):
+        return None
+    return claimed
 
 
 def _retry_status_for_run(
@@ -5099,12 +6899,15 @@ def release_stale_claims(
             continue
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, row["id"])
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
+                (landing_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -5131,12 +6934,26 @@ def release_stale_claims(
                 "retry_status": retry_status,
             }
             payload.update(termination)
+            _annotate_parked_retry_payload(
+                payload,
+                retry_status=retry_status,
+                landing_status=landing_status,
+                parked=parked_by_dispatch_brake,
+            )
             _append_event(
                 conn, row["id"], "reclaimed",
                 payload,
                 run_id=run_id,
             )
+            _park_retry_transitions_before_commit(
+                conn,
+                ((row["id"], retry_status, "reclaimed"),),
+            )
             reclaimed += 1
+        _park_retry_transitions_after_commit(
+            conn,
+            ((row["id"], retry_status, "reclaimed"),),
+        )
         # The reclaimed worker is gone (or never local): drop a dead lock.
         _unlock_task_worktree(conn, row["id"])
         # Worker-lifecycle observer (RFC #58548): the reclaim txn above has
@@ -5193,12 +7010,15 @@ def reclaim_task(
     )
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
+        landing_status, parked_by_dispatch_brake = (
+            _park_runnable_status_if_dispatch_paused(retry_status)
+        )
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
-            (retry_status, task_id, prev_lock),
+            (landing_status, task_id, prev_lock),
         )
         if cur.rowcount != 1:
             return False
@@ -5218,11 +7038,25 @@ def reclaim_task(
             "retry_status": retry_status,
         }
         payload.update(termination)
+        _annotate_parked_retry_payload(
+            payload,
+            retry_status=retry_status,
+            landing_status=landing_status,
+            parked=parked_by_dispatch_brake,
+        )
         _append_event(
             conn, task_id, "reclaimed",
             payload,
             run_id=run_id,
         )
+        _park_retry_transitions_before_commit(
+            conn,
+            ((task_id, retry_status, "reclaimed"),),
+        )
+    _park_retry_transitions_after_commit(
+        conn,
+        ((task_id, retry_status, "reclaimed"),),
+    )
     # Operator intervention — they've looked at the task, so the
     # consecutive-failures counter is now stale. Give the next retry
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
@@ -5632,7 +7466,7 @@ def complete_task(
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
+    _recompute_ready_after_committed_mutation(conn)
     # Release the finished worker's worktree lock, then clean up the
     # scratch workspace and any stale tmux session for the worker.
     _unlock_task_worktree(conn, task_id, _prior_pid)
@@ -6651,22 +8485,29 @@ def request_review(
                     )
                 reviewer = prior_reviewer
         reviewer = _canonical_assignee(reviewer) if reviewer is not None else None
+        landing_status, parked_by_dispatch_brake = (
+            _park_runnable_status_if_dispatch_paused("review")
+        )
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
         params: tuple[Any, ...]
         if expected_run_id is None:
-            params = (reviewer, task_id) if reviewer is not None else (task_id,)
+            params = (
+                (landing_status, reviewer, task_id)
+                if reviewer is not None
+                else (landing_status, task_id)
+            )
             run_guard = ""
         else:
             params = (
-                (reviewer, task_id, int(expected_run_id))
+                (landing_status, reviewer, task_id, int(expected_run_id))
                 if reviewer is not None
-                else (task_id, int(expected_run_id))
+                else (landing_status, task_id, int(expected_run_id))
             )
             run_guard = " AND current_run_id = ?"
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'review',
+               SET status        = ?,
                    claim_lock    = NULL,
                    claim_expires = NULL,
                    worker_pid    = NULL
@@ -6686,7 +8527,7 @@ def request_review(
             conn,
             task_id,
             outcome="review_requested",
-            status="review",
+            status=landing_status,
             summary=summary,
             metadata=metadata,
         )
@@ -6708,8 +8549,22 @@ def request_review(
                 "summary": event_summary or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                "status": landing_status,
+                "resume_status": (
+                    "review" if parked_by_dispatch_brake else None
+                ),
+                "parked_by_dispatch_brake": (
+                    True if parked_by_dispatch_brake else None
+                ),
             },
             run_id=run_id,
+        )
+        if landing_status == "review":
+            _raise_if_dispatch_paused()
+    if landing_status == "review":
+        _park_runnable_transitions_after_commit(
+            conn,
+            ((task_id, "review", "review_requested"),),
         )
     return _ret(True)
 
@@ -6792,7 +8647,10 @@ def request_changes(
         else:
             reviewer = None
 
-        new_status = _landing_status_after_parents(conn, task_id)
+        desired_status = _landing_status_after_parents(conn, task_id)
+        new_status, parked_by_dispatch_brake = (
+            _park_runnable_status_if_dispatch_paused(desired_status)
+        )
         # NOTE: consecutive_failures is deliberately PRESERVED (neither
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
@@ -6827,8 +8685,21 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                "resume_status": (
+                    desired_status if parked_by_dispatch_brake else None
+                ),
+                "parked_by_dispatch_brake": (
+                    True if parked_by_dispatch_brake else None
+                ),
             },
             run_id=run_id,
+        )
+        if new_status in {"ready", "review"}:
+            _raise_if_dispatch_paused()
+    if new_status in {"ready", "review"}:
+        _park_runnable_transitions_after_commit(
+            conn,
+            ((task_id, new_status, "changes_requested"),),
         )
     return True, implementer
 
@@ -6885,21 +8756,31 @@ def promote_task(
     if dry_run:
         return True, None
 
-    with write_txn(conn):
-        upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
-            (task_id,),
-        )
-        if upd.rowcount != 1:
-            return False, f"task {task_id} status changed during promotion"
-        _append_event(
-            conn,
-            task_id,
-            "promoted_manual",
-            {"actor": actor, "reason": reason, "forced": force},
-        )
+    try:
+        _raise_if_dispatch_paused()
+        with write_txn(conn):
+            _raise_if_dispatch_paused()
+            upd = conn.execute(
+                "UPDATE tasks SET status = 'ready' "
+                "WHERE id = ? AND status IN ('todo', 'blocked')",
+                (task_id,),
+            )
+            if upd.rowcount != 1:
+                return False, f"task {task_id} status changed during promotion"
+            _append_event(
+                conn,
+                task_id,
+                "promoted_manual",
+                {"actor": actor, "reason": reason, "forced": force},
+            )
+            _raise_if_dispatch_paused()
+    except DispatchPausedError as exc:
+        return False, str(exc)
 
+    _park_runnable_transitions_after_commit(
+        conn,
+        ((task_id, "ready", "promoted_manual"),),
+    )
     return True, None
 
 
@@ -6984,6 +8865,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
+        new_status, parked_by_dispatch_brake = (
+            _park_runnable_status_if_dispatch_paused(new_status)
+        )
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -7005,12 +8889,25 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         _append_event(
             conn, task_id, "unblocked",
             (
-                {"status": new_status, "resume_status": resume_status}
+                {
+                    "status": new_status,
+                    "resume_status": resume_status,
+                    "parked_by_dispatch_brake": (
+                        True if parked_by_dispatch_brake else None
+                    ),
+                }
                 if new_status != "ready" or resume_status != "ready"
                 else None
             ),
         )
-        return True
+        if new_status in {"ready", "review"}:
+            _raise_if_dispatch_paused()
+    if new_status in {"ready", "review"}:
+        _park_runnable_transitions_after_commit(
+            conn,
+            ((task_id, new_status, "unblocked"),),
+        )
+    return True
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -7033,7 +8930,10 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             conn, task_id, statuses=("review",), now=now,
             note="invariant recovery on review reopen",
         )
-        new_status = _landing_status_after_parents(conn, task_id)
+        desired_status = _landing_status_after_parents(conn, task_id)
+        new_status, parked_by_dispatch_brake = (
+            _park_runnable_status_if_dispatch_paused(desired_status)
+        )
         review_event = conn.execute(
             "SELECT payload FROM task_events "
             "WHERE task_id = ? AND kind = 'review_requested' "
@@ -7070,6 +8970,9 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         if cur.rowcount != 1:
             return False
         payload: dict[str, Any] = {"status": new_status}
+        if parked_by_dispatch_brake:
+            payload["resume_status"] = desired_status
+            payload["parked_by_dispatch_brake"] = True
         if implementer:
             payload["implementer"] = implementer
         _append_event(
@@ -7078,7 +8981,14 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "review_reopened",
             payload if payload != {"status": "ready"} else None,
         )
-        return True
+        if new_status in {"ready", "review"}:
+            _raise_if_dispatch_paused()
+    if new_status in {"ready", "review"}:
+        _park_runnable_transitions_after_commit(
+            conn,
+            ((task_id, new_status, "review_reopened"),),
+        )
+    return True
 
 
 def invalidate_descendants_for_parent_reopen(
@@ -7279,7 +9189,12 @@ def specify_triage_task(
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
+    # Keep the cheap check outside the write lock, then repeat it after
+    # BEGIN IMMEDIATE succeeds. A brake may be engaged while this caller is
+    # waiting behind another SQLite writer.
+    _raise_if_dispatch_paused()
     with write_txn(conn):
+        _raise_if_dispatch_paused()
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -7333,12 +9248,19 @@ def specify_triage_task(
             "specified",
             {"changed_fields": changed_fields} if changed_fields else None,
         )
+        _raise_if_dispatch_paused()
     # Outside the write_txn above, so we don't nest BEGIN IMMEDIATE — the
     # ready-promotion pass opens its own IMMEDIATE txn. This runs the same
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    try:
+        recompute_ready(conn, require_dispatch_allowed=True)
+    except DispatchPausedError:
+        # The specification transaction already committed. A stop that lands
+        # before this separate promotion transaction leaves the task safely in
+        # todo; report the committed mutation instead of pretending it failed.
+        pass
     return True
 
 
@@ -7424,6 +9346,10 @@ def decompose_triage_task(
     if _seen != len(children):
         raise ValueError("cyclic dependency detected in decomposed children list")
 
+    # Avoid waiting for a write lock when planning is already stopped. The
+    # authoritative check is repeated inside the acquired transaction below.
+    _raise_if_dispatch_paused()
+
     # We do the full decomposition in a SINGLE write_txn so it's
     # atomic: either every child is created AND the root flips to
     # ``todo``, or nothing changes. We deliberately do NOT call any
@@ -7434,6 +9360,10 @@ def decompose_triage_task(
     now = int(time.time())
     child_ids: list[str] = []
     with write_txn(conn):
+        # BEGIN IMMEDIATE may have waited on another writer. A halt or ESTOP
+        # engaged during that wait must win before any child, link, comment,
+        # event, or root-status mutation.
+        _raise_if_dispatch_paused()
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
@@ -7569,6 +9499,7 @@ def decompose_triage_task(
                 "root_assignee": root_assignee,
             },
         )
+        _raise_if_dispatch_paused()
 
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern
@@ -7576,7 +9507,13 @@ def decompose_triage_task(
     # stay in 'todo' until the user manually promotes them — useful
     # for manual-review-first workflows.
     if auto_promote:
-        recompute_ready(conn)
+        try:
+            recompute_ready(conn, require_dispatch_allowed=True)
+        except DispatchPausedError:
+            # Child creation and root promotion already committed atomically.
+            # A late stop keeps every child in todo, which is the safe parked
+            # result callers need to report as committed rather than failed.
+            pass
     return child_ids
 
 
@@ -7602,7 +9539,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
-    recompute_ready(conn)
+    _recompute_ready_after_committed_mutation(conn)
     # Reap the workspace on archive too — tasks archived without ever
     # completing previously kept their scratch dir / worktree forever.
     _cleanup_workspace(conn, task_id)
@@ -7654,13 +9591,72 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-    recompute_ready(conn)
+    _recompute_ready_after_committed_mutation(conn)
     return True
 
 
 # ---------------------------------------------------------------------------
 # Workspace resolution
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class _WorkspaceMaterialization:
+    """A workspace created by one unresolved dispatch attempt.
+
+    The record stays in memory until the workspace metadata is committed.
+    If a dispatch brake closes while resolution is running, rollback uses the
+    captured directory identity and Git ref value so it cannot remove a
+    pre-existing or subsequently replaced workspace.
+    """
+
+    kind: Optional[str] = None
+    path: Optional[Path] = None
+    identity: Optional[tuple[int, int]] = None
+    repo_root: Optional[Path] = None
+    branch_name: Optional[str] = None
+    branch_oid: Optional[str] = None
+    created_branch: bool = False
+    base_fell_back: bool = False
+
+
+def _directory_identity(path: Path) -> Optional[tuple[int, int]]:
+    """Return a no-follow directory identity, or ``None`` when untrusted."""
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return None
+    if not stat_module.S_ISDIR(metadata.st_mode):
+        return None
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _mkdir_workspace(path: Path) -> bool:
+    """Create ``path`` and report whether this call created the leaf."""
+    try:
+        path.mkdir(parents=True, exist_ok=False)
+        return True
+    except FileExistsError:
+        if not path.is_dir():
+            raise
+        return False
+
+
+def _record_created_directory(
+    materialization: Optional[_WorkspaceMaterialization],
+    *,
+    kind: str,
+    path: Path,
+    created: bool,
+) -> None:
+    if materialization is None or not created:
+        return
+    identity = _directory_identity(path)
+    if identity is None:
+        return
+    materialization.kind = kind
+    materialization.path = path
+    materialization.identity = identity
 
 def _git_toplevel(path: Path) -> Optional[Path]:
     """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
@@ -7697,6 +9693,25 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
     except Exception:
         return False
     return result.returncode == 0
+
+
+def _git_branch_oid(repo_root: Path, branch_name: str) -> Optional[str]:
+    """Return the exact local branch object id without accepting ambiguity."""
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", str(repo_root), "rev-parse", "--verify",
+                f"refs/heads/{branch_name}",
+            ],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    value = (result.stdout or "").strip()
+    return value if result.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40,64}", value) else None
 
 
 def _git_common_dir(path: Path) -> Optional[Path]:
@@ -8070,7 +10085,50 @@ def _worktree_base_ref(repo_root: Path) -> tuple[str, bool]:
     return "HEAD", True
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> bool:
+def _capture_created_worktree(
+    materialization: Optional[_WorkspaceMaterialization],
+    *,
+    repo_root: Path,
+    repo_common: Optional[Path],
+    target: Path,
+    branch_name: str,
+    branch_existed: bool,
+    target_was_missing: bool,
+) -> None:
+    """Record a worktree created even when ``git worktree add`` fails."""
+    if materialization is None or not target_was_missing or repo_common is None:
+        return
+    try:
+        identity = _directory_identity(target)
+        if (
+            identity is None
+            or _git_common_dir(target) != repo_common
+            or _git_current_branch(target) != branch_name
+        ):
+            return
+        materialization.kind = "worktree"
+        materialization.path = target
+        materialization.identity = identity
+        materialization.repo_root = repo_root.expanduser().resolve(strict=False)
+        materialization.branch_name = branch_name
+        materialization.created_branch = not branch_existed
+        materialization.branch_oid = _git_branch_oid(repo_root, branch_name)
+    except Exception:
+        # Rollback is best effort and must never hide the original git error.
+        _log.debug(
+            "Could not safely capture partially-created worktree %s",
+            target,
+            exc_info=True,
+        )
+
+
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    materialization: Optional[_WorkspaceMaterialization] = None,
+) -> bool:
     """Materialize ``target`` as a linked git worktree under ``repo_root``.
 
     Returns True when a NEW branch had to be based on ``HEAD`` because no
@@ -8079,6 +10137,13 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> boo
     the tree already exists and a live hermes process holds its lock.
     """
     target = target.expanduser()
+    target_was_missing = False
+    try:
+        os.lstat(target)
+    except FileNotFoundError:
+        target_was_missing = True
+    except OSError:
+        pass
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
@@ -8087,7 +10152,8 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> boo
             return False
     target.parent.mkdir(parents=True, exist_ok=True)
     fell_back = False
-    if _git_branch_exists(repo_root, branch_name):
+    branch_existed = _git_branch_exists(repo_root, branch_name)
+    if branch_existed:
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
         base_ref, fell_back = _worktree_base_ref(repo_root)
@@ -8095,19 +10161,35 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> boo
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
             str(target), base_ref,
         ]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True, encoding='utf-8', errors='replace',
-        timeout=60,
-        check=False,
-        env=_git_worktree_env(),
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=60,
+            check=False,
+            env=_git_worktree_env(),
+        )
+    finally:
+        # Git can leave a registered checkout and branch behind when a
+        # post-checkout hook fails or the parent process times out. Capture
+        # that exact artifact before the original error is propagated.
+        _capture_created_worktree(
+            materialization,
+            repo_root=repo_root,
+            repo_common=repo_common,
+            target=target,
+            branch_name=branch_name,
+            branch_existed=branch_existed,
+            target_was_missing=target_was_missing,
+        )
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    if materialization is not None and fell_back:
+        materialization.base_fell_back = True
     return fell_back
 
 
@@ -8128,7 +10210,11 @@ def _note_worktree_base_fallback(
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None, conn: Optional[sqlite3.Connection] = None,
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+    materialization: Optional[_WorkspaceMaterialization] = None,
 ) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``.
 
@@ -8167,7 +10253,9 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        if _ensure_git_worktree(repo_root, target, branch_name):
+        if _ensure_git_worktree(
+            repo_root, target, branch_name, materialization=materialization
+        ) and materialization is None:
             _note_worktree_base_fallback(conn, task.id, branch_name)
         return target, branch_name
 
@@ -8196,7 +10284,12 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                if _ensure_git_worktree(fallback_root, fallback, branch_name):
+                if _ensure_git_worktree(
+                    fallback_root,
+                    fallback,
+                    branch_name,
+                    materialization=materialization,
+                ) and materialization is None:
                     _note_worktree_base_fallback(conn, task.id, branch_name)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
@@ -8208,7 +10301,9 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        if _ensure_git_worktree(repo_root, target, branch_name):
+        if _ensure_git_worktree(
+            repo_root, target, branch_name, materialization=materialization
+        ) and materialization is None:
             _note_worktree_base_fallback(conn, task.id, branch_name)
         return target, branch_name
 
@@ -8218,12 +10313,19 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    if _ensure_git_worktree(repo_root, requested, branch_name):
+    if _ensure_git_worktree(
+        repo_root, requested, branch_name, materialization=materialization
+    ) and materialization is None:
         _note_worktree_base_fallback(conn, task.id, branch_name)
     return requested, branch_name
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+def resolve_workspace(
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    materialization: Optional[_WorkspaceMaterialization] = None,
+) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     - ``scratch``: a fresh dir under ``<board-root>/workspaces/<id>/``,
@@ -8263,7 +10365,10 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 )
         else:
             p = workspaces_root(board=board) / task.id
-        p.mkdir(parents=True, exist_ok=True)
+        created = _mkdir_workspace(p)
+        _record_created_directory(
+            materialization, kind="scratch", path=p, created=created
+        )
         return p
     if kind == "dir":
         if not task.workspace_path:
@@ -8277,10 +10382,15 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"{task.workspace_path!r}; use an absolute path "
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
             )
-        p.mkdir(parents=True, exist_ok=True)
+        created = _mkdir_workspace(p)
+        _record_created_directory(
+            materialization, kind="dir", path=p, created=created
+        )
         return p
     if kind == "worktree":
-        p, _branch_name = _resolve_worktree_workspace(task, board=board)
+        p, _branch_name = _resolve_worktree_workspace(
+            task, board=board, materialization=materialization
+        )
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
@@ -8303,6 +10413,225 @@ def set_branch_name(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
             (str(branch_name), task_id),
         )
+
+
+def _remove_created_empty_directory(
+    path: Path, expected_identity: tuple[int, int]
+) -> bool:
+    """Remove one newly-created empty directory without following its leaf."""
+    try:
+        if os.rmdir in os.supports_dir_fd:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+            parent_fd = os.open(path.parent, flags)
+            try:
+                metadata = os.stat(
+                    path.name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if (
+                    not stat_module.S_ISDIR(metadata.st_mode)
+                    or (metadata.st_dev, metadata.st_ino) != expected_identity
+                ):
+                    return False
+                os.rmdir(path.name, dir_fd=parent_fd)
+                return True
+            finally:
+                os.close(parent_fd)
+        if _directory_identity(path) != expected_identity:
+            return False
+        # Native Windows has no dir_fd form. rmdir still refuses symlinks and
+        # non-empty directories, and the identity check keeps replacement
+        # races fail-closed as far as that platform's API permits.
+        path.rmdir()
+        return True
+    except Exception:
+        return False
+
+
+def _remove_created_worktree(materialization: _WorkspaceMaterialization) -> bool:
+    """Remove only the exact clean worktree and unchanged branch just created."""
+    path = materialization.path
+    repo_root = materialization.repo_root
+    identity = materialization.identity
+    if path is None or repo_root is None or identity is None:
+        return False
+    if _directory_identity(path) != identity:
+        return False
+    branch_name = materialization.branch_name
+    branch_oid = materialization.branch_oid
+    if not branch_name or not branch_oid:
+        return False
+    try:
+        path_common = _git_common_dir(path)
+        repo_common = _git_common_dir(repo_root)
+        if (
+            path_common is None
+            or repo_common is None
+            or path_common != repo_common
+            or _git_current_branch(path) != branch_name
+            or _git_branch_oid(repo_root, branch_name) != branch_oid
+        ):
+            return False
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "remove", str(path)],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=60,
+            check=False,
+        )
+    except Exception:
+        return False
+    if result.returncode != 0:
+        _log.warning(
+            "Could not roll back newly-created worktree %s after dispatch paused: %s",
+            path,
+            (result.stderr or result.stdout or "").strip(),
+        )
+        return False
+    if materialization.created_branch:
+        # update-ref's old-value argument makes deletion atomic: a branch that
+        # another actor advanced after materialization is preserved.
+        try:
+            deleted = subprocess.run(
+                [
+                    "git", "-C", str(repo_root), "update-ref", "-d",
+                    f"refs/heads/{branch_name}", branch_oid,
+                ],
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=30,
+                check=False,
+            )
+        except Exception:
+            _log.warning(
+                "Preserved branch %s because its paused-worktree cleanup failed",
+                branch_name,
+                exc_info=True,
+            )
+            return True
+        if deleted.returncode != 0:
+            _log.warning(
+                "Preserved changed branch %s after removing paused worktree %s",
+                branch_name,
+                path,
+            )
+    return True
+
+
+def _rollback_workspace_materialization(
+    materialization: _WorkspaceMaterialization,
+) -> bool:
+    """Best-effort rollback for a workspace created after a dispatch claim."""
+    path = materialization.path
+    identity = materialization.identity
+    if path is None or identity is None:
+        return False
+    if materialization.kind == "worktree":
+        removed = _remove_created_worktree(materialization)
+    else:
+        removed = _remove_created_empty_directory(path, identity)
+    if not removed:
+        _log.warning(
+            "Preserved workspace %s because paused-dispatch rollback could not "
+            "prove it was still the unchanged workspace just created",
+            path,
+        )
+    return removed
+
+
+def _persist_dispatch_workspace(
+    conn: sqlite3.Connection,
+    claimed: Task,
+    workspace: Path,
+    resolved_branch_name: Optional[str],
+    materialization: _WorkspaceMaterialization,
+    *,
+    board: Optional[str],
+) -> None:
+    """Persist one resolved workspace only while every dispatch brake is open."""
+    original_workspace_path = claimed.workspace_path
+    original_branch_name = claimed.branch_name
+    branch_name: Optional[str] = None
+    fallback_event_id: Optional[int] = None
+    if claimed.workspace_kind == "worktree":
+        branch_name = (
+            resolved_branch_name or (claimed.branch_name or "")
+        ).strip() or default_task_branch_name(claimed.id, board=board)
+    with write_txn(conn):
+        _raise_if_dispatch_paused()
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(workspace), claimed.id),
+        )
+        if branch_name is not None:
+            conn.execute(
+                "UPDATE tasks SET branch_name = ? WHERE id = ?",
+                (branch_name, claimed.id),
+            )
+        if materialization.base_fell_back and branch_name is not None:
+            _append_event(
+                conn,
+                claimed.id,
+                "worktree_base_fallback",
+                {"branch": branch_name, "base": "HEAD"},
+            )
+            fallback_event_id = int(
+                conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            )
+        # A brake that closed while this transaction was writing rolls every
+        # workspace, branch, and fallback-event change back together.
+        _raise_if_dispatch_paused()
+    try:
+        # A stop can win while SQLite is executing COMMIT, after the final
+        # in-transaction check. Recheck at the first post-commit edge so the
+        # caller's existing resolution cleanup removes the exact directory or
+        # worktree it just created instead of retaining an unspawned workspace.
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
+        persisted_branch_name = (
+            branch_name if branch_name is not None else original_branch_name
+        )
+        restored = False
+        try:
+            with write_txn(conn):
+                restored = conn.execute(
+                    "UPDATE tasks SET workspace_path = ?, branch_name = ? "
+                    "WHERE id = ? AND status = 'running' "
+                    "AND current_run_id IS ? AND claim_lock IS ? "
+                    "AND workspace_path IS ? AND branch_name IS ?",
+                    (
+                        original_workspace_path,
+                        original_branch_name,
+                        claimed.id,
+                        claimed.current_run_id,
+                        claimed.claim_lock,
+                        str(workspace),
+                        persisted_branch_name,
+                    ),
+                ).rowcount == 1
+                if restored and fallback_event_id is not None:
+                    conn.execute(
+                        "DELETE FROM task_events WHERE id = ? AND task_id = ? "
+                        "AND kind = 'worktree_base_fallback'",
+                        (fallback_event_id, claimed.id),
+                    )
+        except Exception:
+            restored = False
+            _log.warning(
+                "Could not restore workspace metadata after dispatch paused "
+                "at the commit edge for %s",
+                claimed.id,
+                exc_info=True,
+            )
+        if not restored:
+            # Keep the filesystem artifact when its durable pointer could not
+            # be restored. Removing it would leave the task pointing at a path
+            # that no longer exists.
+            materialization.identity = None
+        raise
+    claimed.workspace_path = str(workspace)
+    if branch_name is not None:
+        claimed.branch_name = branch_name
 
 
 # ---------------------------------------------------------------------------
@@ -8467,9 +10796,10 @@ class DispatchResult:
     a live process). None of these count as a failure."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
-    (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
-    counting a failure. These never trip the circuit breaker — a long quota
-    window just makes the task bounce cheaply until the window clears."""
+    (EX_TEMPFAIL sentinel exit) and were restored to their source phase
+    WITHOUT counting a failure. A dispatch brake keeps them in ``todo`` until
+    resume. These never trip the circuit breaker — a long quota window just
+    makes the task bounce cheaply until the window clears."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -8918,13 +11248,16 @@ def enforce_max_runtime(
 
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                (landing_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -8934,6 +11267,12 @@ def enforce_max_runtime(
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                _annotate_parked_retry_payload(
+                    payload,
+                    retry_status=retry_status,
+                    landing_status=landing_status,
+                    parked=parked_by_dispatch_brake,
+                )
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -8943,7 +11282,16 @@ def enforce_max_runtime(
                 _append_event(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
+                _park_retry_transitions_before_commit(
+                    conn,
+                    ((tid, retry_status, "timed_out"),),
+                )
                 timed_out.append(tid)
+        if cur.rowcount == 1:
+            _park_retry_transitions_after_commit(
+                conn,
+                ((tid, retry_status, "timed_out"),),
+            )
         # Increment the unified failure counter. Outside the write_txn
         # above because ``_record_task_failure`` opens its own. If the
         # breaker trips, this flips the retried task to ``blocked`` and
@@ -9052,13 +11400,16 @@ def detect_stale_running(
 
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
+                (landing_status, tid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -9076,6 +11427,12 @@ def detect_stale_running(
                 "retry_status": retry_status,
             }
             payload.update(termination)
+            _annotate_parked_retry_payload(
+                payload,
+                retry_status=retry_status,
+                landing_status=landing_status,
+                parked=parked_by_dispatch_brake,
+            )
 
             run_id = _end_run(
                 conn, tid,
@@ -9090,7 +11447,15 @@ def detect_stale_running(
             _append_event(
                 conn, tid, "stale", payload, run_id=run_id,
             )
+            _park_retry_transitions_before_commit(
+                conn,
+                ((tid, retry_status, "stale"),),
+            )
             reclaimed.append(tid)
+        _park_retry_transitions_after_commit(
+            conn,
+            ((tid, retry_status, "stale"),),
+        )
 
         # Intentionally NOT calling _record_task_failure here. Stale reclaim
         # is dispatcher-side detection of an absent heartbeat; the task is
@@ -9119,11 +11484,13 @@ def reconcile_orphaned_running(
     ``detect_stale_running`` is disabled by default — so the card shows
     Running forever (a zombie).
 
-    This pass finds those orphans, requeues them to ``ready`` with an
+    This pass finds those orphans, restores their source phase with an
     explanatory comment, closes any leaked run, and appends a
-    ``reconciled`` event. If the orphan row still records a live PID on
-    this host, requeueing is deferred to a later tick so we never spawn a
-    duplicate beside a possibly-alive worker.
+    ``reconciled`` event. A dispatch brake parks that retry in ``todo`` until
+    the normal promotion pass can safely restore the source phase. If the
+    orphan row still records a live PID on this host, requeueing is deferred
+    to a later tick so we never spawn a duplicate beside a possibly-alive
+    worker.
 
     Returns the list of reconciled task ids. Safe to call every tick.
 
@@ -9148,13 +11515,22 @@ def reconcile_orphaned_running(
             )
             continue
         with write_txn(conn):
+            retry_status = _retry_status_for_run(conn, tid)
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
+                (
+                    landing_status,
+                    tid,
+                    row["claim_lock"],
+                    row["claim_expires"],
+                ),
             )
             if cur.rowcount != 1:
                 continue
@@ -9167,7 +11543,14 @@ def reconcile_orphaned_running(
                 ),
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
+                "retry_status": retry_status,
             }
+            _annotate_parked_retry_payload(
+                payload,
+                retry_status=retry_status,
+                landing_status=landing_status,
+                parked=parked_by_dispatch_brake,
+            )
             run_id = _end_run(
                 conn, tid,
                 outcome="reclaimed", status="reclaimed",
@@ -9182,15 +11565,27 @@ def reconcile_orphaned_running(
                 (
                     tid, "dispatcher",
                     "reconciliation: card was 'running' with no valid claim "
-                    "(dead/gone worker) — requeued to ready",
+                    f"(dead/gone worker) — retry retained for {retry_status}",
                     now,
                 ),
             )
             _append_event(conn, tid, "reconciled", payload, run_id=run_id)
+            _park_retry_transitions_before_commit(
+                conn,
+                ((tid, retry_status, "reconciled"),),
+            )
             reconciled.append(tid)
+        _park_retry_transitions_after_commit(
+            conn,
+            ((tid, retry_status, "reconciled"),),
+        )
         _log.info(
-            "kanban reconcile: requeued orphaned running task %s "
-            "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
+            "kanban reconcile: restored orphaned running task %s for %s retry "
+            "(claim_lock=%r, worker_pid=%r)",
+            tid,
+            retry_status,
+            row["claim_lock"],
+            pid,
         )
     return reconciled
 
@@ -9318,6 +11713,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
+    retry_transitions: list[tuple[str, str, str]] = []
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee "
@@ -9406,13 +11802,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             retry_status = _retry_status_for_run(conn, row["id"])
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
             event_payload["retry_status"] = retry_status
+            _annotate_parked_retry_payload(
+                event_payload,
+                retry_status=retry_status,
+                landing_status=landing_status,
+                parked=parked_by_dispatch_brake,
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                (landing_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -9429,6 +11834,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     conn, row["id"], event_kind,
                     event_payload,
                     run_id=run_id,
+                )
+                retry_transitions.append(
+                    (row["id"], retry_status, event_kind)
                 )
                 exited_hook_payloads.append({
                     "task_id": row["id"],
@@ -9469,6 +11877,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text)
                     )
+        _park_retry_transitions_before_commit(conn, retry_transitions)
+    _park_retry_transitions_after_commit(conn, retry_transitions)
     # Dead workers hold no worktree: release each reclaimed card's lock so
     # the retry can enter the checkout (dead-pid locks only — never a live one).
     for _tid in (*crashed, *rate_limited):
@@ -9513,8 +11923,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     else _PROTOCOL_VIOLATION_FAILURE_LIMIT
                 )
                 if streak < violation_limit:
-                    # Below budget: the task is already back at ``ready``
-                    # (respawn allowed) with ``last_failure_error`` stamped.
+                    # Below budget: the task is back in its source phase, or
+                    # parked in ``todo`` while stopped, with
+                    # ``last_failure_error`` stamped.
                     # Deliberately no ``_record_task_failure`` call — a
                     # below-budget violation must not consume the unified
                     # failure budget, just as other failure kinds don't
@@ -9639,6 +12050,7 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
+    post_commit_transitions: tuple[tuple[str, str, str], ...] = ()
     with write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id, "
@@ -9653,7 +12065,15 @@ def _record_task_failure(
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
-            else ("review" if row["status"] == "review" else "ready")
+            else (
+                "review"
+                if row["status"] == "review"
+                else (
+                    _resume_status_from_events(conn, task_id)
+                    if row["status"] in {"todo", "blocked"}
+                    else "ready"
+                )
+            )
         )
         failures = int(row["consecutive_failures"]) + 1
 
@@ -9687,7 +12107,8 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'review', 'running')",
+                    "WHERE id = ? "
+                    "AND status IN ('todo', 'ready', 'review', 'running')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -9721,14 +12142,19 @@ def _record_task_failure(
             blocked = True
         else:
             # Below threshold.
+            landing_status = retry_status
+            parked_by_dispatch_brake = False
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
+                landing_status, parked_by_dispatch_brake = (
+                    _park_runnable_status_if_dispatch_paused(retry_status)
+                )
                 conn.execute(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (retry_status, failures, error[:500], task_id),
+                    (landing_status, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: caller already restored the source phase.
@@ -9739,25 +12165,60 @@ def _record_task_failure(
                 )
             if end_run:
                 # Spawn path: close the open run with outcome.
+                run_metadata = {
+                    "failures": failures,
+                    "retry_status": retry_status,
+                }
+                _annotate_parked_retry_payload(
+                    run_metadata,
+                    retry_status=retry_status,
+                    landing_status=landing_status,
+                    parked=parked_by_dispatch_brake,
+                )
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
+                    metadata=run_metadata,
+                )
+                event_payload = {
+                    "error": error[:500],
+                    "failures": failures,
+                    "retry_status": retry_status,
+                }
+                _annotate_parked_retry_payload(
+                    event_payload,
+                    retry_status=retry_status,
+                    landing_status=landing_status,
+                    parked=parked_by_dispatch_brake,
                 )
                 _append_event(
                     conn, task_id, outcome,
-                    {
-                        "error": error[:500],
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
+                    event_payload,
                     run_id=run_id,
                 )
+            elif release_claim and parked_by_dispatch_brake:
+                _append_event(
+                    conn,
+                    task_id,
+                    "dispatch_parked",
+                    {
+                        "source_event": outcome,
+                        "status": "todo",
+                        "resume_status": retry_status,
+                        "parked_by_dispatch_brake": True,
+                    },
+                )
+            if release_claim:
+                post_commit_transitions = (
+                    (task_id, retry_status, outcome),
+                )
+                _park_retry_transitions_before_commit(
+                    conn,
+                    post_commit_transitions,
+                )
             # Timeout/crash path's caller already emitted its own event.
+    _park_retry_transitions_after_commit(conn, post_commit_transitions)
     if blocked:
         # The card is parked for a human: reap the worker's leftovers so a
         # gave-up task never keeps a tmux pane, a lock, or a clean worktree
@@ -9818,39 +12279,101 @@ def _release_paused_claim(
     event_kind: str = "dispatch_paused",
     summary: str = "dispatch paused before worker spawn",
     payload_extra: Optional[dict] = None,
+    expected_claim_lock: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> None:
-    """Return a claimed task to its source lane without counting a failure.
+    """Release a claimed task without counting a failure.
 
     Shared by the pause edge and the busy-worktree edge: both are "not now",
     never "this card is broken", so ``consecutive_failures`` stays untouched.
+    A brake parks the task in ``todo`` with its source lane recorded; otherwise
+    a busy workspace returns directly to that lane. Optional expected claim
+    fields bind commit-edge compensation to the exact claim it just created.
     """
     now = int(time.time())
     with write_txn(conn):
         row = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'running'",
+            "SELECT current_run_id, claim_lock FROM tasks "
+            "WHERE id = ? AND status = 'running'",
             (task_id,),
         ).fetchone()
         if row is None:
             return
         run_id = row["current_run_id"]
+        claim_lock = row["claim_lock"]
+        if (
+            expected_run_id is not None
+            and run_id != int(expected_run_id)
+        ):
+            return
+        if (
+            expected_claim_lock is not None
+            and claim_lock != expected_claim_lock
+        ):
+            return
         retry_status = _retry_status_for_run(conn, task_id, run_id)
+        if event_kind == "dispatch_paused":
+            # The caller already observed a brake. Preserve that decision even
+            # if the sentinel disappears before this cleanup transaction gets
+            # its write lock; the next safe promotion pass will restore it.
+            landing_status, parked_by_dispatch_brake = "todo", True
+        else:
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
+        bind_exact_claim = (
+            expected_run_id is not None or expected_claim_lock is not None
+        )
+        claim_guard = (
+            " AND current_run_id IS ? AND claim_lock IS ?"
+            if bind_exact_claim
+            else ""
+        )
+        claim_params = (
+            (landing_status, task_id, run_id, claim_lock)
+            if bind_exact_claim
+            else (landing_status, task_id)
+        )
+        released = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, current_run_id = NULL "
+            "WHERE id = ? AND status = 'running'" + claim_guard,
+            claim_params,
+        )
+        if released.rowcount != 1:
+            return
         if run_id is not None:
+            run_guard = " AND claim_lock IS ?" if bind_exact_claim else ""
+            run_params = (
+                (summary, now, run_id, claim_lock)
+                if bind_exact_claim
+                else (summary, now, run_id)
+            )
             conn.execute(
                 "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
                 "summary = ?, ended_at = ?, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND ended_at IS NULL",
-                (summary, now, run_id),
+                "WHERE id = ? AND ended_at IS NULL" + run_guard,
+                run_params,
             )
-        conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
-            "worker_pid = NULL, current_run_id = NULL WHERE id = ? AND status = 'running'",
-            (retry_status, task_id),
-        )
         payload = {"retry_status": retry_status, "failure_counted": False}
         if payload_extra:
             payload.update(payload_extra)
+        _annotate_parked_retry_payload(
+            payload,
+            retry_status=retry_status,
+            landing_status=landing_status,
+            parked=parked_by_dispatch_brake,
+        )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        _park_retry_transitions_before_commit(
+            conn,
+            ((task_id, retry_status, event_kind),),
+        )
+    _park_retry_transitions_after_commit(
+        conn,
+        ((task_id, retry_status, event_kind),),
+    )
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
@@ -10541,6 +13064,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    _emit_tick_hook: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -10557,9 +13081,12 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
-    if dispatch_is_paused():
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
         result = DispatchResult()
-        _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        if _emit_tick_hook:
+            _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     try:
         db_path = kanban_db_path(board=board)
@@ -10581,7 +13108,8 @@ def dispatch_once(
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
         )
-        _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+        if _emit_tick_hook:
+            _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -10609,7 +13137,8 @@ def dispatch_once(
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
-    _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    if _emit_tick_hook:
+        _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
 
 
@@ -10687,15 +13216,26 @@ def _dispatch_once_locked(
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
     # Rate-limited requeues (quota wall, no failure counted) — surface for
-    # telemetry / tests. These tasks went back to ``ready`` and the respawn
-    # guard will defer them until the quota window clears.
+    # telemetry / tests. These tasks returned to their source phase (or
+    # ``todo`` while stopped); the respawn guard defers them until the quota
+    # window clears after resume.
     _crash_rate_limited = getattr(
         detect_crashed_workers, "_last_rate_limited", []
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    try:
+        result.promoted = recompute_ready(
+            conn,
+            failure_limit=failure_limit,
+            require_dispatch_allowed=True,
+        )
+    except DispatchPausedError:
+        # A stop can arrive after the tick entry check while reclaim and
+        # reconciliation are running. Keep their completed audit work, but end
+        # this tick before any card becomes runnable or any worker is claimed.
+        return result
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -10840,6 +13380,14 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
+        try:
+            _raise_if_dispatch_paused()
+        except DispatchPausedError:
+            # recompute_ready is guarded, but a brake can arrive after it
+            # returns and before this loop begins. End the tick before any
+            # ready-row diagnostics, assignments, claims, or spawns mutate
+            # state.
+            return result
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -10858,7 +13406,11 @@ def _dispatch_once_locked(
                 # 'assigned' event so the board state matches what just happened.
                 if not dry_run:
                     try:
+                        _raise_if_dispatch_paused()
                         with write_txn(conn):
+                            # BEGIN IMMEDIATE may wait for another writer. A
+                            # brake that wins that wait must beat assignment.
+                            _raise_if_dispatch_paused()
                             conn.execute(
                                 "UPDATE tasks SET assignee = ? WHERE id = ? "
                                 "AND (assignee IS NULL OR assignee = '')",
@@ -10871,6 +13423,11 @@ def _dispatch_once_locked(
                                     "source": "kanban.default_assignee",
                                 },
                             )
+                            # Roll back both the row and its audit event if a
+                            # brake arrives during either write.
+                            _raise_if_dispatch_paused()
+                    except DispatchPausedError:
+                        return result
                     except Exception:
                         _log.debug(
                             "kanban dispatch: failed to apply default_assignee=%r "
@@ -10977,15 +13534,35 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        materialization = _WorkspaceMaterialization()
         try:
+            # A stop may arrive after claim_task commits its running row.
+            # Check again before scratch directories or git worktrees are
+            # materialized; the later process-edge check remains the final
+            # guard immediately before spawn.
+            _raise_if_dispatch_paused()
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(
-                    claimed, board=board, conn=conn,
+                    claimed,
+                    board=board,
+                    conn=conn,
+                    materialization=materialization,
                 )
             else:
-                workspace = resolve_workspace(claimed, board=board)
+                workspace = resolve_workspace(
+                    claimed, board=board, materialization=materialization
+                )
+            _persist_dispatch_workspace(
+                conn,
+                claimed,
+                workspace,
+                resolved_branch_name,
+                materialization,
+                board=board,
+            )
         except DispatchPausedError:
+            _rollback_workspace_materialization(materialization)
             _release_paused_claim(conn, claimed.id)
             continue
         except WorkspaceBusyError as busy:
@@ -11000,6 +13577,13 @@ def _dispatch_once_locked(
             result.claim_guarded.append((claimed.id, f"workspace_busy:{busy.pid}"))
             continue
         except Exception as exc:
+            try:
+                _raise_if_dispatch_paused()
+            except DispatchPausedError:
+                _rollback_workspace_materialization(materialization)
+                _release_paused_claim(conn, claimed.id)
+                continue
+            _rollback_workspace_materialization(materialization)
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -11007,10 +13591,6 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            _persist_resolved_branch(conn, claimed, resolved_branch_name, board=board)
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
@@ -11021,10 +13601,13 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
+                    _raise_if_dispatch_paused()
                     pid = _spawn(claimed, str(workspace), board=board)
                 else:
+                    _raise_if_dispatch_paused()
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
+                _raise_if_dispatch_paused()
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
@@ -11122,15 +13705,33 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        materialization = _WorkspaceMaterialization()
         try:
+            # Match the ready lane: no review workspace or branch may be
+            # created after a stop wins the post-claim race.
+            _raise_if_dispatch_paused()
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(
-                    claimed, board=board, conn=conn,
+                    claimed,
+                    board=board,
+                    conn=conn,
+                    materialization=materialization,
                 )
             else:
-                workspace = resolve_workspace(claimed, board=board)
+                workspace = resolve_workspace(
+                    claimed, board=board, materialization=materialization
+                )
+            _persist_dispatch_workspace(
+                conn,
+                claimed,
+                workspace,
+                resolved_branch_name,
+                materialization,
+                board=board,
+            )
         except DispatchPausedError:
+            _rollback_workspace_materialization(materialization)
             _release_paused_claim(conn, claimed.id)
             continue
         except WorkspaceBusyError as busy:
@@ -11145,6 +13746,13 @@ def _dispatch_once_locked(
             result.claim_guarded.append((claimed.id, f"workspace_busy:{busy.pid}"))
             continue
         except Exception as exc:
+            try:
+                _raise_if_dispatch_paused()
+            except DispatchPausedError:
+                _rollback_workspace_materialization(materialization)
+                _release_paused_claim(conn, claimed.id)
+                continue
+            _rollback_workspace_materialization(materialization)
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -11152,10 +13760,6 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            _persist_resolved_branch(conn, claimed, resolved_branch_name, board=board)
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
@@ -11171,10 +13775,13 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
+                    _raise_if_dispatch_paused()
                     pid = _spawn(claimed, str(workspace), board=board)
                 else:
+                    _raise_if_dispatch_paused()
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
+                _raise_if_dispatch_paused()
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
@@ -11524,10 +14131,7 @@ def _default_spawn(
     vars all resolve to the same board the dispatcher claimed the task
     from. Workers cannot accidentally see other boards.
     """
-    if dispatch_is_paused():
-        raise DispatchPausedError(
-            f"Kanban dispatch is paused by {dispatch_pause_path()}"
-        )
+    _raise_if_dispatch_paused()
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
@@ -11701,14 +14305,25 @@ def _default_spawn(
     # `hermes kanban log` on a specific board reads its own file and
     # logs don't collide across boards that happen to share task ids.
     log_dir = worker_logs_dir(board=board)
-    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
+    # Command, toolset, and log-policy resolution above may be slow enough for
+    # an operator stop to arrive. Check immediately before the first log write
+    # so a blocked attempt cannot change the previous worker's diagnostics.
+    _raise_if_dispatch_paused()
+    log_dir.mkdir(parents=True, exist_ok=True)
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    # Keep a second edge after log I/O so a stop that arrives during that short
+    # operation cannot create a new file or reach the process launch.
+    _raise_if_dispatch_paused()
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
     try:
+        # Final process edge: setup above may take long enough for a halt to
+        # arrive after the entry guard.  Recheck immediately before Popen and
+        # release the opened parent-side log handle on that path.
+        _raise_if_dispatch_paused()
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
@@ -11719,6 +14334,9 @@ def _default_spawn(
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
+    except DispatchPausedError:
+        log_f.close()
+        raise
     except FileNotFoundError:
         log_f.close()
         raise RuntimeError(

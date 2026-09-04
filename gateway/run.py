@@ -16275,7 +16275,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         args = (event.get_command_args() or "").strip()
         if args.lower() in {"off", "resume", "stop", "disengage"}:
-            if estop.disengage():
+            try:
+                removed = estop.disengage()
+            except estop.DisengageError as exc:
+                return f"⏸️ Hermes is still paused — {exc}."
+            try:
+                from hermes_cli.kanban_db import dispatch_is_paused
+                kanban_still_paused = dispatch_is_paused()
+            except Exception:
+                kanban_still_paused = True
+            if kanban_still_paused:
+                if removed:
+                    return (
+                        "▶️ Emergency stop removed. Cron and new gateway turns "
+                        "may resume, but kanban dispatch is still paused by its "
+                        "manual pause, full halt, or unreadable brake state."
+                    )
+                return (
+                    "Hermes had no emergency stop, but kanban dispatch is still "
+                    "paused by its manual pause, full halt, or unreadable brake "
+                    "state."
+                )
+            if removed:
                 return "▶️ Resumed — new work is accepted again."
             return "Hermes wasn't paused."
         state = estop.get_state()
@@ -16286,7 +16307,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 f"⏸️ Hermes is already paused{suffix}. "
                 "Use `/pause off` to resume."
             )
-        estop.engage(reason=args or None)
+        try:
+            estop.engage(reason=args or None)
+        except estop.EngageError as exc:
+            return (
+                f"⚠️ Hermes was not paused — {exc}. "
+                "New work may still be accepted."
+            )
         suffix = f" (reason: {args})" if args else ""
         return (
             f"⏸️ Paused{suffix}. New cron/kanban/gateway work is on hold; "

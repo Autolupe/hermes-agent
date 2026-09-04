@@ -111,6 +111,35 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert tenant_ids == [c]
 
 
+def test_list_keeps_todo_tasks_parked_while_paused(monkeypatch, worker_env):
+    """The model-facing list remains read-only across the dispatch brake."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="parked tool list task")
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+        conn.commit()
+        pause = kb.dispatch_pause_path()
+        pause.parent.mkdir(parents=True, exist_ok=True)
+        pause.write_text("{}\n", encoding="utf-8")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+
+    payload = json.loads(kt._handle_list({"limit": 100}))
+
+    assert payload["promoted"] == 0
+    assert any(task["id"] == task_id for task in payload["tasks"])
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, task_id).status == "todo"
+    finally:
+        conn.close()
+
+
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({

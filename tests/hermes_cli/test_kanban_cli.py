@@ -57,6 +57,23 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_kanban_list_keeps_todo_tasks_parked_while_paused(kanban_home):
+    """Viewing the board must not create runnable work across a brake."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="parked list task")
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+        conn.commit()
+    state_dir = kanban_home / "state"
+    state_dir.mkdir()
+    (state_dir / "dispatch_pause.json").write_text("{}\n", encoding="utf-8")
+
+    payload = json.loads(kc.run_slash("list --json"))
+
+    assert any(row["id"] == task_id for row in payload)
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "todo"
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")
@@ -177,5 +194,4 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
 

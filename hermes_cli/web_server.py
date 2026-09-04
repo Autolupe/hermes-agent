@@ -12036,9 +12036,9 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
 
 
 # Serialises the one-time writable schema bootstrap for read-only opens.
-# Concurrent first-load polls otherwise race sqlite file creation: the losers
-# open mode=ro against a store whose schema is still being written and every
-# query raises "no such table: sessions".
+# Every caller takes this lock before checking the file: SQLite makes the file
+# non-empty before schema creation commits, so an unlocked preliminary stat can
+# mistake an in-progress bootstrap for a complete store.
 _session_db_bootstrap_lock = threading.Lock()
 
 
@@ -12102,10 +12102,9 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
         except OSError:
             return False
 
-    if _needs_bootstrap():
-        with _session_db_bootstrap_lock:
-            if _needs_bootstrap():
-                SessionDB(db_path=db_path, read_only=False).close()
+    with _session_db_bootstrap_lock:
+        if _needs_bootstrap():
+            SessionDB(db_path=db_path, read_only=False).close()
 
     def _open_probed():
         db = SessionDB(db_path=db_path, read_only=True)

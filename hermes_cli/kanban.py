@@ -1649,7 +1649,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        try:
+            kb.recompute_ready(conn)
+        except kb.DispatchPausedError:
+            # Listing stays read-only while a brake parks new runnable work.
+            pass
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,
@@ -3125,6 +3129,7 @@ def _cmd_specify(args: argparse.Namespace) -> int:
                 "ok": outcome.ok,
                 "reason": outcome.reason,
                 "new_title": outcome.new_title,
+                "parked": outcome.parked,
             }))
         elif outcome.ok:
             title_suffix = (
@@ -3132,7 +3137,15 @@ def _cmd_specify(args: argparse.Namespace) -> int:
                 if outcome.new_title
                 else ""
             )
-            print(f"Specified {outcome.task_id} → todo{title_suffix}")
+            parked_suffix = (
+                "; dispatch remains paused or halted"
+                if outcome.parked
+                else ""
+            )
+            print(
+                f"Specified {outcome.task_id} → todo"
+                f"{title_suffix}{parked_suffix}"
+            )
         else:
             print(
                 f"kanban: specify {outcome.task_id}: {outcome.reason}",
@@ -3198,13 +3211,20 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                 "fanout": outcome.fanout,
                 "child_ids": outcome.child_ids,
                 "new_title": outcome.new_title,
+                "parked": outcome.parked,
             }))
         elif outcome.ok:
+            parked_suffix = (
+                "; dispatch remains paused or halted"
+                if outcome.parked
+                else ""
+            )
             if outcome.fanout and outcome.child_ids:
                 child_summary = ", ".join(outcome.child_ids)
                 print(
                     f"Decomposed {outcome.task_id} → {len(outcome.child_ids)} "
                     f"children ({child_summary}); root promoted to todo"
+                    f"{parked_suffix}"
                 )
             else:
                 title_suffix = (
@@ -3214,7 +3234,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                 )
                 print(
                     f"Specified {outcome.task_id} → todo "
-                    f"(no fanout){title_suffix}"
+                    f"(no fanout){title_suffix}{parked_suffix}"
                 )
         else:
             print(
