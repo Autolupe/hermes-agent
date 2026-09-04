@@ -169,6 +169,43 @@ def test_profile_scoped_gateway_owner_is_recognized(monkeypatch, unit):
 
 
 @pytest.mark.linux_only
+@pytest.mark.parametrize(
+    "unit",
+    [
+        "hermes-serve-work.service",
+        "hermes-serve-a1b2c3d4.service",
+        "hermes-serve-team_one.service",
+    ],
+)
+def test_profile_scoped_serve_owner_is_recognized(monkeypatch, unit):
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    _set_cgroup(monkeypatch, unit)
+
+    assert local_mod._may_need_foreground_systemd_scope() is True
+    assert process_registry_mod._supervised_runtime_owner() == (unit, True)
+    assert process_registry_mod._is_supervised_gateway_process() is True
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    "unit",
+    [
+        "hermes-server.service",
+        "hermes-serve-.service",
+        "hermes-serve-work.timer",
+        "other-hermes-serve-work.service",
+    ],
+)
+def test_serve_lookalike_units_are_not_supervised(monkeypatch, unit):
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    _set_cgroup(monkeypatch, unit)
+
+    assert local_mod._may_need_foreground_systemd_scope() is False
+    assert process_registry_mod._supervised_runtime_owner() == ("", False)
+    assert process_registry_mod._is_supervised_gateway_process() is False
+
+
+@pytest.mark.linux_only
 def test_profile_scoped_gateway_foreground_scope_binds_to_exact_owner(monkeypatch):
     unit = "hermes-gateway-coder.service"
     _set_cgroup(monkeypatch, unit)

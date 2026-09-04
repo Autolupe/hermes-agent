@@ -31,11 +31,19 @@ _FOREGROUND_SCOPE_WRAPPER_REAP_SECONDS = 2.0
 _GATEWAY_SYSTEMD_UNIT_RE = re.compile(
     r"^hermes-gateway(?:-[a-z0-9][a-z0-9_-]{0,63})?\.service$"
 )
+_SERVE_SYSTEMD_UNIT_RE = re.compile(
+    r"^hermes-serve(?:-[a-z0-9][a-z0-9_-]{0,63})?\.service$"
+)
 
 
 def _is_gateway_service_unit_name(unit: str) -> bool:
     """Return whether *unit* is a supported profile-scoped gateway service."""
     return _GATEWAY_SYSTEMD_UNIT_RE.fullmatch(unit) is not None
+
+
+def _is_serve_service_unit_name(unit: str) -> bool:
+    """Return whether *unit* is a supported profile-scoped Serve service."""
+    return _SERVE_SYSTEMD_UNIT_RE.fullmatch(unit) is not None
 
 
 def _may_need_foreground_systemd_scope() -> bool:
@@ -57,10 +65,11 @@ def _may_need_foreground_systemd_scope() -> bool:
         return False
     for line in cgroup_text.splitlines():
         for unit in line.strip().split("/"):
-            if unit in (
-                "hermes-dashboard.service",
-                "hermes-serve.service",
-            ) or _is_gateway_service_unit_name(unit):
+            if (
+                unit == "hermes-dashboard.service"
+                or _is_serve_service_unit_name(unit)
+                or _is_gateway_service_unit_name(unit)
+            ):
                 return True
     return False
 
@@ -100,8 +109,7 @@ def _foreground_systemd_scope_argv(args: list[str]) -> tuple[list[str], str]:
                 return args, ""
         elif owner_unit not in (
             "hermes-dashboard.service",
-            "hermes-serve.service",
-        ):
+        ) and not _is_serve_service_unit_name(owner_unit):
             return args, ""
         if not owner_is_user_unit:
             logger.debug(

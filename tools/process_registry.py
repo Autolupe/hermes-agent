@@ -116,11 +116,19 @@ _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
 _GATEWAY_SYSTEMD_UNIT_RE = re.compile(
     r"^hermes-gateway(?:-[a-z0-9][a-z0-9_-]{0,63})?\.service$"
 )
+_SERVE_SYSTEMD_UNIT_RE = re.compile(
+    r"^hermes-serve(?:-[a-z0-9][a-z0-9_-]{0,63})?\.service$"
+)
 
 
 def _is_gateway_service_unit_name(unit: str) -> bool:
     """Return whether *unit* is a supported profile-scoped gateway service."""
     return _GATEWAY_SYSTEMD_UNIT_RE.fullmatch(unit) is not None
+
+
+def _is_serve_service_unit_name(unit: str) -> bool:
+    """Return whether *unit* is a supported profile-scoped Serve service."""
+    return _SERVE_SYSTEMD_UNIT_RE.fullmatch(unit) is not None
 
 
 def _worker_memory_max_bytes() -> int:
@@ -352,10 +360,11 @@ def _supervised_runtime_owner() -> tuple[str, bool]:
     for line in cgroup_text.splitlines():
         components = line.strip().split("/")
         for unit_index, unit in enumerate(components):
-            if unit not in (
-                "hermes-dashboard.service",
-                "hermes-serve.service",
-            ) and not _is_gateway_service_unit_name(unit):
+            if (
+                unit != "hermes-dashboard.service"
+                and not _is_serve_service_unit_name(unit)
+                and not _is_gateway_service_unit_name(unit)
+            ):
                 continue
             is_user_unit = any(
                 component.startswith("user@") and component.endswith(".service")
@@ -378,7 +387,9 @@ def _is_supervised_gateway_process() -> bool:
     dashboard/Serve cgroup, preventing unnecessary nested scopes.
     """
     owner_unit, owner_is_user_unit = _supervised_runtime_owner()
-    if owner_unit in ("hermes-dashboard.service", "hermes-serve.service"):
+    if owner_unit == "hermes-dashboard.service" or _is_serve_service_unit_name(
+        owner_unit
+    ):
         # These runtimes have no separate supervisor identity marker. Scope
         # them only when the owner is proven to live in the same user manager;
         # a system/unknown-manager unit cannot safely own a user scope.
