@@ -674,14 +674,18 @@ def _dashboard_allowed_hosts() -> Optional[set[str]]:
         raw_values: Any = env_raw.split(",")
     else:
         try:
-            raw_values = cfg_get(
-                load_config_readonly_strict(),
-                "dashboard",
-                "allowed_hosts",
-                default=[],
-            )
+            config = load_config_readonly_strict()
         except Exception:  # noqa: BLE001 — malformed config must not crash HTTP
             return set()
+        if not isinstance(config, dict):
+            return set()
+        dashboard = config.get("dashboard")
+        if not isinstance(dashboard, dict):
+            # ``cfg_get`` deliberately treats malformed parent sections as a
+            # missing leaf. That fail-soft behavior is unsafe at this network
+            # boundary: a scalar or list must not become an absent allowlist.
+            return set()
+        raw_values = dashboard.get("allowed_hosts", [])
 
     if isinstance(raw_values, list):
         if not raw_values:

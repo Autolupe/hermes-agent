@@ -215,6 +215,33 @@ class TestHostHeaderMiddleware:
             if hasattr(app.state, "bound_host"):
                 del app.state.bound_host
 
+    @pytest.mark.parametrize(
+        "config_text",
+        ["dashboard: invalid\n", "dashboard: []\n"],
+    )
+    def test_malformed_user_dashboard_section_fails_closed_through_middleware(
+        self, tmp_path, monkeypatch, config_text
+    ):
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(config_text, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
+        app.state.bound_host = "0.0.0.0"
+        try:
+            response = TestClient(app).get(
+                "/api/status", headers={"Host": "attacker.example"}
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"].startswith("Invalid Host header")
+        finally:
+            if hasattr(app.state, "bound_host"):
+                del app.state.bound_host
+
     def test_malformed_config_file_fails_closed_through_middleware(
         self, tmp_path, monkeypatch
     ):
@@ -309,6 +336,36 @@ class TestHostHeaderMiddleware:
         # still carry the failed managed-parse signal for the strict boundary.
         load_config_readonly()
 
+        app.state.bound_host = "0.0.0.0"
+        try:
+            response = TestClient(app).get(
+                "/api/status", headers={"Host": "attacker.example"}
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"].startswith("Invalid Host header")
+        finally:
+            if hasattr(app.state, "bound_host"):
+                del app.state.bound_host
+
+    @pytest.mark.parametrize(
+        "config_text",
+        ["dashboard: invalid\n", "dashboard: []\n"],
+    )
+    def test_malformed_managed_dashboard_section_fails_closed_through_middleware(
+        self, tmp_path, monkeypatch, config_text
+    ):
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(config_text, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
         app.state.bound_host = "0.0.0.0"
         try:
             response = TestClient(app).get(
