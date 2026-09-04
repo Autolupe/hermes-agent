@@ -960,6 +960,7 @@ def test_stop_engaged_during_dispatch_reclaim_skips_promotion_and_spawn(
 
 @pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
 @pytest.mark.parametrize("source_lane", ["ready", "review"])
+@pytest.mark.parametrize("arrival", ["retry_write", "commit"])
 @pytest.mark.parametrize(
     "recovery",
     [
@@ -972,10 +973,10 @@ def test_stop_engaged_during_dispatch_reclaim_skips_promotion_and_spawn(
         "spawn_failed",
     ],
 )
-def test_stop_during_retry_write_parks_and_restores_source_lane(
-    tmp_path, monkeypatch, recovery, source_lane, brake
+def test_stop_during_retry_transition_parks_and_restores_source_lane(
+    tmp_path, monkeypatch, recovery, arrival, source_lane, brake
 ):
-    """A brake arriving on the retry update wins before its commit."""
+    """A brake arriving during a retry write or COMMIT stays authoritative."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
@@ -1056,8 +1057,14 @@ def test_stop_during_retry_write_parks_and_restores_source_lane(
         normalized = " ".join(statement.lower().split())
         if (
             not stop_created
-            and normalized.startswith("update tasks")
-            and "set status =" in normalized
+            and (
+                (
+                    arrival == "retry_write"
+                    and normalized.startswith("update tasks")
+                    and "set status =" in normalized
+                )
+                or (arrival == "commit" and normalized == "commit")
+            )
         ):
             stop_created = True
             brake_path = _engage_brake(tmp_path, monkeypatch, brake)

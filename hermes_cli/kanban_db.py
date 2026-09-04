@@ -1232,28 +1232,65 @@ def _park_retry_transitions_before_commit(
     try:
         _raise_if_dispatch_paused()
     except DispatchPausedError:
-        parked: set[str] = set()
-        for task_id, retry_status, source_event in pending:
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'todo' "
-                "WHERE id = ? AND status IN ('ready', 'review')",
-                (task_id,),
-            )
-            if cur.rowcount != 1:
-                continue
-            _append_event(
-                conn,
-                task_id,
-                "dispatch_parked",
-                {
-                    "source_event": source_event,
-                    "status": "todo",
-                    "resume_status": retry_status,
-                    "parked_by_dispatch_brake": True,
-                },
-            )
-            parked.add(task_id)
-        return parked
+        return _park_retry_transitions_locked(conn, pending)
+    return set()
+
+
+def _park_retry_transitions_locked(
+    conn: sqlite3.Connection,
+    transitions: Iterable[tuple[str, str, str]],
+) -> set[str]:
+    """Park runnable retries while the caller owns a SQLite write lock."""
+    parked: set[str] = set()
+    for task_id, retry_status, source_event in transitions:
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'todo' "
+            "WHERE id = ? AND status IN ('ready', 'review')",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            continue
+        _append_event(
+            conn,
+            task_id,
+            "dispatch_parked",
+            {
+                "source_event": source_event,
+                "status": "todo",
+                "resume_status": retry_status,
+                "parked_by_dispatch_brake": True,
+            },
+        )
+        parked.add(task_id)
+    return parked
+
+
+def _park_retry_transitions_after_commit(
+    conn: sqlite3.Connection,
+    transitions: Iterable[tuple[str, str, str]],
+) -> set[str]:
+    """Compensate when a brake arrives during SQLite's COMMIT boundary.
+
+    The in-transaction check runs immediately before control returns to
+    :func:`write_txn`, but SQLite can still wait or invoke trace hooks while
+    executing ``COMMIT``. Recheck after that statement becomes durable. If a
+    brake appeared at that exact edge, take a new write lock and park only
+    rows that are still runnable. Claim paths independently check the same
+    brakes, so no stopped worker can start during this short compensation
+    window.
+    """
+    pending = tuple(
+        (task_id, retry_status, source_event)
+        for task_id, retry_status, source_event in transitions
+        if retry_status in {"ready", "review"}
+    )
+    if not pending:
+        return set()
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
+        with write_txn(conn):
+            return _park_retry_transitions_locked(conn, pending)
     return set()
 
 
@@ -6856,6 +6893,10 @@ def release_stale_claims(
                 ((row["id"], retry_status, "reclaimed"),),
             )
             reclaimed += 1
+        _park_retry_transitions_after_commit(
+            conn,
+            ((row["id"], retry_status, "reclaimed"),),
+        )
         # The reclaimed worker is gone (or never local): drop a dead lock.
         _unlock_task_worktree(conn, row["id"])
         # Worker-lifecycle observer (RFC #58548): the reclaim txn above has
@@ -6955,6 +6996,10 @@ def reclaim_task(
             conn,
             ((task_id, retry_status, "reclaimed"),),
         )
+    _park_retry_transitions_after_commit(
+        conn,
+        ((task_id, retry_status, "reclaimed"),),
+    )
     # Operator intervention — they've looked at the task, so the
     # consecutive-failures counter is now stale. Give the next retry
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
@@ -11107,6 +11152,11 @@ def enforce_max_runtime(
                     ((tid, retry_status, "timed_out"),),
                 )
                 timed_out.append(tid)
+        if cur.rowcount == 1:
+            _park_retry_transitions_after_commit(
+                conn,
+                ((tid, retry_status, "timed_out"),),
+            )
         # Increment the unified failure counter. Outside the write_txn
         # above because ``_record_task_failure`` opens its own. If the
         # breaker trips, this flips the retried task to ``blocked`` and
@@ -11267,6 +11317,10 @@ def detect_stale_running(
                 ((tid, retry_status, "stale"),),
             )
             reclaimed.append(tid)
+        _park_retry_transitions_after_commit(
+            conn,
+            ((tid, retry_status, "stale"),),
+        )
 
         # Intentionally NOT calling _record_task_failure here. Stale reclaim
         # is dispatcher-side detection of an absent heartbeat; the task is
@@ -11386,6 +11440,10 @@ def reconcile_orphaned_running(
                 ((tid, retry_status, "reconciled"),),
             )
             reconciled.append(tid)
+        _park_retry_transitions_after_commit(
+            conn,
+            ((tid, retry_status, "reconciled"),),
+        )
         _log.info(
             "kanban reconcile: restored orphaned running task %s for %s retry "
             "(claim_lock=%r, worker_pid=%r)",
@@ -11685,6 +11743,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                          protocol_violation, error_text)
                     )
         _park_retry_transitions_before_commit(conn, retry_transitions)
+    _park_retry_transitions_after_commit(conn, retry_transitions)
     # Dead workers hold no worktree: release each reclaimed card's lock so
     # the retry can enter the checkout (dead-pid locks only — never a live one).
     for _tid in (*crashed, *rate_limited):
@@ -11856,6 +11915,7 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
+    post_commit_transitions: tuple[tuple[str, str, str], ...] = ()
     with write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id, "
@@ -12015,11 +12075,15 @@ def _record_task_failure(
                     },
                 )
             if release_claim:
+                post_commit_transitions = (
+                    (task_id, retry_status, outcome),
+                )
                 _park_retry_transitions_before_commit(
                     conn,
-                    ((task_id, retry_status, outcome),),
+                    post_commit_transitions,
                 )
             # Timeout/crash path's caller already emitted its own event.
+    _park_retry_transitions_after_commit(conn, post_commit_transitions)
     if blocked:
         # The card is parked for a human: reap the worker's leftovers so a
         # gave-up task never keeps a tmux pane, a lock, or a clean worktree
@@ -12134,6 +12198,10 @@ def _release_paused_claim(
             conn,
             ((task_id, retry_status, event_kind),),
         )
+    _park_retry_transitions_after_commit(
+        conn,
+        ((task_id, retry_status, event_kind),),
+    )
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
