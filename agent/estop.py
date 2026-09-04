@@ -63,11 +63,19 @@ class _LegacySentinelEntry(NamedTuple):
     parent_identity: tuple[object, ...]
 
 
+class _WindowsSentinelAnchor(NamedTuple):
+    handle: int
+    logical_parent: Path
+    physical_parent: Path
+    parent_identity: tuple[object, ...]
+
+
 class _SentinelReadEntry(NamedTuple):
     path: Path
     parent_identity: tuple[object, ...] | None
     parent_fd: int | None = None
     recheck_logical_parent: bool = False
+    windows_anchor: _WindowsSentinelAnchor | None = None
 
 
 class _CleanupTarget(NamedTuple):
@@ -126,6 +134,14 @@ def _sentinel_read_entries() -> tuple[_SentinelReadEntry, ...]:
                     parent_fd,
                     True,
                 )
+        elif os.name == "nt":
+            windows_anchor = _open_windows_shared_sentinel_parent(shared)
+            if windows_anchor is not None:
+                entries[shared] = _SentinelReadEntry(
+                    shared,
+                    windows_anchor.parent_identity,
+                    windows_anchor=windows_anchor,
+                )
         for entry in _legacy_profile_sentinel_entries(shared.parent):
             parent_fd = None
             if _supports_anchored_profile_scan():
@@ -136,6 +152,8 @@ def _sentinel_read_entries() -> tuple[_SentinelReadEntry, ...]:
             prior = entries.get(entry.path)
             if prior is not None and prior.parent_fd is not None:
                 os.close(prior.parent_fd)
+            if prior is not None and prior.windows_anchor is not None:
+                _close_windows_directory_handle(prior.windows_anchor.handle)
             entries[entry.path] = _SentinelReadEntry(
                 entry.path,
                 entry.parent_identity,
@@ -573,10 +591,130 @@ def _open_validated_shared_sentinel_parent(
         raise
 
 
+def _open_windows_directory_handle(path: Path) -> int:
+    """Lock a Windows directory against rename or replacement."""
+    import ctypes
+    from ctypes import wintypes
+
+    file_read_attributes = 0x00000080
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    open_existing = 3
+    file_flag_open_reparse_point = 0x00200000
+    file_flag_backup_semantics = 0x02000000
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        file_read_attributes,
+        # Deliberately omit FILE_SHARE_DELETE. Windows then refuses a rename
+        # or replacement for this directory until the short read completes.
+        file_share_read | file_share_write,
+        None,
+        open_existing,
+        file_flag_backup_semantics | file_flag_open_reparse_point,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return int(handle)
+
+
+def _close_windows_directory_handle(handle: int) -> None:
+    """Close a native Windows directory handle."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    if not close_handle(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _open_windows_shared_sentinel_parent(
+    path: Path,
+) -> _WindowsSentinelAnchor | None:
+    """Anchor the canonical Windows stop to a locked physical directory.
+
+    Python has no ``dir_fd`` leaf operations on native Windows. Resolve the
+    configured root once, hold its physical directory open without delete
+    sharing, and read the leaf through that physical path. The open handle
+    prevents the directory from being renamed or replaced between checks.
+    """
+    logical_parent = path.parent
+    try:
+        physical_parent = logical_parent.resolve(strict=True)
+    except FileNotFoundError:
+        if not _missing_path_has_usable_ancestor(logical_parent.parent):
+            raise OSError("shared Hermes root ancestry is not usable") from None
+        try:
+            physical_parent = logical_parent.resolve(strict=True)
+        except FileNotFoundError:
+            try:
+                os.lstat(logical_parent)
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise OSError(
+                    "shared Hermes root could not be checked safely"
+                ) from exc
+            raise OSError("shared Hermes root target is unavailable") from None
+        except (OSError, RuntimeError) as exc:
+            raise OSError("shared Hermes root could not be resolved safely") from exc
+    except (OSError, RuntimeError) as exc:
+        raise OSError("shared Hermes root could not be resolved safely") from exc
+
+    try:
+        expected_info = os.stat(physical_parent, follow_symlinks=False)
+    except OSError as exc:
+        raise OSError("shared Hermes root could not be checked safely") from exc
+    if (
+        not stat_module.S_ISDIR(expected_info.st_mode)
+        or _is_unsafe_profile_redirect(expected_info)
+    ):
+        raise OSError("shared Hermes root is not a real directory")
+
+    handle = _open_windows_directory_handle(physical_parent)
+    try:
+        current_info = os.stat(physical_parent, follow_symlinks=False)
+        logical_info = os.stat(logical_parent)
+        parent_identity = _stat_identity(expected_info)
+        if (
+            not stat_module.S_ISDIR(current_info.st_mode)
+            or _is_unsafe_profile_redirect(current_info)
+            or _stat_identity(current_info) != parent_identity
+            or not stat_module.S_ISDIR(logical_info.st_mode)
+            or _stat_identity(logical_info) != parent_identity
+        ):
+            raise OSError("shared Hermes root changed before stop read")
+        return _WindowsSentinelAnchor(
+            handle,
+            logical_parent,
+            physical_parent,
+            parent_identity,
+        )
+    except BaseException:
+        _close_windows_directory_handle(handle)
+        raise
+
+
 def _close_sentinel_read_entry_fds(
     entries: tuple[_SentinelReadEntry, ...],
 ) -> None:
-    """Close profile descriptors retained only for one stop-state read."""
+    """Close directory anchors retained only for one stop-state read."""
     closed: set[int] = set()
     for entry in entries:
         if entry.parent_fd is None or entry.parent_fd in closed:
@@ -584,6 +722,16 @@ def _close_sentinel_read_entry_fds(
         closed.add(entry.parent_fd)
         try:
             os.close(entry.parent_fd)
+        except OSError:
+            pass
+    closed_windows: set[int] = set()
+    for entry in entries:
+        anchor = entry.windows_anchor
+        if anchor is None or anchor.handle in closed_windows:
+            continue
+        closed_windows.add(anchor.handle)
+        try:
+            _close_windows_directory_handle(anchor.handle)
         except OSError:
             pass
 
@@ -913,6 +1061,20 @@ def _sentinel_parent_matches(entry: _SentinelReadEntry) -> bool:
     if entry.parent_identity is None:
         return True
     try:
+        if entry.windows_anchor is not None:
+            anchor = entry.windows_anchor
+            physical_info = os.stat(
+                anchor.physical_parent,
+                follow_symlinks=False,
+            )
+            logical_info = os.stat(anchor.logical_parent)
+            return (
+                stat_module.S_ISDIR(physical_info.st_mode)
+                and not _is_unsafe_profile_redirect(physical_info)
+                and _stat_identity(physical_info) == anchor.parent_identity
+                and stat_module.S_ISDIR(logical_info.st_mode)
+                and _stat_identity(logical_info) == anchor.parent_identity
+            )
         if entry.parent_fd is not None:
             parent_info = os.fstat(entry.parent_fd)
             matches_open_parent = (
@@ -947,6 +1109,13 @@ def _sentinel_entry_is_engaged(entry: _SentinelReadEntry) -> bool:
     """Check a stop without letting a replaced profile hide its old entry."""
     if not _sentinel_parent_matches(entry):
         return True
+    if entry.windows_anchor is not None:
+        anchored_path = (
+            entry.windows_anchor.physical_parent / entry.path.name
+        )
+        if _path_is_engaged(anchored_path):
+            return True
+        return not _sentinel_parent_matches(entry)
     if entry.parent_fd is not None:
         try:
             present = _optional_entry_info(entry.parent_fd, entry.path.name)
@@ -1118,6 +1287,10 @@ def get_state() -> Optional[dict]:
 
 def _read_sentinel_entry_text(entry: _SentinelReadEntry) -> str:
     """Read stop metadata through the same anchored parent used for presence."""
+    if entry.windows_anchor is not None:
+        return (
+            entry.windows_anchor.physical_parent / entry.path.name
+        ).read_text(encoding="utf-8")
     if entry.parent_fd is None:
         return entry.path.read_text(encoding="utf-8")
     flags = (

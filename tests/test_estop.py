@@ -263,6 +263,123 @@ def test_canonical_stop_read_anchors_configured_home_during_temporary_swaps(
     assert stop.is_file()
 
 
+@pytest.mark.windows_only
+@pytest.mark.parametrize("root_kind", ["directory", "junction"])
+def test_canonical_stop_read_anchors_configured_home_on_windows(
+    tmp_path, monkeypatch, root_kind
+):
+    """A real Windows root replacement or redirect cannot hide the stop."""
+    configured_home = tmp_path / "configured-home"
+    physical_home = (
+        configured_home
+        if root_kind == "directory"
+        else tmp_path / "physical-home"
+    )
+    physical_home.mkdir()
+    empty_home = tmp_path / "empty-home"
+    empty_home.mkdir()
+
+    def create_junction(path, target):
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(path), str(target)],
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    def remove_junction(path):
+        result = subprocess.run(
+            ["cmd", "/c", "rmdir", str(path)],
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    if root_kind == "junction":
+        create_junction(configured_home, physical_home)
+
+    stop = physical_home / "ESTOP"
+    logical_stop = configured_home / "ESTOP"
+    stop.write_text(
+        json.dumps({"reason": "keep stopped", "engaged_at": "test"}) + "\n",
+        encoding="utf-8",
+    )
+    moved_home = tmp_path / "configured-home-original"
+    monkeypatch.setenv("HERMES_HOME", str(configured_home))
+    estop._reset_log_state_for_tests()
+    real_lstat = estop.os.lstat
+    stop_keys = {
+        os.path.normcase(os.path.abspath(os.fspath(stop))),
+        os.path.normcase(os.path.abspath(os.fspath(logical_stop))),
+    }
+    replacement_attempts = 0
+    completed_swaps = 0
+    locked_attempts = 0
+    expect_locked = False
+
+    def lstat_during_temporary_root_replacement(path, *args, **kwargs):
+        nonlocal replacement_attempts, completed_swaps, locked_attempts
+        path_key = os.path.normcase(os.path.abspath(os.fspath(path)))
+        if path_key not in stop_keys:
+            return real_lstat(path, *args, **kwargs)
+        replacement_attempts += 1
+        try:
+            configured_home.rename(moved_home)
+        except OSError as exc:
+            if (
+                not expect_locked
+                or getattr(exc, "winerror", None) not in {5, 32, 33}
+            ):
+                raise
+            locked_attempts += 1
+            return real_lstat(path, *args, **kwargs)
+        if root_kind == "directory":
+            empty_home.rename(configured_home)
+        else:
+            create_junction(configured_home, empty_home)
+        try:
+            return real_lstat(path, *args, **kwargs)
+        finally:
+            if root_kind == "directory":
+                configured_home.rename(empty_home)
+            else:
+                remove_junction(configured_home)
+            moved_home.rename(configured_home)
+            completed_swaps += 1
+
+    monkeypatch.setattr(
+        estop.os,
+        "lstat",
+        lstat_during_temporary_root_replacement,
+    )
+
+    # Reproduce the old Windows path race before any directory handle exists.
+    assert estop._path_is_engaged(logical_stop) is False
+    assert replacement_attempts == 2
+    assert completed_swaps == 2
+
+    replacement_attempts = 0
+    completed_swaps = 0
+    expect_locked = True
+
+    # A real directory is locked against replacement. A junction may still be
+    # retargeted, but both public reads use its locked physical target instead.
+    assert estop.is_engaged() is True
+    assert estop.get_state() == {
+        "reason": "keep stopped",
+        "engaged_at": "test",
+    }
+    assert replacement_attempts == 2
+    assert completed_swaps == (0 if root_kind == "directory" else 2)
+    assert locked_attempts == (2 if root_kind == "directory" else 0)
+    assert logical_stop.is_file()
+    assert stop.is_file()
+
+
 def test_genuinely_missing_hermes_home_below_real_parent_is_not_engaged(
     hermes_home, monkeypatch
 ):
