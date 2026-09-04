@@ -68,6 +68,7 @@ from hermes_cli.config import (
     get_hermes_home,
     get_process_hermes_home,
     load_config,
+    load_config_readonly_strict,
     load_env,
     read_raw_config,
     resolve_cron_model_drift_defaults,
@@ -660,14 +661,55 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
+def _dashboard_allowed_hosts() -> Optional[set[str]]:
+    """Resolve wildcard-bind Host names with env-over-config precedence.
+
+    ``None`` means the canonical list is absent or explicitly empty, which
+    preserves legacy wildcard behavior. A set means an allowlist was supplied;
+    an empty set is deliberately distinct and rejects every Host because the
+    supplied value was malformed or contained no usable string entries.
+    """
+    env_raw = os.environ.get("HERMES_DASHBOARD_ALLOWED_HOSTS", "")
+    if env_raw.strip():
+        raw_values: Any = env_raw.split(",")
+    else:
+        try:
+            config = load_config_readonly_strict()
+        except Exception:  # noqa: BLE001 — malformed config must not crash HTTP
+            return set()
+        if not isinstance(config, dict):
+            return set()
+        dashboard = config.get("dashboard")
+        if not isinstance(dashboard, dict):
+            # ``cfg_get`` deliberately treats malformed parent sections as a
+            # missing leaf. That fail-soft behavior is unsafe at this network
+            # boundary: a scalar or list must not become an absent allowlist.
+            return set()
+        raw_values = dashboard.get("allowed_hosts", [])
+
+    if isinstance(raw_values, list):
+        if not raw_values:
+            return None
+        values = raw_values
+    else:
+        # The canonical config shape is a YAML list. An unexpected scalar or
+        # object is configured-but-invalid and must not turn protection off.
+        return set()
+    return {
+        item.strip().lower().rstrip(".")
+        for item in values
+        if isinstance(item, str) and item.strip().rstrip(".")
+    }
+
+
 def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     """True if the Host header targets the interface we bound to.
 
     Accepts:
     - Exact bound host (with or without port suffix)
     - Loopback aliases when bound to loopback
-    - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
-      no protection possible at this layer)
+    - Configured browser-facing names on wildcard binds, or any host on a
+      wildcard bind when no explicit allowlist is configured
     """
     if not host_header:
         return False
@@ -689,11 +731,16 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
         host_only = h.rsplit(":", 1)[0] if ":" in h else h
     host_only = host_only.lower()
 
-    # 0.0.0.0 bind means operator explicitly opted into all-interfaces
-    # (requires --insecure per web_server.start_server). No Host-layer
-    # defence can protect that mode; rely on operator network controls.
+    # A wildcard socket can still retain Host-header protection when the
+    # operator supplies the exact browser-facing names. This is useful for a
+    # Tailscale-only dashboard that must accept both its tailnet IP and
+    # MagicDNS name while rejecting DNS-rebinding hostnames. Keep the old
+    # allow-any behavior only when no explicit allowlist is configured.
     if bound_host in {"0.0.0.0", "::"}:
-        return True
+        allowed_hosts = _dashboard_allowed_hosts()
+        if allowed_hosts is None:
+            return True
+        return host_only.rstrip(".") in allowed_hosts
 
     # Loopback bind: accept the loopback names
     bound_lc = bound_host.lower()
@@ -917,6 +964,15 @@ class DashboardHealth:
 DASHBOARD_HEALTH = DashboardHealth()
 
 
+def _apply_dashboard_security_headers(response: Response) -> Response:
+    """Add browser protections that are safe for the dashboard SPA and API."""
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-XSS-Protection", "0")
+    return response
+
+
 @app.middleware("http")
 async def _dashboard_health_middleware(request: Request, call_next):
     """Outermost middleware: count unhandled exceptions and 5xx responses.
@@ -933,7 +989,7 @@ async def _dashboard_health_middleware(request: Request, call_next):
         raise
     if response.status_code >= 500:
         DASHBOARD_HEALTH.record_error(f"http_{response.status_code}", request.url.path)
-    return response
+    return _apply_dashboard_security_headers(response)
 
 
 # ---------------------------------------------------------------------------
