@@ -2087,7 +2087,6 @@ def test_stop_after_claim_blocks_workspace_materialization(
         conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
         conn.commit()
         monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
-
     materialized = tmp_path / "materialized-workspace"
     resolver_calls = []
 
@@ -2315,6 +2314,105 @@ def test_stop_during_worktree_resolution_removes_new_worktree_and_branch(
         "AND kind = 'worktree_base_fallback'",
         (task_id,),
     ).fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    ("lane", "expected_status"),
+    [("ready", "ready"), ("review", "review")],
+)
+@pytest.mark.parametrize("workspace_kind", ["scratch", "worktree"])
+def test_halt_during_workspace_commit_rolls_back_persisted_materialization(
+    tmp_path, monkeypatch, lane, expected_status, workspace_kind
+):
+    """A halt that wins on COMMIT leaves no new workspace or DB pointer."""
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(hermes_home))
+    repo = tmp_path / "repo"
+    if workspace_kind == "worktree":
+        _init_git_repo(repo)
+        monkeypatch.setattr(
+            kb, "read_board_metadata", lambda _board: {"default_workdir": str(repo)}
+        )
+    db_path = hermes_home / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(
+        conn,
+        title=f"{lane} commit-edge {workspace_kind}",
+        assignee="default",
+        workspace_kind=workspace_kind,
+    )
+    if lane == "review":
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        conn.commit()
+        monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: True)
+    original_task = kb.get_task(conn, task_id)
+    assert original_task is not None
+    original_workspace_path = original_task.workspace_path
+    original_branch_name = original_task.branch_name
+
+    expected_path = (
+        repo / ".worktrees" / task_id
+        if workspace_kind == "worktree"
+        else kb.workspaces_root() / task_id
+    )
+    workspace_update_seen = False
+    halt_engaged = False
+
+    def halt_on_workspace_commit(statement):
+        nonlocal workspace_update_seen, halt_engaged
+        normalized = statement.strip().upper()
+        if normalized.startswith("UPDATE TASKS SET WORKSPACE_PATH"):
+            workspace_update_seen = True
+        elif workspace_update_seen and normalized == "COMMIT" and not halt_engaged:
+            halt_engaged = True
+            _halt(hermes_home, monkeypatch)
+
+    conn.set_trace_callback(halt_on_workspace_commit)
+    spawn_calls = []
+    try:
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *args, **kwargs: spawn_calls.append((args, kwargs)),
+            max_spawn=1,
+        )
+    finally:
+        conn.set_trace_callback(None)
+
+    task = kb.get_task(conn, task_id)
+    assert workspace_update_seen is True
+    assert halt_engaged is True
+    assert result.spawned == []
+    assert spawn_calls == []
+    assert not expected_path.exists()
+    assert task is not None and task.status == "todo"
+    assert task.workspace_path == original_workspace_path
+    assert task.branch_name == original_branch_name
+    payload = _latest_event_payload(conn, task_id, "dispatch_paused")
+    assert payload["resume_status"] == expected_status
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+        "AND kind = 'worktree_base_fallback'",
+        (task_id,),
+    ).fetchone()[0] == 0
+    if workspace_kind == "worktree":
+        branch_name = kb.default_task_branch_name(task_id)
+        branch = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "show-ref",
+                "--verify",
+                f"refs/heads/{branch_name}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert branch.returncode != 0
     conn.close()
 
 

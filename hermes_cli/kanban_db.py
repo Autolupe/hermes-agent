@@ -10549,7 +10549,10 @@ def _persist_dispatch_workspace(
     board: Optional[str],
 ) -> None:
     """Persist one resolved workspace only while every dispatch brake is open."""
+    original_workspace_path = claimed.workspace_path
+    original_branch_name = claimed.branch_name
     branch_name: Optional[str] = None
+    fallback_event_id: Optional[int] = None
     if claimed.workspace_kind == "worktree":
         branch_name = (
             resolved_branch_name or (claimed.branch_name or "")
@@ -10572,9 +10575,60 @@ def _persist_dispatch_workspace(
                 "worktree_base_fallback",
                 {"branch": branch_name, "base": "HEAD"},
             )
+            fallback_event_id = int(
+                conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            )
         # A brake that closed while this transaction was writing rolls every
         # workspace, branch, and fallback-event change back together.
         _raise_if_dispatch_paused()
+    try:
+        # A stop can win while SQLite is executing COMMIT, after the final
+        # in-transaction check. Recheck at the first post-commit edge so the
+        # caller's existing resolution cleanup removes the exact directory or
+        # worktree it just created instead of retaining an unspawned workspace.
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
+        persisted_branch_name = (
+            branch_name if branch_name is not None else original_branch_name
+        )
+        restored = False
+        try:
+            with write_txn(conn):
+                restored = conn.execute(
+                    "UPDATE tasks SET workspace_path = ?, branch_name = ? "
+                    "WHERE id = ? AND status = 'running' "
+                    "AND current_run_id IS ? AND claim_lock IS ? "
+                    "AND workspace_path IS ? AND branch_name IS ?",
+                    (
+                        original_workspace_path,
+                        original_branch_name,
+                        claimed.id,
+                        claimed.current_run_id,
+                        claimed.claim_lock,
+                        str(workspace),
+                        persisted_branch_name,
+                    ),
+                ).rowcount == 1
+                if restored and fallback_event_id is not None:
+                    conn.execute(
+                        "DELETE FROM task_events WHERE id = ? AND task_id = ? "
+                        "AND kind = 'worktree_base_fallback'",
+                        (fallback_event_id, claimed.id),
+                    )
+        except Exception:
+            restored = False
+            _log.warning(
+                "Could not restore workspace metadata after dispatch paused "
+                "at the commit edge for %s",
+                claimed.id,
+                exc_info=True,
+            )
+        if not restored:
+            # Keep the filesystem artifact when its durable pointer could not
+            # be restored. Removing it would leave the task pointing at a path
+            # that no longer exists.
+            materialization.identity = None
+        raise
     claimed.workspace_path = str(workspace)
     if branch_name is not None:
         claimed.branch_name = branch_name
