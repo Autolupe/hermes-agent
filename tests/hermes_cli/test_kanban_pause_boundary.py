@@ -959,6 +959,173 @@ def test_stop_engaged_during_dispatch_reclaim_skips_promotion_and_spawn(
 
 
 @pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+@pytest.mark.parametrize("source_lane", ["ready", "review"])
+@pytest.mark.parametrize(
+    "recovery",
+    [
+        "expired_claim",
+        "manual_reclaim",
+        "stale_heartbeat",
+        "timed_out",
+        "crashed",
+        "orphaned",
+        "spawn_failed",
+    ],
+)
+def test_stop_during_retry_write_parks_and_restores_source_lane(
+    tmp_path, monkeypatch, recovery, source_lane, brake
+):
+    """A brake arriving on the retry update wins before its commit."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        kb,
+        "_classify_worker_exit",
+        lambda _pid: ("nonzero_exit", 1),
+    )
+    monkeypatch.setattr(kb, "_cleanup_worker_tmux", lambda *_args: None)
+    monkeypatch.setattr(kb, "_unlock_task_worktree", lambda *_args: None)
+
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(
+        conn,
+        title=f"{recovery} from {source_lane}",
+        assignee="default",
+        max_runtime_seconds=1 if recovery == "timed_out" else None,
+    )
+    if source_lane == "review":
+        conn.execute(
+            "UPDATE tasks SET status = 'review' WHERE id = ?",
+            (task_id,),
+        )
+        conn.commit()
+        claimed = kb.claim_review_task(
+            conn,
+            task_id,
+            claimer=f"{kb._claimer_id().split(':', 1)[0]}:test",
+        )
+    else:
+        claimed = kb.claim_task(
+            conn,
+            task_id,
+            claimer=f"{kb._claimer_id().split(':', 1)[0]}:test",
+        )
+    assert claimed is not None
+
+    old = int(kb.time.time()) - 10_000
+    if recovery == "expired_claim":
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (old, task_id),
+        )
+    elif recovery == "stale_heartbeat":
+        conn.execute(
+            "UPDATE tasks SET started_at = ?, last_heartbeat_at = NULL "
+            "WHERE id = ?",
+            (old, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE id = ?",
+            (old, claimed.current_run_id),
+        )
+    elif recovery in {"timed_out", "crashed"}:
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ?, started_at = ? WHERE id = ?",
+            (999_999, old, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ?, started_at = ? WHERE id = ?",
+            (999_999, old, claimed.current_run_id),
+        )
+    elif recovery == "orphaned":
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL WHERE id = ?",
+            (task_id,),
+        )
+    conn.commit()
+
+    stop_created = False
+    brake_path = None
+
+    def stop_on_retry_update(statement):
+        nonlocal stop_created, brake_path
+        normalized = " ".join(statement.lower().split())
+        if (
+            not stop_created
+            and normalized.startswith("update tasks")
+            and "set status =" in normalized
+        ):
+            stop_created = True
+            brake_path = _engage_brake(tmp_path, monkeypatch, brake)
+
+    conn.set_trace_callback(stop_on_retry_update)
+    try:
+        if recovery == "expired_claim":
+            outcome = kb.release_stale_claims(
+                conn,
+                signal_fn=lambda *_args: None,
+            )
+            assert outcome == 1
+        elif recovery == "manual_reclaim":
+            assert kb.reclaim_task(
+                conn,
+                task_id,
+                reason="test retry",
+                signal_fn=lambda *_args: None,
+            )
+        elif recovery == "stale_heartbeat":
+            assert kb.detect_stale_running(
+                conn,
+                stale_timeout_seconds=1,
+                signal_fn=lambda *_args: None,
+            ) == [task_id]
+        elif recovery == "timed_out":
+            assert kb.enforce_max_runtime(
+                conn,
+                signal_fn=lambda *_args: None,
+            ) == [task_id]
+        elif recovery == "crashed":
+            assert kb.detect_crashed_workers(conn) == [task_id]
+        elif recovery == "orphaned":
+            assert kb.reconcile_orphaned_running(conn) == [task_id]
+        else:
+            assert not kb._record_spawn_failure(
+                conn,
+                task_id,
+                "spawn failed during stop race",
+                failure_limit=3,
+            )
+    finally:
+        conn.set_trace_callback(None)
+
+    assert stop_created is True
+    assert brake_path is not None and brake_path.exists()
+    parked = kb.get_task(conn, task_id)
+    assert parked is not None
+    assert parked.status == "todo"
+    assert parked.current_run_id is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE status IN ('ready', 'review')"
+    ).fetchone()[0] == 0
+    parked_event = kb.list_events(conn, task_id)[-1]
+    assert parked_event.kind == "dispatch_parked"
+    assert parked_event.payload is not None
+    assert parked_event.payload["resume_status"] == source_lane
+    assert parked_event.payload["parked_by_dispatch_brake"] is True
+
+    brake_path.unlink()
+    estop._reset_log_state_for_tests()
+    assert kb.recompute_ready(conn) == 1
+    resumed = kb.get_task(conn, task_id)
+    assert resumed is not None and resumed.status == source_lane
+    conn.close()
+
+
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
 @pytest.mark.parametrize(
     "arrival", ["after_promotion", "after_write_lock", "during_assignment"]
 )
@@ -1396,6 +1563,134 @@ print(json.dumps({
     assert halt.is_file()
 
 
+@pytest.mark.windows_only
+@pytest.mark.parametrize("root_kind", ["directory", "junction"])
+def test_dispatch_state_read_anchors_configured_root_on_windows(
+    tmp_path, monkeypatch, root_kind
+):
+    """A real Windows root replacement or redirect cannot hide a halt."""
+    configured_root = tmp_path / "configured-root"
+    physical_root = (
+        configured_root
+        if root_kind == "directory"
+        else tmp_path / "physical-root"
+    )
+    physical_state = physical_root / "state"
+    physical_state.mkdir(parents=True)
+    empty_root = tmp_path / "empty-root"
+    (empty_root / "state").mkdir(parents=True)
+
+    def create_junction(path, target):
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(path), str(target)],
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    def remove_junction(path):
+        result = subprocess.run(
+            ["cmd", "/c", "rmdir", str(path)],
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    if root_kind == "junction":
+        create_junction(configured_root, physical_root)
+
+    physical_halt = physical_state / "halt.json"
+    physical_halt.write_text("{}\n", encoding="utf-8")
+    logical_state = configured_root / "state"
+    logical_pause = logical_state / "dispatch_pause.json"
+    logical_halt = logical_state / "halt.json"
+    physical_pause = physical_state / "dispatch_pause.json"
+    moved_root = tmp_path / "configured-root-original"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(configured_root))
+
+    real_lstat = kb.os.lstat
+    brake_keys = {
+        os.path.normcase(os.path.abspath(os.fspath(path)))
+        for path in (
+            logical_pause,
+            logical_halt,
+            physical_pause,
+            physical_halt,
+        )
+    }
+    replacement_attempts = 0
+    completed_swaps = 0
+    locked_attempts = 0
+    expect_locked = False
+
+    def lstat_during_temporary_root_replacement(path, *args, **kwargs):
+        nonlocal replacement_attempts, completed_swaps, locked_attempts
+        path_key = os.path.normcase(os.path.abspath(os.fspath(path)))
+        if path_key not in brake_keys:
+            return real_lstat(path, *args, **kwargs)
+        replacement_attempts += 1
+        try:
+            configured_root.rename(moved_root)
+        except OSError as exc:
+            if (
+                not expect_locked
+                or getattr(exc, "winerror", None) not in {5, 32, 33}
+            ):
+                raise
+            locked_attempts += 1
+            return real_lstat(path, *args, **kwargs)
+        if root_kind == "directory":
+            empty_root.rename(configured_root)
+        else:
+            create_junction(configured_root, empty_root)
+        try:
+            return real_lstat(path, *args, **kwargs)
+        finally:
+            if root_kind == "directory":
+                configured_root.rename(empty_root)
+            else:
+                remove_junction(configured_root)
+            moved_root.rename(configured_root)
+            completed_swaps += 1
+
+    monkeypatch.setattr(
+        kb.os,
+        "lstat",
+        lstat_during_temporary_root_replacement,
+    )
+
+    # Reproduce the former path race before either directory is locked: both
+    # brake lookups see the empty replacement and both snapshots see the
+    # restored original root.
+    before = kb._dispatch_state_snapshot(logical_state)
+    old_paused = (
+        before is None
+        or kb._dispatch_brake_entry_exists(logical_pause)
+        or kb._dispatch_brake_entry_exists(logical_halt)
+        or kb._dispatch_state_snapshot(logical_state) != before
+    )
+    assert old_paused is False
+    assert replacement_attempts == 4
+    assert completed_swaps == 4
+
+    replacement_attempts = 0
+    completed_swaps = 0
+    expect_locked = True
+
+    # A real root is locked against replacement. A root junction may still
+    # move, but the public read stays on its locked physical root and state.
+    assert kb.dispatch_is_paused() is True
+    assert replacement_attempts == 3
+    assert completed_swaps == (0 if root_kind == "directory" else 3)
+    assert locked_attempts == (3 if root_kind == "directory" else 0)
+    assert logical_halt.is_file()
+    assert physical_halt.is_file()
+
+
 def test_halt_uses_shared_root_from_profile_home(tmp_path, monkeypatch):
     root = tmp_path / "shared"
     profile_home = root / "profiles" / "planner"
@@ -1495,7 +1790,7 @@ def test_halt_lookup_error_blocks_claim_dispatch_and_final_spawn(tmp_path, monke
         kb._default_spawn(task, str(tmp_path))
 
 
-def test_halt_arriving_after_claim_requeues_without_failure(tmp_path, monkeypatch):
+def test_halt_arriving_after_claim_parks_without_failure(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     kb.init_db(db_path=db_path)
     conn = kb.connect(db_path=db_path)
@@ -1508,8 +1803,11 @@ def test_halt_arriving_after_claim_requeues_without_failure(tmp_path, monkeypatc
     result = kb.dispatch_once(conn, spawn_fn=halt_at_final_spawn, max_spawn=1)
     task = kb.get_task(conn, task_id)
     assert result.spawned == []
-    assert task.status == "ready"
+    assert task.status == "todo"
     assert task.consecutive_failures == 0
+    payload = _latest_event_payload(conn, task_id, "dispatch_paused")
+    assert payload["resume_status"] == "ready"
+    assert payload["parked_by_dispatch_brake"] is True
     run = conn.execute(
         "SELECT status, outcome, ended_at FROM task_runs WHERE task_id = ?",
         (task_id,),
@@ -1595,7 +1893,9 @@ def test_stop_after_claim_blocks_workspace_materialization(
     assert not materialized.exists()
     assert spawn_calls == []
     assert result.spawned == []
-    assert task is not None and task.status == expected_status
+    assert task is not None and task.status == "todo"
+    payload = _latest_event_payload(conn, task_id, "dispatch_paused")
+    assert payload["resume_status"] == expected_status
     assert task.workspace_path is None
     assert task.branch_name is None
     assert task.consecutive_failures == 0
@@ -1663,7 +1963,9 @@ def test_stop_during_directory_resolution_rolls_back_new_workspace(
     assert not expected_path.exists()
     assert spawn_calls == []
     assert result.spawned == []
-    assert task is not None and task.status == expected_status
+    assert task is not None and task.status == "todo"
+    payload = _latest_event_payload(conn, task_id, "dispatch_paused")
+    assert payload["resume_status"] == expected_status
     expected_stored_path = str(explicit_path) if workspace_kind == "dir" else None
     assert task.workspace_path == expected_stored_path
     assert task.branch_name is None
@@ -1753,7 +2055,9 @@ def test_stop_during_worktree_resolution_removes_new_worktree_and_branch(
     assert branch.returncode != 0
     assert spawn_calls == []
     assert result.spawned == []
-    assert task is not None and task.status == expected_status
+    assert task is not None and task.status == "todo"
+    payload = _latest_event_payload(conn, task_id, "dispatch_paused")
+    assert payload["resume_status"] == expected_status
     assert task.workspace_path == original_workspace_path
     assert task.branch_name is None
     assert task.consecutive_failures == 0
@@ -1833,7 +2137,9 @@ def test_halt_from_failing_checkout_hook_rolls_back_partial_worktree(
     assert branch.returncode != 0
     assert spawn_calls == []
     assert result.spawned == []
-    assert task is not None and task.status == expected_status
+    assert task is not None and task.status == "todo"
+    payload = _latest_event_payload(conn, task_id, "dispatch_paused")
+    assert payload["resume_status"] == expected_status
     assert task.workspace_path == original_workspace_path
     assert task.branch_name is None
     assert task.consecutive_failures == 0
@@ -1872,7 +2178,9 @@ def test_stop_during_resolution_preserves_preexisting_workspace(
 
     task = kb.get_task(conn, task_id)
     assert result.spawned == []
-    assert task is not None and task.status == "ready"
+    assert task is not None and task.status == "todo"
+    payload = _latest_event_payload(conn, task_id, "dispatch_paused")
+    assert payload["resume_status"] == "ready"
     assert task.workspace_path is None
     assert marker.read_text(encoding="utf-8") == "preserve me"
     conn.close()
@@ -1969,7 +2277,9 @@ def test_estop_arriving_at_injected_spawn_guard_releases_claim(
     assert estop_path.is_file()
     assert spawn_calls == []
     assert result.spawned == []
-    assert task is not None and task.status == expected_status
+    assert task is not None and task.status == "todo"
+    payload = _latest_event_payload(conn, task_id, "dispatch_paused")
+    assert payload["resume_status"] == expected_status
     assert task.consecutive_failures == 0
     assert run is not None
     assert (run["status"], run["outcome"]) == ("reclaimed", "reclaimed")
@@ -2099,7 +2409,7 @@ def test_dispatch_boundary_probe_exception_still_emits_strict_failure_json(
     assert all(value is False for value in payload["checks"].values())
 
 
-def test_pause_arriving_after_ready_claim_requeues_without_failure(tmp_path, monkeypatch):
+def test_pause_arriving_after_ready_claim_parks_without_failure(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     kb.init_db(db_path=db_path)
     conn = kb.connect(db_path=db_path)
@@ -2112,8 +2422,10 @@ def test_pause_arriving_after_ready_claim_requeues_without_failure(tmp_path, mon
     result = kb.dispatch_once(conn, spawn_fn=pause_at_spawn, max_spawn=1)
     task = kb.get_task(conn, task_id)
     assert result.spawned == []
-    assert task.status == "ready"
+    assert task.status == "todo"
     assert task.consecutive_failures == 0
+    payload = _latest_event_payload(conn, task_id, "dispatch_paused")
+    assert payload["resume_status"] == "ready"
     run = conn.execute(
         "SELECT status, outcome, ended_at FROM task_runs WHERE task_id = ?",
         (task_id,),
@@ -2122,7 +2434,7 @@ def test_pause_arriving_after_ready_claim_requeues_without_failure(tmp_path, mon
     assert run["ended_at"] is not None
 
 
-def test_pause_arriving_after_review_claim_returns_to_review(tmp_path, monkeypatch):
+def test_pause_arriving_after_review_claim_parks_for_review(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     kb.init_db(db_path=db_path)
     conn = kb.connect(db_path=db_path)
@@ -2138,5 +2450,7 @@ def test_pause_arriving_after_review_claim_returns_to_review(tmp_path, monkeypat
     result = kb.dispatch_once(conn, spawn_fn=pause_at_spawn, max_spawn=1)
     task = kb.get_task(conn, task_id)
     assert result.spawned == []
-    assert task.status == "review"
+    assert task.status == "todo"
     assert task.consecutive_failures == 0
+    payload = _latest_event_payload(conn, task_id, "dispatch_paused")
+    assert payload["resume_status"] == "review"

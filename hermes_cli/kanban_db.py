@@ -806,6 +806,8 @@ def _dispatch_stat_identity(info: object) -> tuple[Any, ...]:
         getattr(info, "st_dev", None),
         getattr(info, "st_ino", None),
         getattr(info, "st_mode", None),
+        getattr(info, "st_file_attributes", None),
+        getattr(info, "st_reparse_tag", None),
     )
 
 
@@ -818,6 +820,18 @@ def _dispatch_stat_fingerprint(info: object) -> tuple[Any, ...]:
         getattr(info, "st_size", None),
         getattr(info, "st_nlink", None),
     )
+
+
+def _dispatch_is_unsafe_redirect(info: object) -> bool:
+    """Reject symlinks and native Windows directory reparse points."""
+    mode = getattr(info, "st_mode", 0)
+    reparse_flag = getattr(
+        stat_module,
+        "FILE_ATTRIBUTE_REPARSE_POINT",
+        0x400,
+    )
+    file_attributes = getattr(info, "st_file_attributes", 0)
+    return stat_module.S_ISLNK(mode) or bool(file_attributes & reparse_flag)
 
 
 def _dispatch_optional_entry_info(parent_fd: int, name: str) -> object | None:
@@ -969,6 +983,137 @@ def _anchored_dispatch_brakes_present(
             os.close(root_fd)
 
 
+def _windows_optional_dispatch_entry_info(path: Path) -> object | None:
+    """Read one Windows entry without following redirects, retrying absence."""
+    try:
+        return os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            return os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+
+def _windows_dispatch_root_matches(
+    anchor: object,
+    root_fingerprint: tuple[Any, ...],
+) -> bool:
+    """Verify that a locked Windows root still backs its configured path."""
+    physical_root = getattr(anchor, "physical_parent")
+    logical_root = getattr(anchor, "logical_parent")
+    parent_identity = getattr(anchor, "parent_identity")
+    physical_info = os.stat(physical_root, follow_symlinks=False)
+    logical_info = os.stat(logical_root)
+    return (
+        stat_module.S_ISDIR(physical_info.st_mode)
+        and not _dispatch_is_unsafe_redirect(physical_info)
+        and _dispatch_stat_fingerprint(physical_info) == root_fingerprint
+        and stat_module.S_ISDIR(logical_info.st_mode)
+        and _dispatch_stat_identity(logical_info) == parent_identity
+    )
+
+
+def _windows_anchored_dispatch_brakes_present(
+    state_dir: Path,
+    brake_names: tuple[str, ...],
+    expected_snapshot: tuple[Any, ...],
+) -> Optional[bool]:
+    """Read Windows brakes below locked physical root and state folders.
+
+    Native Windows does not support Python's ``dir_fd`` leaf operations.
+    Retaining handles opened without delete sharing prevents a real root or
+    state directory from being renamed during the read. A configured root
+    junction may still be retargeted, so every leaf lookup uses the resolved
+    physical path and the logical path is checked again before returning.
+
+    ``None`` has the same meaning as the POSIX helper: the shared root is
+    genuinely absent, so the caller may use the snapshot fallback. Every
+    unsafe, changing, or unreadable state fails closed as ``True``.
+    """
+    try:
+        from agent.estop import (
+            _close_windows_directory_handle,
+            _open_windows_directory_handle,
+            _open_windows_shared_sentinel_parent,
+        )
+    except Exception:
+        return True
+
+    root_anchor = None
+    state_handle: int | None = None
+    try:
+        root_anchor = _open_windows_shared_sentinel_parent(
+            state_dir.parent / "ESTOP"
+        )
+        if root_anchor is None:
+            return None
+
+        physical_root = root_anchor.physical_parent
+        root_info = os.stat(physical_root, follow_symlinks=False)
+        root_fingerprint = _dispatch_stat_fingerprint(root_info)
+        if (
+            _dispatch_is_unsafe_redirect(root_info)
+            or _dispatch_stat_identity(root_info) != root_anchor.parent_identity
+            or not _windows_dispatch_root_matches(
+                root_anchor,
+                root_fingerprint,
+            )
+            or _dispatch_state_snapshot(state_dir) != expected_snapshot
+        ):
+            return True
+
+        physical_state = physical_root / state_dir.name
+        state_info = _windows_optional_dispatch_entry_info(physical_state)
+        if state_info is None:
+            return (
+                not _windows_dispatch_root_matches(
+                    root_anchor,
+                    root_fingerprint,
+                )
+                or _dispatch_state_snapshot(state_dir) != expected_snapshot
+            )
+        if (
+            not stat_module.S_ISDIR(state_info.st_mode)
+            or _dispatch_is_unsafe_redirect(state_info)
+        ):
+            return True
+
+        state_handle = _open_windows_directory_handle(physical_state)
+        opened_state = os.stat(physical_state, follow_symlinks=False)
+        state_fingerprint = _dispatch_stat_fingerprint(opened_state)
+        if (
+            not stat_module.S_ISDIR(opened_state.st_mode)
+            or _dispatch_is_unsafe_redirect(opened_state)
+            or state_fingerprint != _dispatch_stat_fingerprint(state_info)
+        ):
+            return True
+
+        for brake_name in brake_names:
+            if _dispatch_brake_entry_exists(physical_state / brake_name):
+                return True
+
+        final_state = os.stat(physical_state, follow_symlinks=False)
+        return (
+            not stat_module.S_ISDIR(final_state.st_mode)
+            or _dispatch_is_unsafe_redirect(final_state)
+            or _dispatch_stat_fingerprint(final_state) != state_fingerprint
+            or not _windows_dispatch_root_matches(
+                root_anchor,
+                root_fingerprint,
+            )
+            or _dispatch_state_snapshot(state_dir) != expected_snapshot
+        )
+    except (OSError, RuntimeError):
+        return True
+    finally:
+        try:
+            if state_handle is not None:
+                _close_windows_directory_handle(state_handle)
+        finally:
+            if root_anchor is not None:
+                _close_windows_directory_handle(root_anchor.handle)
+
+
 def dispatch_is_paused() -> bool:
     """Fail closed while a shared-root dispatch pause or full halt exists."""
     try:
@@ -983,6 +1128,12 @@ def dispatch_is_paused() -> bool:
         anchored_result: Optional[bool] = None
         if _supports_anchored_dispatch_state_read():
             anchored_result = _anchored_dispatch_brakes_present(
+                state_dir,
+                (pause_path.name, halt_path.name),
+                before,
+            )
+        elif os.name == "nt":
+            anchored_result = _windows_anchored_dispatch_brakes_present(
                 state_dir,
                 (pause_path.name, halt_path.name),
                 before,
@@ -1041,6 +1192,69 @@ def _park_runnable_status_if_dispatch_paused(status: str) -> tuple[str, bool]:
     except DispatchPausedError:
         return "todo", True
     return status, False
+
+
+def _annotate_parked_retry_payload(
+    payload: dict[str, Any],
+    *,
+    retry_status: str,
+    landing_status: str,
+    parked: bool,
+) -> None:
+    """Record how a stopped retry can safely recover after resume."""
+    if not parked:
+        return
+    payload["status"] = landing_status
+    payload["resume_status"] = retry_status
+    payload["parked_by_dispatch_brake"] = True
+
+
+def _park_retry_transitions_before_commit(
+    conn: sqlite3.Connection,
+    transitions: Iterable[tuple[str, str, str]],
+) -> set[str]:
+    """Turn newly runnable retries into durable ``todo`` work if stopped.
+
+    Recovery paths must commit worker cleanup and audit rows even when a
+    brake arrives, so they cannot use the runnable-transition pattern that
+    rolls the whole transaction back. Callers first choose a safe landing
+    after acquiring their write lock, then call this immediately before the
+    transaction commits. A late brake changes any ``ready``/``review`` row to
+    ``todo`` and records the intended source lane for ``recompute_ready``.
+    """
+    pending = [
+        (task_id, retry_status, source_event)
+        for task_id, retry_status, source_event in transitions
+        if retry_status in {"ready", "review"}
+    ]
+    if not pending:
+        return set()
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
+        parked: set[str] = set()
+        for task_id, retry_status, source_event in pending:
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status IN ('ready', 'review')",
+                (task_id,),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(
+                conn,
+                task_id,
+                "dispatch_parked",
+                {
+                    "source_event": source_event,
+                    "status": "todo",
+                    "resume_status": retry_status,
+                    "parked_by_dispatch_brake": True,
+                },
+            )
+            parked.add(task_id)
+        return parked
+    return set()
 
 
 def _dispatch_brake_description() -> str:
@@ -1526,6 +1740,7 @@ raise SystemExit(0 if ok else 1)
             root = _root(base, name)
             child_code = """
 import inspect
+import json
 import os
 import sqlite3
 import sys
@@ -1767,12 +1982,25 @@ def injected_lane_blocks(lane):
         "SELECT status, outcome, ended_at FROM task_runs WHERE task_id = ?",
         (task_id,),
     ).fetchone()
+    parked_event = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'dispatch_paused' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    parked_payload = (
+        json.loads(parked_event["payload"])
+        if parked_event is not None and parked_event["payload"]
+        else {}
+    )
     lane_ok = (
         result.spawned == []
         and spawn_calls == []
         and row is not None
-        and row["status"] == lane
+        and row["status"] == "todo"
         and row["consecutive_failures"] == 0
+        and parked_payload.get("resume_status") == lane
+        and parked_payload.get("parked_by_dispatch_brake") is True
         and run is not None
         and run["status"] == "reclaimed"
         and run["outcome"] == "reclaimed"
@@ -5960,8 +6188,9 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_requested', 'review_reopened', "
-        "'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'status', 'reclaimed', 'reconciled', 'dispatch_parked', "
+        "'dispatch_paused', 'workspace_busy', 'stale', 'timed_out', "
+        "'crashed', 'protocol_violation', 'spawn_failed', 'rate_limited'"
         ") ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -6576,12 +6805,15 @@ def release_stale_claims(
             continue
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, row["id"])
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (retry_status, row["id"], row["claim_lock"], now),
+                (landing_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -6608,10 +6840,20 @@ def release_stale_claims(
                 "retry_status": retry_status,
             }
             payload.update(termination)
+            _annotate_parked_retry_payload(
+                payload,
+                retry_status=retry_status,
+                landing_status=landing_status,
+                parked=parked_by_dispatch_brake,
+            )
             _append_event(
                 conn, row["id"], "reclaimed",
                 payload,
                 run_id=run_id,
+            )
+            _park_retry_transitions_before_commit(
+                conn,
+                ((row["id"], retry_status, "reclaimed"),),
             )
             reclaimed += 1
         # The reclaimed worker is gone (or never local): drop a dead lock.
@@ -6670,12 +6912,15 @@ def reclaim_task(
     )
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
+        landing_status, parked_by_dispatch_brake = (
+            _park_runnable_status_if_dispatch_paused(retry_status)
+        )
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
-            (retry_status, task_id, prev_lock),
+            (landing_status, task_id, prev_lock),
         )
         if cur.rowcount != 1:
             return False
@@ -6695,10 +6940,20 @@ def reclaim_task(
             "retry_status": retry_status,
         }
         payload.update(termination)
+        _annotate_parked_retry_payload(
+            payload,
+            retry_status=retry_status,
+            landing_status=landing_status,
+            parked=parked_by_dispatch_brake,
+        )
         _append_event(
             conn, task_id, "reclaimed",
             payload,
             run_id=run_id,
+        )
+        _park_retry_transitions_before_commit(
+            conn,
+            ((task_id, retry_status, "reclaimed"),),
         )
     # Operator intervention — they've looked at the task, so the
     # consecutive-failures counter is now stale. Give the next retry
@@ -10361,9 +10616,10 @@ class DispatchResult:
     a live process). None of these count as a failure."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
-    (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
-    counting a failure. These never trip the circuit breaker — a long quota
-    window just makes the task bounce cheaply until the window clears."""
+    (EX_TEMPFAIL sentinel exit) and were restored to their source phase
+    WITHOUT counting a failure. A dispatch brake keeps them in ``todo`` until
+    resume. These never trip the circuit breaker — a long quota window just
+    makes the task bounce cheaply until the window clears."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -10812,13 +11068,16 @@ def enforce_max_runtime(
 
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, tid, pid, row["claim_lock"]),
+                (landing_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -10828,6 +11087,12 @@ def enforce_max_runtime(
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                _annotate_parked_retry_payload(
+                    payload,
+                    retry_status=retry_status,
+                    landing_status=landing_status,
+                    parked=parked_by_dispatch_brake,
+                )
                 run_id = _end_run(
                     conn, tid,
                     outcome="timed_out", status="timed_out",
@@ -10836,6 +11101,10 @@ def enforce_max_runtime(
                 )
                 _append_event(
                     conn, tid, "timed_out", payload, run_id=run_id,
+                )
+                _park_retry_transitions_before_commit(
+                    conn,
+                    ((tid, retry_status, "timed_out"),),
                 )
                 timed_out.append(tid)
         # Increment the unified failure counter. Outside the write_txn
@@ -10946,13 +11215,16 @@ def detect_stale_running(
 
         with write_txn(conn):
             retry_status = _retry_status_for_run(conn, tid)
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ?",
-                (retry_status, tid, row["claim_lock"]),
+                (landing_status, tid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -10970,6 +11242,12 @@ def detect_stale_running(
                 "retry_status": retry_status,
             }
             payload.update(termination)
+            _annotate_parked_retry_payload(
+                payload,
+                retry_status=retry_status,
+                landing_status=landing_status,
+                parked=parked_by_dispatch_brake,
+            )
 
             run_id = _end_run(
                 conn, tid,
@@ -10983,6 +11261,10 @@ def detect_stale_running(
             )
             _append_event(
                 conn, tid, "stale", payload, run_id=run_id,
+            )
+            _park_retry_transitions_before_commit(
+                conn,
+                ((tid, retry_status, "stale"),),
             )
             reclaimed.append(tid)
 
@@ -11013,11 +11295,13 @@ def reconcile_orphaned_running(
     ``detect_stale_running`` is disabled by default — so the card shows
     Running forever (a zombie).
 
-    This pass finds those orphans, requeues them to ``ready`` with an
+    This pass finds those orphans, restores their source phase with an
     explanatory comment, closes any leaked run, and appends a
-    ``reconciled`` event. If the orphan row still records a live PID on
-    this host, requeueing is deferred to a later tick so we never spawn a
-    duplicate beside a possibly-alive worker.
+    ``reconciled`` event. A dispatch brake parks that retry in ``todo`` until
+    the normal promotion pass can safely restore the source phase. If the
+    orphan row still records a live PID on this host, requeueing is deferred
+    to a later tick so we never spawn a duplicate beside a possibly-alive
+    worker.
 
     Returns the list of reconciled task ids. Safe to call every tick.
 
@@ -11042,13 +11326,22 @@ def reconcile_orphaned_running(
             )
             continue
         with write_txn(conn):
+            retry_status = _retry_status_for_run(conn, tid)
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
-                (tid, row["claim_lock"], row["claim_expires"]),
+                (
+                    landing_status,
+                    tid,
+                    row["claim_lock"],
+                    row["claim_expires"],
+                ),
             )
             if cur.rowcount != 1:
                 continue
@@ -11061,7 +11354,14 @@ def reconcile_orphaned_running(
                 ),
                 "worker_pid": int(pid) if pid else None,
                 "now": now,
+                "retry_status": retry_status,
             }
+            _annotate_parked_retry_payload(
+                payload,
+                retry_status=retry_status,
+                landing_status=landing_status,
+                parked=parked_by_dispatch_brake,
+            )
             run_id = _end_run(
                 conn, tid,
                 outcome="reclaimed", status="reclaimed",
@@ -11076,15 +11376,23 @@ def reconcile_orphaned_running(
                 (
                     tid, "dispatcher",
                     "reconciliation: card was 'running' with no valid claim "
-                    "(dead/gone worker) — requeued to ready",
+                    f"(dead/gone worker) — retry retained for {retry_status}",
                     now,
                 ),
             )
             _append_event(conn, tid, "reconciled", payload, run_id=run_id)
+            _park_retry_transitions_before_commit(
+                conn,
+                ((tid, retry_status, "reconciled"),),
+            )
             reconciled.append(tid)
         _log.info(
-            "kanban reconcile: requeued orphaned running task %s "
-            "(claim_lock=%r, worker_pid=%r)", tid, row["claim_lock"], pid,
+            "kanban reconcile: restored orphaned running task %s for %s retry "
+            "(claim_lock=%r, worker_pid=%r)",
+            tid,
+            retry_status,
+            row["claim_lock"],
+            pid,
         )
     return reconciled
 
@@ -11212,6 +11520,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
+    retry_transitions: list[tuple[str, str, str]] = []
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at, assignee "
@@ -11300,13 +11609,22 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             retry_status = _retry_status_for_run(conn, row["id"])
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
             event_payload["retry_status"] = retry_status
+            _annotate_parked_retry_payload(
+                event_payload,
+                retry_status=retry_status,
+                landing_status=landing_status,
+                parked=parked_by_dispatch_brake,
+            )
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"]),
+                (landing_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -11323,6 +11641,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     conn, row["id"], event_kind,
                     event_payload,
                     run_id=run_id,
+                )
+                retry_transitions.append(
+                    (row["id"], retry_status, event_kind)
                 )
                 exited_hook_payloads.append({
                     "task_id": row["id"],
@@ -11363,6 +11684,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text)
                     )
+        _park_retry_transitions_before_commit(conn, retry_transitions)
     # Dead workers hold no worktree: release each reclaimed card's lock so
     # the retry can enter the checkout (dead-pid locks only — never a live one).
     for _tid in (*crashed, *rate_limited):
@@ -11407,8 +11729,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     else _PROTOCOL_VIOLATION_FAILURE_LIMIT
                 )
                 if streak < violation_limit:
-                    # Below budget: the task is already back at ``ready``
-                    # (respawn allowed) with ``last_failure_error`` stamped.
+                    # Below budget: the task is back in its source phase, or
+                    # parked in ``todo`` while stopped, with
+                    # ``last_failure_error`` stamped.
                     # Deliberately no ``_record_task_failure`` call — a
                     # below-budget violation must not consume the unified
                     # failure budget, just as other failure kinds don't
@@ -11547,7 +11870,15 @@ def _record_task_failure(
         retry_status = (
             _retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
-            else ("review" if row["status"] == "review" else "ready")
+            else (
+                "review"
+                if row["status"] == "review"
+                else (
+                    _resume_status_from_events(conn, task_id)
+                    if row["status"] in {"todo", "blocked"}
+                    else "ready"
+                )
+            )
         )
         failures = int(row["consecutive_failures"]) + 1
 
@@ -11581,7 +11912,8 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'review', 'running')",
+                    "WHERE id = ? "
+                    "AND status IN ('todo', 'ready', 'review', 'running')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -11615,14 +11947,19 @@ def _record_task_failure(
             blocked = True
         else:
             # Below threshold.
+            landing_status = retry_status
+            parked_by_dispatch_brake = False
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
+                landing_status, parked_by_dispatch_brake = (
+                    _park_runnable_status_if_dispatch_paused(retry_status)
+                )
                 conn.execute(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (retry_status, failures, error[:500], task_id),
+                    (landing_status, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: caller already restored the source phase.
@@ -11633,23 +11970,54 @@ def _record_task_failure(
                 )
             if end_run:
                 # Spawn path: close the open run with outcome.
+                run_metadata = {
+                    "failures": failures,
+                    "retry_status": retry_status,
+                }
+                _annotate_parked_retry_payload(
+                    run_metadata,
+                    retry_status=retry_status,
+                    landing_status=landing_status,
+                    parked=parked_by_dispatch_brake,
+                )
                 run_id = _end_run(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
+                    metadata=run_metadata,
+                )
+                event_payload = {
+                    "error": error[:500],
+                    "failures": failures,
+                    "retry_status": retry_status,
+                }
+                _annotate_parked_retry_payload(
+                    event_payload,
+                    retry_status=retry_status,
+                    landing_status=landing_status,
+                    parked=parked_by_dispatch_brake,
                 )
                 _append_event(
                     conn, task_id, outcome,
-                    {
-                        "error": error[:500],
-                        "failures": failures,
-                        "retry_status": retry_status,
-                    },
+                    event_payload,
                     run_id=run_id,
+                )
+            elif release_claim and parked_by_dispatch_brake:
+                _append_event(
+                    conn,
+                    task_id,
+                    "dispatch_parked",
+                    {
+                        "source_event": outcome,
+                        "status": "todo",
+                        "resume_status": retry_status,
+                        "parked_by_dispatch_brake": True,
+                    },
+                )
+            if release_claim:
+                _park_retry_transitions_before_commit(
+                    conn,
+                    ((task_id, retry_status, outcome),),
                 )
             # Timeout/crash path's caller already emitted its own event.
     if blocked:
@@ -11713,10 +12081,12 @@ def _release_paused_claim(
     summary: str = "dispatch paused before worker spawn",
     payload_extra: Optional[dict] = None,
 ) -> None:
-    """Return a claimed task to its source lane without counting a failure.
+    """Release a claimed task without counting a failure.
 
     Shared by the pause edge and the busy-worktree edge: both are "not now",
     never "this card is broken", so ``consecutive_failures`` stays untouched.
+    A brake parks the task in ``todo`` with its source lane recorded; otherwise
+    a busy workspace returns directly to that lane.
     """
     now = int(time.time())
     with write_txn(conn):
@@ -11728,6 +12098,15 @@ def _release_paused_claim(
             return
         run_id = row["current_run_id"]
         retry_status = _retry_status_for_run(conn, task_id, run_id)
+        if event_kind == "dispatch_paused":
+            # The caller already observed a brake. Preserve that decision even
+            # if the sentinel disappears before this cleanup transaction gets
+            # its write lock; the next safe promotion pass will restore it.
+            landing_status, parked_by_dispatch_brake = "todo", True
+        else:
+            landing_status, parked_by_dispatch_brake = (
+                _park_runnable_status_if_dispatch_paused(retry_status)
+            )
         if run_id is not None:
             conn.execute(
                 "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
@@ -11739,12 +12118,22 @@ def _release_paused_claim(
         conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
             "worker_pid = NULL, current_run_id = NULL WHERE id = ? AND status = 'running'",
-            (retry_status, task_id),
+            (landing_status, task_id),
         )
         payload = {"retry_status": retry_status, "failure_counted": False}
         if payload_extra:
             payload.update(payload_extra)
+        _annotate_parked_retry_payload(
+            payload,
+            retry_status=retry_status,
+            landing_status=landing_status,
+            parked=parked_by_dispatch_brake,
+        )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
+        _park_retry_transitions_before_commit(
+            conn,
+            ((task_id, retry_status, event_kind),),
+        )
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
@@ -12587,8 +12976,9 @@ def _dispatch_once_locked(
     if _crash_auto_blocked:
         result.auto_blocked.extend(_crash_auto_blocked)
     # Rate-limited requeues (quota wall, no failure counted) — surface for
-    # telemetry / tests. These tasks went back to ``ready`` and the respawn
-    # guard will defer them until the quota window clears.
+    # telemetry / tests. These tasks returned to their source phase (or
+    # ``todo`` while stopped); the respawn guard defers them until the quota
+    # window clears after resume.
     _crash_rate_limited = getattr(
         detect_crashed_workers, "_last_rate_limited", []
     )
