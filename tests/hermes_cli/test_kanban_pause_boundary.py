@@ -2,7 +2,10 @@ import builtins
 import contextlib
 import inspect
 import json
+import os
+import shutil
 import subprocess
+import sys
 import threading
 
 import pytest
@@ -1092,17 +1095,29 @@ def test_dispatch_brake_intact_symlink_entry_blocks(tmp_path, monkeypatch, brake
 
 
 @pytest.mark.parametrize("brake_name", ["dispatch_pause.json", "halt.json"])
-def test_dispatch_brake_lstat_error_fails_closed(tmp_path, monkeypatch, brake_name):
+def test_dispatch_brake_lookup_error_fails_closed(
+    tmp_path, monkeypatch, brake_name
+):
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     target = tmp_path / "state" / brake_name
     real_lstat = kb.os.lstat
+    real_stat = kb.os.stat
 
     def unreadable_entry(path):
         if path == target:
             raise PermissionError("dispatch state unavailable")
         return real_lstat(path)
 
+    def unreadable_anchored_entry(path, *args, **kwargs):
+        if (
+            kwargs.get("dir_fd") is not None
+            and os.fspath(path) == brake_name
+        ):
+            raise PermissionError("dispatch state unavailable")
+        return real_stat(path, *args, **kwargs)
+
     monkeypatch.setattr(kb.os, "lstat", unreadable_entry)
+    monkeypatch.setattr(kb.os, "stat", unreadable_anchored_entry)
 
     assert kb.dispatch_is_paused() is True
 
@@ -1192,6 +1207,7 @@ def test_brake_entry_appearing_after_initial_enoent_still_blocks(
     target = state / "dispatch_pause.json"
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     real_lstat = kb.os.lstat
+    real_stat = kb.os.stat
     first_lookup = True
 
     def brake_appears_during_lookup(path):
@@ -1202,7 +1218,20 @@ def test_brake_entry_appearing_after_initial_enoent_still_blocks(
             raise FileNotFoundError("raced with brake creation")
         return real_lstat(path)
 
+    def brake_appears_during_anchored_lookup(path, *args, **kwargs):
+        nonlocal first_lookup
+        if (
+            kwargs.get("dir_fd") is not None
+            and os.fspath(path) == target.name
+            and first_lookup
+        ):
+            first_lookup = False
+            target.mkdir()
+            raise FileNotFoundError("raced with brake creation")
+        return real_stat(path, *args, **kwargs)
+
     monkeypatch.setattr(kb.os, "lstat", brake_appears_during_lookup)
+    monkeypatch.setattr(kb.os, "stat", brake_appears_during_anchored_lookup)
 
     assert kb.dispatch_is_paused() is True
 
@@ -1216,12 +1245,15 @@ def test_brake_created_during_final_state_snapshot_still_blocks(
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     real_lstat = kb.os.lstat
     state_lookups = 0
+    final_state_lookup = (
+        3 if kb._supports_anchored_dispatch_state_read() else 4
+    )
 
     def brake_appears_during_final_snapshot(path):
         nonlocal state_lookups
         if path == state:
             state_lookups += 1
-            if state_lookups == 4:
+            if state_lookups == final_state_lookup:
                 target.write_text("{}\n", encoding="utf-8")
         return real_lstat(path)
 
@@ -1231,6 +1263,137 @@ def test_brake_created_during_final_state_snapshot_still_blocks(
 
     assert kb.dispatch_is_paused() is True
     assert target.is_file()
+
+
+@pytest.mark.linux_only
+def test_dispatch_state_read_anchors_real_bind_mount_swaps(tmp_path):
+    """A real temporary state mount cannot hide either dispatch brake."""
+    unshare = shutil.which("unshare")
+    mount = shutil.which("mount")
+    umount = shutil.which("umount")
+    if not unshare or not mount or not umount:
+        pytest.skip("unshare, mount, and umount are required")
+
+    root = tmp_path / "shared-root"
+    state = root / "state"
+    state.mkdir(parents=True)
+    halt = state / "halt.json"
+    halt.write_text("{}\n", encoding="utf-8")
+    empty_state = tmp_path / "empty-state"
+    empty_state.mkdir()
+    child = r'''
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root = Path(sys.argv[1])
+state = root / "state"
+empty_state = Path(sys.argv[2])
+mount = sys.argv[3]
+umount = sys.argv[4]
+pause = state / "dispatch_pause.json"
+halt = state / "halt.json"
+subprocess.run([mount, "--make-rprivate", "/"], check=True)
+os.environ["HERMES_KANBAN_HOME"] = str(root)
+
+from hermes_cli import kanban_db as kb
+
+# Reproduce the former path race with real mounts: every leaf lookup sees the
+# empty mount, while both directory snapshots see the restored original.
+before = kb._dispatch_state_snapshot(state)
+real_lstat = os.lstat
+path_swaps = 0
+
+def lstat_through_temporary_mount(path, *args, **kwargs):
+    global path_swaps
+    if Path(path) not in (pause, halt):
+        return real_lstat(path, *args, **kwargs)
+    subprocess.run([mount, "--bind", str(empty_state), str(state)], check=True)
+    try:
+        return real_lstat(path, *args, **kwargs)
+    finally:
+        subprocess.run([umount, str(state)], check=True)
+        path_swaps += 1
+
+os.lstat = lstat_through_temporary_mount
+try:
+    old_paused = (
+        before is None
+        or kb._dispatch_brake_entry_exists(pause)
+        or kb._dispatch_brake_entry_exists(halt)
+        or kb._dispatch_state_snapshot(state) != before
+    )
+finally:
+    os.lstat = real_lstat
+
+# A mount already present when the state directory is opened has a different
+# Linux mount identity and must fail closed even though it hides the brake.
+subprocess.run([mount, "--bind", str(empty_state), str(state)], check=True)
+try:
+    mounted_paused = kb.dispatch_is_paused()
+finally:
+    subprocess.run([umount, str(state)], check=True)
+
+# If the mount arrives only around each leaf read, the retained state handle
+# still names the original directory and therefore still sees halt.json.
+real_optional_entry_info = kb._dispatch_optional_entry_info
+anchored_swaps = 0
+
+def anchored_read_through_temporary_mount(parent_fd, name):
+    global anchored_swaps
+    if name not in (pause.name, halt.name):
+        return real_optional_entry_info(parent_fd, name)
+    subprocess.run([mount, "--bind", str(empty_state), str(state)], check=True)
+    try:
+        return real_optional_entry_info(parent_fd, name)
+    finally:
+        subprocess.run([umount, str(state)], check=True)
+        anchored_swaps += 1
+
+kb._dispatch_optional_entry_info = anchored_read_through_temporary_mount
+anchored_paused = kb.dispatch_is_paused()
+
+print(json.dumps({
+    "old_paused": old_paused,
+    "mounted_paused": mounted_paused,
+    "anchored_paused": anchored_paused,
+    "path_swaps": path_swaps,
+    "anchored_swaps": anchored_swaps,
+    "halt_present": halt.is_file(),
+}))
+'''
+    result = subprocess.run(
+        [
+            unshare,
+            "-Ur",
+            "-m",
+            sys.executable,
+            "-c",
+            child,
+            str(root),
+            str(empty_state),
+            mount,
+            umount,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 and "Operation not permitted" in result.stderr:
+        pytest.skip("this Linux host disables unprivileged mount namespaces")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.splitlines()[-1])
+
+    assert payload == {
+        "old_paused": False,
+        "mounted_paused": True,
+        "anchored_paused": True,
+        "path_swaps": 4,
+        "anchored_swaps": 2,
+        "halt_present": True,
+    }
+    assert halt.is_file()
 
 
 def test_halt_uses_shared_root_from_profile_home(tmp_path, monkeypatch):

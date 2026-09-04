@@ -778,6 +778,197 @@ def _dispatch_state_snapshot(state_dir: Path) -> Optional[tuple[Any, ...]]:
     )
 
 
+def _supports_anchored_dispatch_state_read() -> bool:
+    """Return whether brake reads can stay below open directories."""
+    supports_dir_fd = getattr(os, "supports_dir_fd", set())
+    return (
+        os.name != "nt"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and os.open in supports_dir_fd
+        and os.stat in supports_dir_fd
+    )
+
+
+def _dispatch_directory_open_flags() -> int:
+    """Open a real directory without following its final path component."""
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _dispatch_stat_identity(info: object) -> tuple[Any, ...]:
+    """Return the stable identity fields for an open dispatch directory."""
+    return (
+        getattr(info, "st_dev", None),
+        getattr(info, "st_ino", None),
+        getattr(info, "st_mode", None),
+    )
+
+
+def _dispatch_stat_fingerprint(info: object) -> tuple[Any, ...]:
+    """Include directory-change fields used to catch late brake writes."""
+    return (
+        *_dispatch_stat_identity(info),
+        getattr(info, "st_mtime_ns", None),
+        getattr(info, "st_ctime_ns", None),
+        getattr(info, "st_size", None),
+        getattr(info, "st_nlink", None),
+    )
+
+
+def _dispatch_optional_entry_info(parent_fd: int, name: str) -> object | None:
+    """Read one entry below an open directory, retrying absence once."""
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        try:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+
+def _dispatch_fd_mount_id(fd: int) -> int | None:
+    """Return the Linux mount identity for an already-open directory."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        lines = Path(f"/proc/self/fdinfo/{fd}").read_text(
+            encoding="utf-8",
+            errors="strict",
+        ).splitlines()
+        values = [
+            line.partition(":")[2].strip()
+            for line in lines
+            if line.startswith("mnt_id:")
+        ]
+        if len(values) != 1:
+            raise ValueError("missing or repeated mount ID")
+        return int(values[0])
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise OSError(
+            "dispatch-state mount identity could not be checked safely"
+        ) from exc
+
+
+def _dispatch_state_shares_root_mount(root_fd: int, state_fd: int) -> bool:
+    """Reject mounted state folders, including same-filesystem bind mounts."""
+    root_info = os.fstat(root_fd)
+    state_info = os.fstat(state_fd)
+    if getattr(root_info, "st_dev", None) != getattr(
+        state_info,
+        "st_dev",
+        None,
+    ):
+        return False
+    root_mount_id = _dispatch_fd_mount_id(root_fd)
+    state_mount_id = _dispatch_fd_mount_id(state_fd)
+    return root_mount_id is None or state_mount_id == root_mount_id
+
+
+def _anchored_dispatch_brakes_present(
+    state_dir: Path,
+    brake_names: tuple[str, ...],
+    expected_snapshot: tuple[Any, ...],
+) -> Optional[bool]:
+    """Read both brakes through a fixed, unmounted state-directory handle.
+
+    ``None`` means the shared root is genuinely absent and the caller should
+    use its path-snapshot fallback. Every unsafe or changing state returns
+    ``True`` (paused), while ``False`` means both anchored leaf reads and all
+    identity checks proved stable absence.
+    """
+    root = state_dir.parent
+    try:
+        physical_root = root.resolve(strict=True)
+    except FileNotFoundError:
+        return None
+    except (OSError, RuntimeError):
+        return True
+
+    try:
+        expected_root = os.stat(physical_root, follow_symlinks=False)
+    except OSError:
+        return True
+    if (
+        not stat_module.S_ISDIR(expected_root.st_mode)
+        or stat_module.S_ISLNK(expected_root.st_mode)
+    ):
+        return True
+
+    root_fd: int | None = None
+    state_fd: int | None = None
+    try:
+        root_fd = os.open(physical_root, _dispatch_directory_open_flags())
+        opened_root = os.fstat(root_fd)
+        root_identity = _dispatch_stat_identity(opened_root)
+        root_fingerprint = _dispatch_stat_fingerprint(opened_root)
+        if (
+            not stat_module.S_ISDIR(opened_root.st_mode)
+            or root_fingerprint != _dispatch_stat_fingerprint(expected_root)
+            or _dispatch_stat_identity(os.stat(root)) != root_identity
+            or _dispatch_state_snapshot(state_dir) != expected_snapshot
+        ):
+            return True
+
+        state_info = _dispatch_optional_entry_info(root_fd, state_dir.name)
+        if state_info is None:
+            return (
+                _dispatch_stat_fingerprint(os.fstat(root_fd))
+                != root_fingerprint
+                or _dispatch_stat_identity(os.stat(root)) != root_identity
+            )
+        if (
+            not stat_module.S_ISDIR(state_info.st_mode)
+            or stat_module.S_ISLNK(state_info.st_mode)
+        ):
+            return True
+
+        state_fd = os.open(
+            state_dir.name,
+            _dispatch_directory_open_flags(),
+            dir_fd=root_fd,
+        )
+        opened_state = os.fstat(state_fd)
+        state_fingerprint = _dispatch_stat_fingerprint(opened_state)
+        if (
+            not stat_module.S_ISDIR(opened_state.st_mode)
+            or state_fingerprint != _dispatch_stat_fingerprint(state_info)
+            or not _dispatch_state_shares_root_mount(root_fd, state_fd)
+        ):
+            return True
+
+        for brake_name in brake_names:
+            if _dispatch_optional_entry_info(state_fd, brake_name) is not None:
+                return True
+
+        final_state_info = _dispatch_optional_entry_info(
+            root_fd,
+            state_dir.name,
+        )
+        return (
+            _dispatch_stat_fingerprint(os.fstat(state_fd))
+            != state_fingerprint
+            or final_state_info is None
+            or _dispatch_stat_fingerprint(final_state_info)
+            != state_fingerprint
+            or not _dispatch_state_shares_root_mount(root_fd, state_fd)
+            or _dispatch_stat_fingerprint(os.fstat(root_fd))
+            != root_fingerprint
+            or _dispatch_stat_identity(os.stat(root)) != root_identity
+        )
+    except (OSError, RuntimeError):
+        return True
+    finally:
+        if state_fd is not None:
+            os.close(state_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+
+
 def dispatch_is_paused() -> bool:
     """Fail closed while a shared-root dispatch pause or full halt exists."""
     try:
@@ -789,10 +980,20 @@ def dispatch_is_paused() -> bool:
         before = _dispatch_state_snapshot(state_dir)
         if before is None:
             return True
-        if (
-            _dispatch_brake_entry_exists(pause_path)
-            or _dispatch_brake_entry_exists(halt_path)
-        ):
+        anchored_result: Optional[bool] = None
+        if _supports_anchored_dispatch_state_read():
+            anchored_result = _anchored_dispatch_brakes_present(
+                state_dir,
+                (pause_path.name, halt_path.name),
+                before,
+            )
+        if anchored_result is None:
+            if (
+                _dispatch_brake_entry_exists(pause_path)
+                or _dispatch_brake_entry_exists(halt_path)
+            ):
+                return True
+        elif anchored_result:
             return True
         # Detect an ancestor replacement during the two child lookups.  A
         # changed state directory is not proof that both brakes were absent.
@@ -1261,17 +1462,29 @@ raise SystemExit(0 if ok else 1)
                 }
                 target = targets[target_kind]
                 real_lstat = os.lstat
+                real_stat = os.stat
 
                 def failed_lstat(path, *args, **kwargs):
                     if Path(path) == target:
                         raise PermissionError("dispatch lookup denied")
                     return real_lstat(path, *args, **kwargs)
 
+                def failed_stat(path, *args, **kwargs):
+                    if (
+                        target_kind == "brake"
+                        and kwargs.get("dir_fd") is not None
+                        and os.fspath(path) == target.name
+                    ):
+                        raise PermissionError("dispatch lookup denied")
+                    return real_stat(path, *args, **kwargs)
+
                 os.lstat = failed_lstat
+                os.stat = failed_stat
                 try:
                     return _probe(root)
                 finally:
                     os.lstat = real_lstat
+                    os.stat = real_stat
 
             def _stat_failure_case() -> bool:
                 target = _root(base, "lookup-error-stat-target")
