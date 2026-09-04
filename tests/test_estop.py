@@ -928,6 +928,28 @@ def test_cli_resume_disengages(hermes_home, capsys):
     assert "resumed" in capsys.readouterr().out.lower()
 
 
+@pytest.mark.parametrize("brake_name", ["dispatch_pause.json", "halt.json"])
+def test_cli_resume_reports_remaining_kanban_brake(
+    hermes_home, capsys, brake_name
+):
+    from hermes_cli.subcommands.pause import cmd_resume
+
+    estop.engage(reason="maintenance")
+    brake = hermes_home / "state" / brake_name
+    brake.parent.mkdir()
+    brake.write_text("{}\n", encoding="utf-8")
+
+    rc = cmd_resume(argparse.Namespace())
+
+    output = capsys.readouterr().out.lower()
+    assert rc == 0
+    assert estop.is_engaged() is False
+    assert brake.is_file()
+    assert "emergency stop removed" in output
+    assert "kanban dispatch is still paused" in output
+    assert "dispatch picks up" not in output
+
+
 def test_cli_resume_when_not_paused(hermes_home, capsys):
     from hermes_cli.subcommands.pause import cmd_resume
 
@@ -1077,6 +1099,28 @@ async def test_gateway_pause_command_engages_and_resumes(hermes_home):
 
     reply = await runner._handle_pause_command(_FakePauseEvent("off"))
     assert "wasn't paused" in reply.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("brake_name", ["dispatch_pause.json", "halt.json"])
+async def test_gateway_pause_off_reports_remaining_kanban_brake(
+    hermes_home, brake_name
+):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    estop.engage(reason="maintenance")
+    brake = hermes_home / "state" / brake_name
+    brake.parent.mkdir()
+    brake.write_text("{}\n", encoding="utf-8")
+
+    reply = await runner._handle_pause_command(_FakePauseEvent("off"))
+
+    assert estop.is_engaged() is False
+    assert brake.is_file()
+    assert "emergency stop removed" in reply.lower()
+    assert "kanban dispatch is still paused" in reply.lower()
+    assert "new work is accepted again" not in reply.lower()
 
 
 @pytest.mark.asyncio

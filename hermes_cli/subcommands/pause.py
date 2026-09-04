@@ -3,8 +3,8 @@
 ``hermes pause`` writes the ESTOP sentinel at ``<shared-root>/ESTOP``. The
 default profile and every named profile use that same global stop, which halts
 cron dispatch, kanban dispatch, and new gateway turns on their next check.
-In-flight work is never killed. ``hermes resume`` removes the sentinel and
-normal operation resumes on the next tick — no restart needed.
+In-flight work is never killed. ``hermes resume`` removes the sentinel with no
+restart needed; a separate kanban dispatch pause or full halt remains in force.
 
 Ported from: gastownhall/gastown estop.go (MIT); related prior art:
 #26778 (/panic — kill/exit semantics, different), #44617.
@@ -50,6 +50,25 @@ def cmd_resume(args: argparse.Namespace) -> int:
         print(f"Hermes is still paused — {exc}.", file=sys.stderr)
         print(f"    sentinel: {sentinel_path()}", file=sys.stderr)
         return 1
+    try:
+        from hermes_cli.kanban_db import dispatch_is_paused
+        kanban_still_paused = dispatch_is_paused()
+    except Exception:
+        kanban_still_paused = True
+    if kanban_still_paused:
+        if removed:
+            print(
+                "▶️  Emergency stop removed. Cron and new gateway turns may "
+                "resume, but kanban dispatch is still paused by its manual "
+                "pause, full halt, or unreadable brake state."
+            )
+        else:
+            print(
+                "Hermes had no emergency stop, but kanban dispatch is still "
+                "paused by its manual pause, full halt, or unreadable brake "
+                "state."
+            )
+        return 0
     if removed:
         print("▶️  Hermes resumed — dispatch picks up on the next tick.")
         return 0
@@ -78,6 +97,9 @@ def build_pause_parser(subparsers) -> None:
     resume_parser = subparsers.add_parser(
         "resume",
         help="Lift the emergency stop set by `hermes pause`",
-        description="Remove the ESTOP sentinel; dispatch resumes on the next tick.",
+        description=(
+            "Remove the ESTOP sentinel. A separate kanban dispatch pause or "
+            "full halt remains in force."
+        ),
     )
     resume_parser.set_defaults(func=cmd_resume)

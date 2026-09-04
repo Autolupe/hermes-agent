@@ -16279,6 +16279,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 removed = estop.disengage()
             except estop.DisengageError as exc:
                 return f"⏸️ Hermes is still paused — {exc}."
+            try:
+                from hermes_cli.kanban_db import dispatch_is_paused
+                kanban_still_paused = dispatch_is_paused()
+            except Exception:
+                kanban_still_paused = True
+            if kanban_still_paused:
+                if removed:
+                    return (
+                        "▶️ Emergency stop removed. Cron and new gateway turns "
+                        "may resume, but kanban dispatch is still paused by its "
+                        "manual pause, full halt, or unreadable brake state."
+                    )
+                return (
+                    "Hermes had no emergency stop, but kanban dispatch is still "
+                    "paused by its manual pause, full halt, or unreadable brake "
+                    "state."
+                )
             if removed:
                 return "▶️ Resumed — new work is accepted again."
             return "Hermes wasn't paused."
