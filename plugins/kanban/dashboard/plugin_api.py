@@ -1242,6 +1242,11 @@ def _set_status_direct_guarded(
             # A brake raised by a trace hook or concurrent operator during the
             # writes rolls the task update and its audit event back together.
             kanban_db._raise_if_dispatch_paused()
+    if effective_status in {"ready", "review"}:
+        kanban_db._park_runnable_transitions_after_commit(
+            conn,
+            ((task_id, effective_status, "status"),),
+        )
     for pid, claim_lock in terminations:
         kanban_db._terminate_reclaimed_worker(pid, claim_lock)
     # If we re-opened something, children may have gone stale.

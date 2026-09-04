@@ -365,6 +365,59 @@ def test_dashboard_ready_move_rolls_back_when_stop_arrives_during_write(
         ).fetchone()[0] == status_events_before
 
 
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_dashboard_ready_move_parks_when_stop_arrives_on_commit(
+    client, kanban_home, monkeypatch, brake
+):
+    """A dashboard move committed at the stop edge is parked before return."""
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(kanban_home))
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "dashboard commit-edge stop"},
+    ).json()["task"]
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "todo"},
+    )
+    assert response.status_code == 200, response.text
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+
+    with kb.connect() as conn:
+        stop_created = False
+        brake_path = None
+
+        def stop_on_commit(statement):
+            nonlocal brake_path, stop_created
+            if not stop_created and statement.strip().lower() == "commit":
+                stop_created = True
+                brake_path = _engage_dashboard_brake(kanban_home, brake)
+
+        conn.set_trace_callback(stop_on_commit)
+        try:
+            assert plugin._set_status_direct(conn, task["id"], "ready") is True
+        finally:
+            conn.set_trace_callback(None)
+
+        parked = kb.get_task(conn, task["id"])
+        assert stop_created is True
+        assert parked is not None and parked.status == "todo"
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'dispatch_parked' "
+            "ORDER BY id DESC LIMIT 1",
+            (task["id"],),
+        ).fetchone()
+        assert event is not None
+        payload = json.loads(event["payload"])
+        assert payload["source_event"] == "status"
+        assert payload["resume_status"] == "ready"
+
+        assert brake_path is not None
+        brake_path.unlink()
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, task["id"]).status == "ready"
+
+
 def test_reopening_parent_demotes_ready_child(client):
     """Reopening a completed parent must invalidate ready children immediately.
 

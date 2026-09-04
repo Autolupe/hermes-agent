@@ -425,6 +425,135 @@ def test_stop_engaged_during_direct_runnable_write_rolls_back(
     conn.close()
 
 
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "create",
+        "promote",
+        "unblock",
+        "reopen_review",
+        "request_review",
+        "request_changes",
+    ],
+)
+def test_stop_on_direct_runnable_commit_parks_before_return(
+    tmp_path, monkeypatch, brake, operation
+):
+    """A brake created by SQLite's COMMIT hook leaves no runnable card."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+
+    task_id = None
+    expected_resume_status = (
+        "review" if operation == "request_review" else "ready"
+    )
+    expected_source_event = {
+        "create": "created",
+        "promote": "promoted_manual",
+        "unblock": "unblocked",
+        "reopen_review": "review_reopened",
+        "request_review": "review_requested",
+        "request_changes": "changes_requested",
+    }[operation]
+    expected_run_id = None
+
+    if operation == "promote":
+        task_id = kb.create_task(conn, title="commit-edge promote", triage=True)
+        conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+        conn.commit()
+    elif operation == "unblock":
+        task_id = kb.create_task(
+            conn,
+            title="commit-edge unblock",
+            initial_status="blocked",
+        )
+    elif operation == "reopen_review":
+        task_id = kb.create_task(
+            conn,
+            title="commit-edge reopen",
+            assignee="builder",
+        )
+        assert kb.request_review(conn, task_id, reviewer="reviewer")
+    elif operation == "request_review":
+        task_id = kb.create_task(
+            conn,
+            title="commit-edge review request",
+            assignee="builder",
+        )
+    elif operation == "request_changes":
+        task_id = kb.create_task(
+            conn,
+            title="commit-edge changes",
+            assignee="builder",
+        )
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            task_id,
+            reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        review_run = kb.claim_review_task(conn, task_id)
+        assert review_run is not None
+        expected_run_id = review_run.current_run_id
+
+    stop_created = False
+    brake_path = None
+
+    def stop_on_commit(statement):
+        nonlocal brake_path, stop_created
+        if not stop_created and statement.strip().lower() == "commit":
+            stop_created = True
+            brake_path = _engage_brake(tmp_path, monkeypatch, brake)
+
+    conn.set_trace_callback(stop_on_commit)
+    try:
+        if operation == "create":
+            task_id = kb.create_task(conn, title="commit-edge create")
+        elif operation == "promote":
+            assert kb.promote_task(conn, task_id, actor="test") == (True, None)
+        elif operation == "unblock":
+            assert kb.unblock_task(conn, task_id) is True
+        elif operation == "reopen_review":
+            assert kb.reopen_review_task(conn, task_id) is True
+        elif operation == "request_review":
+            assert kb.request_review(
+                conn,
+                task_id,
+                reviewer="reviewer",
+            ) is True
+        else:
+            assert kb.request_changes(
+                conn,
+                task_id,
+                reason="commit-edge rework",
+                expected_run_id=expected_run_id,
+            ) == (True, "builder")
+    finally:
+        conn.set_trace_callback(None)
+
+    assert stop_created is True
+    assert task_id is not None
+    task = kb.get_task(conn, task_id)
+    assert task is not None and task.status == "todo"
+    payload = _latest_event_payload(conn, task_id, "dispatch_parked")
+    assert payload["source_event"] == expected_source_event
+    assert payload["resume_status"] == expected_resume_status
+    assert payload["parked_by_dispatch_brake"] is True
+
+    assert brake_path is not None
+    brake_path.unlink()
+    assert kb.recompute_ready(conn) >= 1
+    resumed = kb.get_task(conn, task_id)
+    assert resumed is not None and resumed.status == expected_resume_status
+    conn.close()
+
+
 def test_estop_blocks_ready_and_review_claims_without_run_rows(
     tmp_path, monkeypatch
 ):
@@ -609,6 +738,73 @@ def test_stop_engaged_during_claim_writes_rolls_back_transaction(
         "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'claimed'",
         (task_id,),
     ).fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_stop_on_claim_commit_releases_and_parks_before_return(
+    tmp_path, monkeypatch, lane, brake
+):
+    """A brake created by SQLite's COMMIT hook prevents claim success."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(
+        conn,
+        title=f"{lane} claim commit stop",
+        assignee="default",
+    )
+    if lane == "review":
+        conn.execute(
+            "UPDATE tasks SET status = 'review' WHERE id = ?",
+            (task_id,),
+        )
+        conn.commit()
+
+    lifecycle_calls = []
+    monkeypatch.setattr(
+        kb,
+        "_fire_kanban_lifecycle_hook",
+        lambda *args, **kwargs: lifecycle_calls.append((args, kwargs)),
+    )
+    stop_created = False
+
+    def stop_on_claim_commit(statement):
+        nonlocal stop_created
+        if not stop_created and statement.strip().lower() == "commit":
+            stop_created = True
+            _engage_brake(tmp_path, monkeypatch, brake)
+
+    conn.set_trace_callback(stop_on_claim_commit)
+    try:
+        claim = kb.claim_task if lane == "ready" else kb.claim_review_task
+        outcome = claim(conn, task_id)
+    finally:
+        conn.set_trace_callback(None)
+
+    task = kb.get_task(conn, task_id)
+    run = conn.execute(
+        "SELECT status, outcome, ended_at, claim_lock "
+        "FROM task_runs WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    assert stop_created is True
+    assert outcome is None
+    assert lifecycle_calls == []
+    assert task is not None and task.status == "todo"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert run is not None
+    assert (run["status"], run["outcome"]) == ("reclaimed", "reclaimed")
+    assert run["ended_at"] is not None
+    assert run["claim_lock"] is None
+    payload = _latest_event_payload(conn, task_id, "dispatch_paused")
+    assert payload["boundary"] == "claim_commit"
+    assert payload["resume_status"] == lane
+    assert payload["parked_by_dispatch_brake"] is True
     conn.close()
 
 
@@ -916,6 +1112,49 @@ def test_stop_engaged_during_ready_promotion_writes_rolls_back_transaction(
         "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'promoted'",
         (task_id,),
     ).fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.parametrize("brake", ["dispatch_pause", "halt", "estop"])
+def test_stop_on_ready_promotion_commit_parks_before_return(
+    tmp_path, monkeypatch, brake
+):
+    """A brake created by promotion COMMIT compensates back to todo."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    task_id = kb.create_task(conn, title="promotion commit", triage=True)
+    conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
+    conn.commit()
+    stop_created = False
+    brake_path = None
+
+    def stop_on_commit(statement):
+        nonlocal brake_path, stop_created
+        if not stop_created and statement.strip().lower() == "commit":
+            stop_created = True
+            brake_path = _engage_brake(tmp_path, monkeypatch, brake)
+
+    conn.set_trace_callback(stop_on_commit)
+    try:
+        assert kb.recompute_ready(conn) == 1
+    finally:
+        conn.set_trace_callback(None)
+
+    task = kb.get_task(conn, task_id)
+    assert stop_created is True
+    assert task is not None and task.status == "todo"
+    payload = _latest_event_payload(conn, task_id, "dispatch_parked")
+    assert payload["source_event"] == "promoted"
+    assert payload["resume_status"] == "ready"
+    assert payload["parked_by_dispatch_brake"] is True
+
+    assert brake_path is not None
+    brake_path.unlink()
+    assert kb.recompute_ready(conn) == 1
+    assert kb.get_task(conn, task_id).status == "ready"
     conn.close()
 
 

@@ -1244,9 +1244,8 @@ def _park_retry_transitions_locked(
     parked: set[str] = set()
     for task_id, retry_status, source_event in transitions:
         cur = conn.execute(
-            "UPDATE tasks SET status = 'todo' "
-            "WHERE id = ? AND status IN ('ready', 'review')",
-            (task_id,),
+            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = ?",
+            (task_id, retry_status),
         )
         if cur.rowcount != 1:
             continue
@@ -1265,7 +1264,7 @@ def _park_retry_transitions_locked(
     return parked
 
 
-def _park_retry_transitions_after_commit(
+def _park_runnable_transitions_after_commit(
     conn: sqlite3.Connection,
     transitions: Iterable[tuple[str, str, str]],
 ) -> set[str]:
@@ -1292,6 +1291,14 @@ def _park_retry_transitions_after_commit(
         with write_txn(conn):
             return _park_retry_transitions_locked(conn, pending)
     return set()
+
+
+def _park_retry_transitions_after_commit(
+    conn: sqlite3.Connection,
+    transitions: Iterable[tuple[str, str, str]],
+) -> set[str]:
+    """Backward-compatible name for recovery-path commit compensation."""
+    return _park_runnable_transitions_after_commit(conn, transitions)
 
 
 def _dispatch_brake_description() -> str:
@@ -5128,6 +5135,7 @@ def create_task(
             return row["id"]
 
     now = int(time.time())
+    caller_owns_txn = bool(getattr(conn, "in_transaction", False))
 
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
@@ -5289,6 +5297,11 @@ def create_task(
                     # INSERT/event writes. Roll the whole creation back rather
                     # than commit newly runnable work.
                     _raise_if_dispatch_paused()
+            if not caller_owns_txn and task_status in {"ready", "review"}:
+                _park_runnable_transitions_after_commit(
+                    conn,
+                    ((task_id, resume_status, "created"),),
+                )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -6289,6 +6302,7 @@ def recompute_ready(
     if require_dispatch_allowed:
         _raise_if_dispatch_paused()
     promoted = 0
+    runnable_transitions: list[tuple[str, str, str]] = []
     with write_txn(conn):
         if require_dispatch_allowed:
             _raise_if_dispatch_paused()
@@ -6345,8 +6359,14 @@ def recompute_ready(
                     {"status": resume_status} if resume_status != "ready" else None,
                 )
                 promoted += 1
+                if resume_status in {"ready", "review"}:
+                    runnable_transitions.append(
+                        (task_id, resume_status, "promoted")
+                    )
         if require_dispatch_allowed:
             _raise_if_dispatch_paused()
+    if require_dispatch_allowed:
+        _park_runnable_transitions_after_commit(conn, runnable_transitions)
     return promoted
 
 
@@ -6373,6 +6393,29 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "AND p.status NOT IN ('done', 'archived') LIMIT 1",
         (task_id,),
     ).fetchone() is None
+
+
+def _claim_survives_commit_boundary(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    claim_lock: str,
+    run_id: int,
+) -> bool:
+    """Undo a claim if a brake arrived during SQLite's actual COMMIT."""
+    try:
+        _raise_if_dispatch_paused()
+    except DispatchPausedError:
+        _release_paused_claim(
+            conn,
+            task_id,
+            summary="dispatch paused during claim commit",
+            payload_extra={"boundary": "claim_commit"},
+            expected_claim_lock=claim_lock,
+            expected_run_id=run_id,
+        )
+        return False
+    return True
 
 
 def claim_task(
@@ -6502,6 +6545,13 @@ def claim_task(
         claim_completed = True
     if not claim_completed:
         return None
+    if not _claim_survives_commit_boundary(
+        conn,
+        task_id,
+        claim_lock=lock,
+        run_id=run_id,
+    ):
+        return None
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -6613,6 +6663,13 @@ def claim_review_task(
         _raise_if_dispatch_paused()
         claim_completed = True
     if not claim_completed:
+        return None
+    if not _claim_survives_commit_boundary(
+        conn,
+        task_id,
+        claim_lock=lock,
+        run_id=run_id,
+    ):
         return None
     return claimed
 
@@ -8504,6 +8561,11 @@ def request_review(
         )
         if landing_status == "review":
             _raise_if_dispatch_paused()
+    if landing_status == "review":
+        _park_runnable_transitions_after_commit(
+            conn,
+            ((task_id, "review", "review_requested"),),
+        )
     return _ret(True)
 
 
@@ -8634,6 +8696,11 @@ def request_changes(
         )
         if new_status in {"ready", "review"}:
             _raise_if_dispatch_paused()
+    if new_status in {"ready", "review"}:
+        _park_runnable_transitions_after_commit(
+            conn,
+            ((task_id, new_status, "changes_requested"),),
+        )
     return True, implementer
 
 
@@ -8710,6 +8777,10 @@ def promote_task(
     except DispatchPausedError as exc:
         return False, str(exc)
 
+    _park_runnable_transitions_after_commit(
+        conn,
+        ((task_id, "ready", "promoted_manual"),),
+    )
     return True, None
 
 
@@ -8831,7 +8902,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if new_status in {"ready", "review"}:
             _raise_if_dispatch_paused()
-        return True
+    if new_status in {"ready", "review"}:
+        _park_runnable_transitions_after_commit(
+            conn,
+            ((task_id, new_status, "unblocked"),),
+        )
+    return True
 
 
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -8907,7 +8983,12 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if new_status in {"ready", "review"}:
             _raise_if_dispatch_paused()
-        return True
+    if new_status in {"ready", "review"}:
+        _park_runnable_transitions_after_commit(
+            conn,
+            ((task_id, new_status, "review_reopened"),),
+        )
+    return True
 
 
 def invalidate_descendants_for_parent_reopen(
@@ -12144,23 +12225,38 @@ def _release_paused_claim(
     event_kind: str = "dispatch_paused",
     summary: str = "dispatch paused before worker spawn",
     payload_extra: Optional[dict] = None,
+    expected_claim_lock: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> None:
     """Release a claimed task without counting a failure.
 
     Shared by the pause edge and the busy-worktree edge: both are "not now",
     never "this card is broken", so ``consecutive_failures`` stays untouched.
     A brake parks the task in ``todo`` with its source lane recorded; otherwise
-    a busy workspace returns directly to that lane.
+    a busy workspace returns directly to that lane. Optional expected claim
+    fields bind commit-edge compensation to the exact claim it just created.
     """
     now = int(time.time())
     with write_txn(conn):
         row = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'running'",
+            "SELECT current_run_id, claim_lock FROM tasks "
+            "WHERE id = ? AND status = 'running'",
             (task_id,),
         ).fetchone()
         if row is None:
             return
         run_id = row["current_run_id"]
+        claim_lock = row["claim_lock"]
+        if (
+            expected_run_id is not None
+            and run_id != int(expected_run_id)
+        ):
+            return
+        if (
+            expected_claim_lock is not None
+            and claim_lock != expected_claim_lock
+        ):
+            return
         retry_status = _retry_status_for_run(conn, task_id, run_id)
         if event_kind == "dispatch_paused":
             # The caller already observed a brake. Preserve that decision even
@@ -12171,19 +12267,41 @@ def _release_paused_claim(
             landing_status, parked_by_dispatch_brake = (
                 _park_runnable_status_if_dispatch_paused(retry_status)
             )
+        bind_exact_claim = (
+            expected_run_id is not None or expected_claim_lock is not None
+        )
+        claim_guard = (
+            " AND current_run_id IS ? AND claim_lock IS ?"
+            if bind_exact_claim
+            else ""
+        )
+        claim_params = (
+            (landing_status, task_id, run_id, claim_lock)
+            if bind_exact_claim
+            else (landing_status, task_id)
+        )
+        released = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL, current_run_id = NULL "
+            "WHERE id = ? AND status = 'running'" + claim_guard,
+            claim_params,
+        )
+        if released.rowcount != 1:
+            return
         if run_id is not None:
+            run_guard = " AND claim_lock IS ?" if bind_exact_claim else ""
+            run_params = (
+                (summary, now, run_id, claim_lock)
+                if bind_exact_claim
+                else (summary, now, run_id)
+            )
             conn.execute(
                 "UPDATE task_runs SET status = 'reclaimed', outcome = 'reclaimed', "
                 "summary = ?, ended_at = ?, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND ended_at IS NULL",
-                (summary, now, run_id),
+                "WHERE id = ? AND ended_at IS NULL" + run_guard,
+                run_params,
             )
-        conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
-            "worker_pid = NULL, current_run_id = NULL WHERE id = ? AND status = 'running'",
-            (landing_status, task_id),
-        )
         payload = {"retry_status": retry_status, "failure_counted": False}
         if payload_extra:
             payload.update(payload_extra)
