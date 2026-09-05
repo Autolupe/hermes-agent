@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -21,6 +22,219 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+_FOREGROUND_SCOPE_REGISTRATION_RETRY_SECONDS = 0.5
+_FOREGROUND_SCOPE_POST_REAP_RECHECK_SECONDS = 1.0
+_FOREGROUND_SCOPE_RETRY_INTERVAL_SECONDS = 0.05
+_FOREGROUND_SCOPE_WRAPPER_REAP_SECONDS = 2.0
+
+_GATEWAY_SYSTEMD_UNIT_RE = re.compile(
+    r"^hermes-gateway(?:-[a-z0-9][a-z0-9_-]{0,63})?\.service$"
+)
+_SERVE_SYSTEMD_UNIT_RE = re.compile(
+    r"^hermes-serve(?:-[a-z0-9][a-z0-9_-]{0,63})?\.service$"
+)
+
+
+def _is_gateway_service_unit_name(unit: str) -> bool:
+    """Return whether *unit* is a supported profile-scoped gateway service."""
+    return _GATEWAY_SYSTEMD_UNIT_RE.fullmatch(unit) is not None
+
+
+def _is_serve_service_unit_name(unit: str) -> bool:
+    """Return whether *unit* is a supported profile-scoped Serve service."""
+    return _SERVE_SYSTEMD_UNIT_RE.fullmatch(unit) is not None
+
+
+def _may_need_foreground_systemd_scope() -> bool:
+    """Cheaply identify runtimes that may need a transient worker scope.
+
+    Importing ``tools.process_registry`` restores its global registry and can
+    touch ``state.db``. Keep ordinary CLI callers and non-Linux hosts on the
+    direct path without importing that module. The definitive gateway marker
+    and PID identity check still happens inside process_registry after this
+    exact cgroup-name check.
+    """
+    if _IS_WINDOWS:
+        return False
+    try:
+        cgroup_text = Path("/proc/self/cgroup").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return False
+    for line in cgroup_text.splitlines():
+        for unit in line.strip().split("/"):
+            if (
+                unit == "hermes-dashboard.service"
+                or _is_serve_service_unit_name(unit)
+                or _is_gateway_service_unit_name(unit)
+            ):
+                return True
+    return False
+
+
+def _foreground_systemd_scope_argv(args: list[str]) -> tuple[list[str], str]:
+    """Isolate a supervised local command from its web-service cgroup.
+
+    ``hermes serve``, ``hermes dashboard``, and the gateway execute model-facing
+    foreground terminal commands through :class:`LocalEnvironment`, while
+    background commands go through ``tools.process_registry``. Reuse that
+    registry's probed transient-scope policy here so tests/builds cannot consume
+    the service's memory budget. The lazy import avoids the registry's existing
+    import of this module becoming a cycle at module-load time.
+
+    Returns ``(argv, unit_name)``. An empty unit name means the direct spawn
+    path is retained (interactive CLI, unsupported host, or unavailable user
+    systemd session).
+    """
+    if not _may_need_foreground_systemd_scope():
+        return args, ""
+
+    try:
+        from tools.process_registry import (
+            _build_systemd_scope_argv,
+            _is_gateway_service_unit_name as _registry_gateway_service_unit,
+            _is_supervised_gateway_process,
+            _supervised_runtime_owner,
+            _systemd_run_user_scope_available,
+            _systemd_scope_stop_propagation_available,
+        )
+
+        owner_unit, owner_is_user_unit = _supervised_runtime_owner()
+        if _registry_gateway_service_unit(owner_unit):
+            # Keep the gateway's existing marker + live-PID identity check;
+            # inherited gateway markers must not make descendants supervisors.
+            if not _is_supervised_gateway_process():
+                return args, ""
+        elif owner_unit not in (
+            "hermes-dashboard.service",
+        ) and not _is_serve_service_unit_name(owner_unit):
+            return args, ""
+        if not owner_is_user_unit:
+            logger.debug(
+                "Local foreground executor not isolated in a systemd scope "
+                "(%s is not proven to share the user systemd manager); "
+                "preserving direct spawn behavior.",
+                owner_unit,
+            )
+            return args, ""
+        if not _systemd_run_user_scope_available():
+            logger.debug(
+                "Local foreground executor not isolated in a systemd scope "
+                "(systemd-run --user unavailable); worker shares the "
+                "supervised runtime cgroup."
+            )
+            return args, ""
+        if not _systemd_scope_stop_propagation_available():
+            logger.debug(
+                "Local foreground executor not isolated in a systemd scope "
+                "(systemd lacks StopPropagatedFrom support); preserving "
+                "direct spawn behavior across owner restarts."
+            )
+            return args, ""
+
+        unit_suffix = f"foreground-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+        scoped_args = _build_systemd_scope_argv(
+            args,
+            unit_suffix=unit_suffix,
+            binds_to_unit=owner_unit,
+            stop_propagated_from_unit=owner_unit,
+        )
+        if scoped_args == args:
+            return args, ""
+        return scoped_args, f"hermes-worker-{unit_suffix}.scope"
+    except Exception as exc:
+        # Isolation is best-effort on hosts without a usable user systemd
+        # session. Preserve the established direct foreground behavior.
+        logger.debug("Could not prepare foreground systemd scope: %s", exc)
+        return args, ""
+
+
+def _stop_foreground_systemd_scope(proc, unit_name: str) -> bool:
+    """Stop and re-check a foreground scope without a registration race.
+
+    ``systemd-run`` can be interrupted before its unique scope is visible to
+    ``systemctl``. Retry an absent result briefly while the wrapper is alive,
+    terminate and reap that wrapper, then always check the unit again. If the
+    first phase never observed registration, keep retrying the final check for
+    one bounded manager-drain window so a late D-Bus request cannot strand the
+    real command.
+    """
+    try:
+        from tools.process_registry import (
+            _SYSTEMD_UNIT_ABSENT,
+            _SYSTEMD_UNIT_FAILED,
+            _SYSTEMD_UNIT_STOPPED,
+            _stop_systemd_unit_status,
+        )
+    except Exception as exc:
+        logger.debug(
+            "Could not load foreground systemd scope cleanup for %s: %s",
+            unit_name,
+            exc,
+        )
+        return False
+
+    def _stop_with_absent_retry(
+        retry_seconds: float, *, while_wrapper_alive: bool
+    ) -> str:
+        deadline = time.monotonic() + max(0.0, retry_seconds)
+        status = _stop_systemd_unit_status(unit_name, aggressive=True)
+        while status == _SYSTEMD_UNIT_ABSENT and time.monotonic() < deadline:
+            if while_wrapper_alive and proc.poll() is not None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(_FOREGROUND_SCOPE_RETRY_INTERVAL_SECONDS, remaining))
+            status = _stop_systemd_unit_status(unit_name, aggressive=True)
+        return status
+
+    initial_status = _stop_with_absent_retry(
+        _FOREGROUND_SCOPE_REGISTRATION_RETRY_SECONDS,
+        while_wrapper_alive=True,
+    )
+
+    try:
+        if proc.poll() is None:
+            # If the scope was not conclusively stopped, cancel systemd-run's
+            # pending registration request before the final unit-name check.
+            if initial_status != _SYSTEMD_UNIT_STOPPED:
+                proc.kill()
+            try:
+                proc.wait(timeout=_FOREGROUND_SCOPE_WRAPPER_REAP_SECONDS)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    proc.kill()
+                    proc.wait(timeout=_FOREGROUND_SCOPE_WRAPPER_REAP_SECONDS)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
+        wrapper_reaped = proc.poll() is not None
+    except Exception as exc:
+        wrapper_reaped = False
+        logger.debug("Could not reap foreground scope wrapper %s: %s", unit_name, exc)
+
+    # This call is unconditional. A prior result that did not prove the scope
+    # stopped needs a bounded absent retry because the manager may register the
+    # unit just after systemd-run exits.
+    final_status = _stop_with_absent_retry(
+        _FOREGROUND_SCOPE_POST_REAP_RECHECK_SECONDS
+        if initial_status != _SYSTEMD_UNIT_STOPPED
+        else 0.0,
+        while_wrapper_alive=False,
+    )
+    clean = wrapper_reaped and final_status != _SYSTEMD_UNIT_FAILED
+    if not clean:
+        logger.debug(
+            "Foreground systemd scope cleanup incomplete for %s "
+            "(initial=%s, final=%s, wrapper_reaped=%s)",
+            unit_name,
+            initial_status,
+            final_status,
+            wrapper_reaped,
+        )
+    return clean
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -1823,8 +2037,9 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
+        spawn_args, systemd_unit = _foreground_systemd_scope_argv(args)
         proc = subprocess.Popen(
-            args,
+            spawn_args,
             text=True,
             env=run_env,
             encoding="utf-8",
@@ -1836,6 +2051,10 @@ class LocalEnvironment(BaseEnvironment):
             cwd=_popen_cwd,
             **_popen_kwargs,
         )
+        if systemd_unit:
+            # Timeout and interrupt cleanup must stop the whole transient
+            # cgroup, not only the systemd-run wrapper's process group.
+            proc._hermes_systemd_unit = systemd_unit
         if not _IS_WINDOWS:
             try:
                 proc._hermes_pgid = os.getpgid(proc.pid)
@@ -1849,6 +2068,19 @@ class LocalEnvironment(BaseEnvironment):
 
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
+
+        systemd_unit = getattr(proc, "_hermes_systemd_unit", "")
+        if systemd_unit and not _IS_WINDOWS:
+            try:
+                if _stop_foreground_systemd_scope(proc, systemd_unit):
+                    return
+            except Exception as exc:
+                logger.debug(
+                    "Could not stop foreground systemd scope %s: %s; "
+                    "falling back to process-group cleanup",
+                    systemd_unit,
+                    exc,
+                )
 
         def _group_alive(pgid: int) -> bool:
             try:
