@@ -1839,6 +1839,10 @@ class TestSystemdCgroupIsolation:
         """CLI mode (no supervisor) must NOT wrap in a systemd scope even if
         systemd-run is available — isolation is a gateway concern."""
         fake_popen, captured = self._fake_popen_capture()
+        monkeypatch.setattr(
+            "tools.process_registry._supervised_runtime_owner",
+            lambda: ("", False),
+        )
 
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
         monkeypatch.setattr(
@@ -1872,6 +1876,10 @@ class TestSystemdCgroupIsolation:
         """
         monkeypatch.setenv("INVOCATION_ID", "herdr-service-inherited-marker")
         monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+        monkeypatch.setattr(
+            "tools.process_registry._supervised_runtime_owner",
+            lambda: ("", False),
+        )
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
         monkeypatch.setattr(
             "tools.process_registry._systemd_run_user_scope_available",
@@ -1922,6 +1930,10 @@ class TestSystemdCgroupIsolation:
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda *, cleanup_stale=False: os.getpid() + 1,
+        )
+        monkeypatch.setattr(
+            "tools.process_registry._supervised_runtime_owner",
+            lambda: ("", False),
         )
         monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
         monkeypatch.setattr(
