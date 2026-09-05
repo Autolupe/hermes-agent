@@ -78,6 +78,15 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
+def _strict_yaml_load(stream):
+    """Parse YAML while distinguishing an empty document from explicit null."""
+    source = stream.read()
+    parsed = yaml.safe_load(source)
+    if parsed is None and yaml.compose(source, Loader=yaml.SafeLoader) is not None:
+        raise ValueError("managed config root is not a mapping")
+    return parsed
+
+
 def _cached_read(
     path: Path,
     cache: Dict[str, tuple],
@@ -108,10 +117,11 @@ def _cached_read(
         return None
     key = (st.st_mtime_ns, st.st_size)
     path_key = str(path)
-    with _CACHE_LOCK:
-        hit = cache.get(path_key)
-        if hit is not None and hit[:2] == key:
-            return copy.deepcopy(hit[2])
+    if not strict:
+        with _CACHE_LOCK:
+            hit = cache.get(path_key)
+            if hit is not None and hit[:2] == key:
+                return copy.deepcopy(hit[2])
     try:
         with open(path, encoding="utf-8") as f:
             parsed = parse(f)
@@ -138,7 +148,7 @@ def load_managed_config() -> dict:
     parsed = _cached_read(
         managed_dir / "config.yaml",
         _CONFIG_CACHE,
-        lambda f: yaml.safe_load(f) or {},
+        yaml.safe_load,
     )
     return parsed if isinstance(parsed, dict) else {}
 
@@ -158,7 +168,7 @@ def load_managed_config_strict() -> dict:
     parsed = _cached_read(
         path,
         _CONFIG_CACHE,
-        lambda f: yaml.safe_load(f) or {},
+        _strict_yaml_load,
         strict=True,
     )
     if parsed is None:

@@ -68,9 +68,9 @@ from hermes_cli.config import (
     get_hermes_home,
     get_process_hermes_home,
     load_config,
-    load_config_readonly_strict,
     load_env,
     read_raw_config,
+    read_user_config_raw,
     resolve_cron_model_drift_defaults,
     save_config,
     save_env_value,
@@ -84,6 +84,7 @@ from hermes_cli.config import (
     redact_key,
     write_platform_config_field,
     _deep_merge,
+    _expand_env_vars,
 )
 from plugins.memory.config_schema import (
     ProviderConfigSchema,
@@ -674,18 +675,24 @@ def _dashboard_allowed_hosts() -> Optional[set[str]]:
         raw_values: Any = env_raw.split(",")
     else:
         try:
-            config = load_config_readonly_strict()
+            from hermes_cli.managed_scope import load_managed_config_strict
+
+            user_config = read_user_config_raw(require_mapping=True)
+            managed_config = load_managed_config_strict()
+            for source in (user_config, managed_config):
+                if "dashboard" in source and not isinstance(
+                    source["dashboard"], dict
+                ):
+                    return set()
         except Exception:  # noqa: BLE001 — malformed config must not crash HTTP
             return set()
-        if not isinstance(config, dict):
-            return set()
-        dashboard = config.get("dashboard")
-        if not isinstance(dashboard, dict):
-            # ``cfg_get`` deliberately treats malformed parent sections as a
-            # missing leaf. That fail-soft behavior is unsafe at this network
-            # boundary: a scalar or list must not become an absent allowlist.
-            return set()
-        raw_values = dashboard.get("allowed_hosts", [])
+        user_dashboard = _expand_env_vars(user_config.get("dashboard", {}))
+        managed_dashboard = _expand_env_vars(managed_config.get("dashboard", {}))
+        raw_values = (
+            managed_dashboard["allowed_hosts"]
+            if "allowed_hosts" in managed_dashboard
+            else user_dashboard.get("allowed_hosts", [])
+        )
 
     if isinstance(raw_values, list):
         if not raw_values:

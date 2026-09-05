@@ -5,6 +5,7 @@ hermes_cli.config.load_config, so the managed overlay has to be wired into each.
 This is the regression guard for the whole bug class (a managed display.skin was
 silently ignored by the TUI; the same gap existed in the gateway and cron).
 """
+import os
 import textwrap
 
 import pytest
@@ -36,6 +37,42 @@ def _seed(home, managed, *, user, mgd):
     cfg._LOAD_CONFIG_CACHE.clear()
     cfg._RAW_CONFIG_CACHE.clear()
     managed_scope.invalidate_managed_cache()
+
+
+@pytest.mark.parametrize("managed_text", ["[]\n", "false\n", "0\n"])
+def test_fail_open_cache_does_not_hide_a_falsy_root_from_strict_reader(
+    homes, managed_text
+):
+    _home, managed = homes
+    (managed / "config.yaml").write_text(managed_text, encoding="utf-8")
+    from hermes_cli import managed_scope
+
+    assert managed_scope.load_managed_config() == {}
+    with pytest.raises(ValueError, match="root is not a mapping"):
+        managed_scope.load_managed_config_strict()
+
+
+def test_strict_reader_rechecks_permissions_after_fail_open_cache_hit(homes):
+    _home, managed = homes
+    path = managed / "config.yaml"
+    path.write_text("{}\n", encoding="utf-8")
+    from hermes_cli import managed_scope
+
+    assert managed_scope.load_managed_config() == {}
+    before = path.stat()
+    path.chmod(0)
+    try:
+        after = path.stat()
+        assert (after.st_mtime_ns, after.st_size) == (
+            before.st_mtime_ns,
+            before.st_size,
+        )
+        with pytest.raises(OSError):
+            path.read_text(encoding="utf-8")
+        with pytest.raises(OSError):
+            managed_scope.load_managed_config_strict()
+    finally:
+        os.chmod(path, 0o600)
 
 
 

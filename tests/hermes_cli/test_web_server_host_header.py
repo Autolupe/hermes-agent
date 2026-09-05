@@ -377,6 +377,149 @@ class TestHostHeaderMiddleware:
             if hasattr(app.state, "bound_host"):
                 del app.state.bound_host
 
+    @pytest.mark.parametrize(
+        "user_config_text",
+        ["dashboard: invalid\n", "dashboard: []\n"],
+    )
+    def test_managed_overlay_cannot_hide_malformed_user_dashboard_section(
+        self, tmp_path, monkeypatch, user_config_text
+    ):
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            user_config_text, encoding="utf-8"
+        )
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            "dashboard:\n  theme: managed-theme\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
+        app.state.bound_host = "0.0.0.0"
+        try:
+            response = TestClient(app).get(
+                "/api/status", headers={"Host": "attacker.example"}
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"].startswith("Invalid Host header")
+        finally:
+            if hasattr(app.state, "bound_host"):
+                del app.state.bound_host
+
+    @pytest.mark.parametrize(
+        "user_config_text", ["[]\n", "false\n", "0\n", "null\n"]
+    )
+    def test_managed_overlay_cannot_hide_falsy_non_mapping_user_config_root(
+        self, tmp_path, monkeypatch, user_config_text
+    ):
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(user_config_text, encoding="utf-8")
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            "dashboard:\n  theme: managed-theme\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
+        app.state.bound_host = "0.0.0.0"
+        try:
+            response = TestClient(app).get(
+                "/api/status", headers={"Host": "attacker.example"}
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"].startswith("Invalid Host header")
+        finally:
+            if hasattr(app.state, "bound_host"):
+                del app.state.bound_host
+
+    @pytest.mark.parametrize(
+        "managed_config_text", ["[]\n", "false\n", "0\n", "null\n"]
+    )
+    def test_falsy_non_mapping_managed_config_root_fails_closed(
+        self, tmp_path, monkeypatch, managed_config_text
+    ):
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            managed_config_text, encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
+        app.state.bound_host = "0.0.0.0"
+        try:
+            response = TestClient(app).get(
+                "/api/status", headers={"Host": "attacker.example"}
+            )
+            assert response.status_code == 400
+            assert response.json()["detail"].startswith("Invalid Host header")
+        finally:
+            if hasattr(app.state, "bound_host"):
+                del app.state.bound_host
+
+    def test_managed_dashboard_sibling_preserves_user_allowlist(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli.web_server import _is_accepted_host
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "dashboard:\n  allowed_hosts:\n    - user.example\n",
+            encoding="utf-8",
+        )
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            "dashboard:\n  theme: managed-theme\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
+
+        assert _is_accepted_host("user.example", "0.0.0.0")
+        assert not _is_accepted_host("attacker.example", "0.0.0.0")
+
+    def test_managed_allowlist_overrides_user_allowlist(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli.web_server import _is_accepted_host
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "dashboard:\n  allowed_hosts:\n    - user.example\n",
+            encoding="utf-8",
+        )
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(
+            "dashboard:\n  allowed_hosts:\n    - managed.example\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
+
+        assert _is_accepted_host("managed.example", "0.0.0.0")
+        assert not _is_accepted_host("user.example", "0.0.0.0")
+
 
 class TestWebSocketHostOriginGuard:
     """WebSocket upgrades must enforce the same dashboard boundary as HTTP."""
@@ -402,6 +545,47 @@ class TestWebSocketHostOriginGuard:
             ):
                 pass
 
+        assert exc.value.code == 4403
+
+    @pytest.mark.parametrize("null_source", ["user", "managed"])
+    def test_explicit_null_config_root_rejects_websocket(
+        self, tmp_path, monkeypatch, null_source
+    ):
+        from fastapi.testclient import TestClient
+        from starlette.websockets import WebSocketDisconnect
+
+        import hermes_cli.web_server as ws
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "null\n" if null_source == "user" else "{}\n", encoding="utf-8"
+        )
+        (managed_dir / "config.yaml").write_text(
+            "null\n"
+            if null_source == "managed"
+            else "dashboard:\n  theme: managed-theme\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+        monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_HOSTS", raising=False)
+        monkeypatch.setattr(ws.app.state, "bound_host", "0.0.0.0", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=null-root-test"
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(
+                url,
+                headers={
+                    "Host": "attacker.example",
+                    "Origin": "http://attacker.example",
+                },
+            ):
+                pass
         assert exc.value.code == 4403
 
 
