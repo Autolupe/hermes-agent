@@ -3294,7 +3294,9 @@ def read_user_config_raw(
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 
     No DEFAULT_CONFIG merge, no managed-scope overlay, no ``${ENV_VAR}``
-    expansion, no migration, no root-model normalization, no caching.
+    expansion, no migration, no root-model normalization, no file caching.
+    Strict reads reuse validated parses by exact source, but always reopen and
+    read the file to verify readability and freshness; returned trees are owned.
 
     ONLY legal for write-back round-trips and raw-file diagnostics —
     behavioral reads must use load_config()/load_config_readonly().
@@ -3337,6 +3339,10 @@ def read_user_config_raw(
         config_path = get_config_path()
     try:
         with open(config_path, encoding="utf-8") as f:
+            if require_mapping:
+                from hermes_cli.managed_scope import _strict_yaml_load
+
+                return _strict_yaml_load(f)
             source = f.read()
         data = fast_safe_load(source)
     except FileNotFoundError:

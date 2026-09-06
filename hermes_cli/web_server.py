@@ -680,14 +680,15 @@ def _dashboard_allowed_hosts() -> Optional[set[str]]:
             user_config = read_user_config_raw(require_mapping=True)
             managed_config = load_managed_config_strict()
             for source in (user_config, managed_config):
-                if "dashboard" in source and not isinstance(
-                    source["dashboard"], dict
-                ):
+                section = source.get("dashboard")
+                # An empty YAML section is absent under the deep-merge contract.
+                # Other scalars/lists must still fail closed before overlaying.
+                if section is not None and not isinstance(section, dict):
                     return set()
         except Exception:  # noqa: BLE001 — malformed config must not crash HTTP
             return set()
-        user_dashboard = _expand_env_vars(user_config.get("dashboard", {}))
-        managed_dashboard = _expand_env_vars(managed_config.get("dashboard", {}))
+        user_dashboard = _expand_env_vars(user_config.get("dashboard") or {})
+        managed_dashboard = _expand_env_vars(managed_config.get("dashboard") or {})
         raw_values = (
             managed_dashboard["allowed_hosts"]
             if "allowed_hosts" in managed_dashboard

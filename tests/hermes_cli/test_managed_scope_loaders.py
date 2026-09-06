@@ -52,6 +52,10 @@ def test_fail_open_cache_does_not_hide_a_falsy_root_from_strict_reader(
         managed_scope.load_managed_config_strict()
 
 
+@pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="chmod cannot deny reads on Windows or for root",
+)
 def test_strict_reader_rechecks_permissions_after_fail_open_cache_hit(homes):
     _home, managed = homes
     path = managed / "config.yaml"
@@ -67,18 +71,117 @@ def test_strict_reader_rechecks_permissions_after_fail_open_cache_hit(homes):
             before.st_mtime_ns,
             before.st_size,
         )
-        with pytest.raises(OSError):
+        try:
             path.read_text(encoding="utf-8")
+        except OSError:
+            pass
+        else:
+            pytest.skip("filesystem or process capabilities bypass read permissions")
         with pytest.raises(OSError):
             managed_scope.load_managed_config_strict()
     finally:
-        os.chmod(path, 0o600)
+        os.chmod(path, before.st_mode)
+
+
+@pytest.mark.parametrize("warm_strict_cache", [False, True])
+def test_strict_reader_rechecks_open_errors_after_cache_hit(
+    homes, monkeypatch, warm_strict_cache
+):
+    """Deterministic permission coverage, including root and Windows runners."""
+    from hermes_cli import managed_scope
+
+    _home, managed = homes
+    path = managed / "config.yaml"
+    path.write_text("dashboard:\n  allowed_hosts: [managed.example]\n", encoding="utf-8")
+    expected = managed_scope.load_managed_config()
+    if warm_strict_cache:
+        assert managed_scope.load_managed_config_strict() == expected
+    before = path.stat()
+
+    def denied_open(file, *args, **kwargs):
+        assert file == path
+        raise PermissionError("deterministic read denial")
+
+    with monkeypatch.context() as denied:
+        denied.setattr(managed_scope, "open", denied_open, raising=False)
+        with pytest.raises(PermissionError, match="deterministic read denial"):
+            managed_scope.load_managed_config_strict()
+    assert path.stat() == before
+    assert managed_scope.load_managed_config_strict() == expected
 
 
 
 
 
 
+
+
+@pytest.fixture(params=["user", "managed"])
+def strict_reader(homes, request):
+    from hermes_cli.config import read_user_config_raw
+    from hermes_cli.managed_scope import load_managed_config_strict
+
+    home, managed = homes
+    if request.param == "user":
+        return home / "config.yaml", lambda: read_user_config_raw(require_mapping=True)
+    return managed / "config.yaml", load_managed_config_strict
+
+
+def test_strict_parse_cache_returns_owned_trees(strict_reader):
+    path, read = strict_reader
+    path.write_text("dashboard:\n  allowed_hosts: [owned.example]\n", encoding="utf-8")
+    first = read()
+    first["dashboard"]["allowed_hosts"].clear()
+    assert read() == {"dashboard": {"allowed_hosts": ["owned.example"]}}
+
+
+@pytest.mark.parametrize("invalid", ["null", "~", "---", "false", "0", "[]", "["])
+def test_strict_parse_cache_rejects_same_metadata_root_edits(strict_reader, invalid):
+    import yaml
+
+    path, read = strict_reader
+    original = "{}      \n"
+    path.write_text(original, encoding="utf-8")
+    assert read() == {}
+    before = path.stat()
+    path.write_text(invalid.ljust(len(original) - 1) + "\n", encoding="utf-8")
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+    for _ in range(2):
+        with pytest.raises((ValueError, yaml.YAMLError)):
+            read()
+    path.write_text(original, encoding="utf-8")
+    assert read() == {}
+
+
+@pytest.mark.parametrize("empty", ["", "# comment only\n", " \n"])
+def test_strict_parse_cache_preserves_empty_documents(strict_reader, empty):
+    path, read = strict_reader
+    assert read() == {}  # Missing is not a failed parse.
+    path.write_text(empty, encoding="utf-8")
+    assert read() == {}
+    assert read() == {}
+
+
+@pytest.mark.parametrize("error_stage", ["open", "read"])
+def test_strict_parse_cache_cannot_hide_io_errors(strict_reader, monkeypatch, error_stage):
+    from unittest.mock import mock_open
+
+    path, read = strict_reader
+    path.write_text("dashboard:\n  allowed_hosts: [readable.example]\n", encoding="utf-8")
+    expected = read()
+    failing_open = mock_open()
+    if error_stage == "open":
+        failing_open.side_effect = PermissionError("read denied")
+    else:
+        failing_open.return_value.read.side_effect = OSError("read denied")
+    with monkeypatch.context() as denied:
+        denied.setattr("builtins.open", failing_open)
+        with pytest.raises(OSError, match="read denied"):
+            read()
+        failing_open.assert_called_once_with(path, encoding="utf-8")
+    assert read() == expected
 
 
 def test_timezone_honors_managed(homes, monkeypatch):

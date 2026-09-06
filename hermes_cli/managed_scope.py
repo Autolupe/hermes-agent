@@ -21,6 +21,7 @@ import copy
 import logging
 import os
 import threading
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -78,13 +79,27 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
-def _strict_yaml_load(stream):
-    """Parse YAML while distinguishing an empty document from explicit null."""
-    source = stream.read()
+@lru_cache(maxsize=8)
+def _parse_strict_yaml_source(source: str) -> dict:
+    """Cache valid trees by exact readable source, never by stale file metadata.
+
+    This bounded cache is separate from the fail-open file caches. Exceptions
+    (including explicit null/non-mapping roots) are never cached as success.
+    Environment expansion stays with callers so env changes remain live.
+    """
     parsed = yaml.safe_load(source)
-    if parsed is None and yaml.compose(source, Loader=yaml.SafeLoader) is not None:
-        raise ValueError("managed config root is not a mapping")
+    if parsed is None and yaml.compose(source, Loader=yaml.SafeLoader) is None:
+        return {}
+    if not isinstance(parsed, dict):
+        raise ValueError("config root is not a mapping")
     return parsed
+
+
+def _strict_yaml_load(stream):
+    # Every call reads the open file BEFORE consulting the parse cache. A cached
+    # tree cannot conceal lost permissions, read errors, or same-metadata edits.
+    # Return an owned tree: raw readers may mutate it for write-back.
+    return copy.deepcopy(_parse_strict_yaml_source(stream.read()))
 
 
 def _cached_read(
