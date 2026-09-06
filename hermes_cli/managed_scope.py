@@ -21,6 +21,7 @@ import copy
 import logging
 import os
 import threading
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -78,6 +79,29 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
+@lru_cache(maxsize=8)
+def _parse_strict_yaml_source(source: str) -> dict:
+    """Cache valid trees by exact readable source, never by stale file metadata.
+
+    This bounded cache is separate from the fail-open file caches. Exceptions
+    (including explicit null/non-mapping roots) are never cached as success.
+    Environment expansion stays with callers so env changes remain live.
+    """
+    parsed = yaml.safe_load(source)
+    if parsed is None and yaml.compose(source, Loader=yaml.SafeLoader) is None:
+        return {}
+    if not isinstance(parsed, dict):
+        raise ValueError("config root is not a mapping")
+    return parsed
+
+
+def _strict_yaml_load(stream):
+    # Every call reads the open file BEFORE consulting the parse cache. A cached
+    # tree cannot conceal lost permissions, read errors, or same-metadata edits.
+    # Return an owned tree: raw readers may mutate it for write-back.
+    return copy.deepcopy(_parse_strict_yaml_source(stream.read()))
+
+
 def _cached_read(
     path: Path,
     cache: Dict[str, tuple],
@@ -108,10 +132,11 @@ def _cached_read(
         return None
     key = (st.st_mtime_ns, st.st_size)
     path_key = str(path)
-    with _CACHE_LOCK:
-        hit = cache.get(path_key)
-        if hit is not None and hit[:2] == key:
-            return copy.deepcopy(hit[2])
+    if not strict:
+        with _CACHE_LOCK:
+            hit = cache.get(path_key)
+            if hit is not None and hit[:2] == key:
+                return copy.deepcopy(hit[2])
     try:
         with open(path, encoding="utf-8") as f:
             parsed = parse(f)
@@ -138,7 +163,7 @@ def load_managed_config() -> dict:
     parsed = _cached_read(
         managed_dir / "config.yaml",
         _CONFIG_CACHE,
-        lambda f: yaml.safe_load(f) or {},
+        yaml.safe_load,
     )
     return parsed if isinstance(parsed, dict) else {}
 
@@ -158,7 +183,7 @@ def load_managed_config_strict() -> dict:
     parsed = _cached_read(
         path,
         _CONFIG_CACHE,
-        lambda f: yaml.safe_load(f) or {},
+        _strict_yaml_load,
         strict=True,
     )
     if parsed is None:

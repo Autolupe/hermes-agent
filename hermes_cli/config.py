@@ -3288,11 +3288,15 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
-def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
+def read_user_config_raw(
+    config_path: Optional[Path] = None, *, require_mapping: bool = False
+) -> Dict[str, Any]:
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 
     No DEFAULT_CONFIG merge, no managed-scope overlay, no ``${ENV_VAR}``
-    expansion, no migration, no root-model normalization, no caching.
+    expansion, no migration, no root-model normalization, no file caching.
+    Strict reads reuse validated parses by exact source, but always reopen and
+    read the file to verify readability and freshness; returned trees are owned.
 
     ONLY legal for write-back round-trips and raw-file diagnostics —
     behavioral reads must use load_config()/load_config_readonly().
@@ -3306,6 +3310,10 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
       * RAW-FILE DIAGNOSTICS (doctor, deprecation sweeps): these inspect
         what the user actually wrote — stale root keys, drift against .env —
         and merged defaults would produce false positives.
+      * SOURCE-SHAPE SECURITY CHECKS: a network boundary may validate one raw
+        section before overlay merging so a valid higher-precedence mapping
+        cannot hide a malformed lower-precedence value. It must still use the
+        normal merged loader for the effective behavioral value.
       * PRESENCE-SENSITIVE ENV BRIDGES (gateway/send bridges that only
         export a key when the user explicitly set it): a defaults merge
         would make every key "present" and bridge the entire DEFAULT_CONFIG
@@ -3321,7 +3329,7 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
       * unparseable YAML / other I/O errors → raises (callers that want
         fail-open already wrap in try/except; callers with last-known-good
         or warn semantics rely on the exception)
-      * non-dict YAML root → ``{}``
+      * non-dict YAML root → ``{}``, unless ``require_mapping=True`` then raises
 
     ``config_path`` defaults to :func:`get_config_path` (profile-aware).
     Pass an explicit path when the caller resolves its own home (gateway
@@ -3331,10 +3339,24 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
         config_path = get_config_path()
     try:
         with open(config_path, encoding="utf-8") as f:
-            data = fast_safe_load(f) or {}
+            if require_mapping:
+                from hermes_cli.managed_scope import _strict_yaml_load
+
+                return _strict_yaml_load(f)
+            source = f.read()
+        data = fast_safe_load(source)
     except FileNotFoundError:
         return {}
-    return data if isinstance(data, dict) else {}
+    if data is None:
+        if yaml.compose(source, Loader=yaml.SafeLoader) is not None:
+            if require_mapping:
+                raise ValueError(f"user config root is not a mapping: {config_path}")
+        return {}
+    if not isinstance(data, dict):
+        if require_mapping:
+            raise ValueError(f"user config root is not a mapping: {config_path}")
+        return {}
+    return data
 
 
 def read_raw_config_readonly() -> Dict[str, Any]:
