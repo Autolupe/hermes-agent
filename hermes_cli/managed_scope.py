@@ -21,6 +21,7 @@ import copy
 import logging
 import os
 import threading
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -78,24 +79,64 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
+@lru_cache(maxsize=8)
+def _parse_strict_yaml_source(source: str) -> dict:
+    """Cache valid trees by exact readable source, never by stale file metadata.
+
+    This bounded cache is separate from the fail-open file caches. Exceptions
+    (including explicit null/non-mapping roots) are never cached as success.
+    Environment expansion stays with callers so env changes remain live.
+    """
+    parsed = yaml.safe_load(source)
+    if parsed is None and yaml.compose(source, Loader=yaml.SafeLoader) is None:
+        return {}
+    if not isinstance(parsed, dict):
+        raise ValueError("config root is not a mapping")
+    return parsed
+
+
+def _strict_yaml_load(stream):
+    # Every call reads the open file BEFORE consulting the parse cache. A cached
+    # tree cannot conceal lost permissions, read errors, or same-metadata edits.
+    # Return an owned tree: raw readers may mutate it for write-back.
+    return copy.deepcopy(_parse_strict_yaml_source(stream.read()))
+
+
+def _cached_read(
+    path: Path,
+    cache: Dict[str, tuple],
+    parse,
+    *,
+    strict: bool = False,
+):
     """Shared (mtime_ns, size)-keyed read. Returns a deepcopy of the parsed value.
 
-    Returns ``None`` when the file is absent or fails to parse (fail-open). A
-    parse failure is logged LOUDLY — the admin needs to know their policy isn't
-    being applied — but never raises, so a malformed managed file can't brick
-    startup.
+    Normally returns ``None`` when the file is absent or fails to parse
+    (fail-open). A parse failure is logged LOUDLY so the administrator knows
+    policy is not being applied. ``strict=True`` preserves access and parse
+    errors for a caller that owns a narrower fail-closed boundary.
     """
     try:
         st = path.stat()
-    except OSError:
+    except FileNotFoundError:
         return None  # absent
+    except OSError as exc:
+        if strict:
+            logger.warning(
+                "managed scope: failed to access %s: %s — refusing the "
+                "strict config read.",
+                path,
+                exc,
+            )
+            raise
+        return None
     key = (st.st_mtime_ns, st.st_size)
     path_key = str(path)
-    with _CACHE_LOCK:
-        hit = cache.get(path_key)
-        if hit is not None and hit[:2] == key:
-            return copy.deepcopy(hit[2])
+    if not strict:
+        with _CACHE_LOCK:
+            hit = cache.get(path_key)
+            if hit is not None and hit[:2] == key:
+                return copy.deepcopy(hit[2])
     try:
         with open(path, encoding="utf-8") as f:
             parsed = parse(f)
@@ -106,6 +147,8 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
             path,
             exc,
         )
+        if strict:
+            raise
         return None
     with _CACHE_LOCK:
         cache[path_key] = (key[0], key[1], copy.deepcopy(parsed))
@@ -120,9 +163,39 @@ def load_managed_config() -> dict:
     parsed = _cached_read(
         managed_dir / "config.yaml",
         _CONFIG_CACHE,
-        lambda f: yaml.safe_load(f) or {},
+        yaml.safe_load,
     )
     return parsed if isinstance(parsed, dict) else {}
+
+
+def load_managed_config_strict() -> dict:
+    """Load managed config while preserving access and parse failures.
+
+    The normal managed layer intentionally fails open so a broken
+    administrator file does not brick general Hermes startup. Security
+    boundaries that cannot safely confuse that failure with an absent file
+    use this variant and decide their own fail-closed behavior.
+    """
+    managed_dir = get_managed_dir()
+    if managed_dir is None:
+        return {}
+    path = managed_dir / "config.yaml"
+    parsed = _cached_read(
+        path,
+        _CONFIG_CACHE,
+        _strict_yaml_load,
+        strict=True,
+    )
+    if parsed is None:
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning(
+            "managed scope: %s must contain a YAML mapping — refusing the "
+            "strict config read.",
+            path,
+        )
+        raise ValueError(f"managed config root is not a mapping: {path}")
+    return parsed
 
 
 def load_managed_env() -> Dict[str, str]:

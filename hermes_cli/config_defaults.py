@@ -1516,6 +1516,12 @@ DEFAULT_CONFIG = {
     # Web dashboard settings
     "dashboard": {
         "theme": "default",  # Dashboard visual theme: "default", "midnight", "ember", "mono", "cyberpunk", "rose"
+        # Exact browser-facing hostnames or IP addresses accepted by the Host
+        # header guard when the dashboard binds to 0.0.0.0 or ::. An empty
+        # list preserves the legacy allow-any wildcard behavior. The
+        # HERMES_DASHBOARD_ALLOWED_HOSTS environment variable can override
+        # this list with comma-separated values for service deployments.
+        "allowed_hosts": [],
         # Process-isolation rollout controls. Runtime reads these through the
         # raw config loader, so tui_gateway.server also owns explicit defaults.
         "turn_isolation": False,
