@@ -35,3 +35,25 @@ def test_no_managed_env_is_noop(env_homes, monkeypatch):
     (home / ".env").write_text("SOME_VALUE=from_user\n", encoding="utf-8")
     load_hermes_dotenv(hermes_home=str(home))
     assert os.environ["SOME_VALUE"] == "from_user"
+
+
+@pytest.mark.linux_only
+def test_unreadable_managed_directory_does_not_block_user_env(env_homes, monkeypatch):
+    from hermes_cli.env_loader import load_hermes_dotenv
+
+    if os.geteuid() == 0:
+        pytest.skip("The root account bypasses directory access permissions")
+    home, managed = env_homes
+    monkeypatch.delenv("MANAGED_PERMISSION_TEST", raising=False)
+    user_env = home / ".env"
+    user_env.write_text("MANAGED_PERMISSION_TEST=from_user\n", encoding="utf-8")
+    managed_env = managed / ".env"
+    managed_env.write_text("MANAGED_PERMISSION_TEST=from_managed\n", encoding="utf-8")
+    managed.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            managed_env.stat()
+        assert load_hermes_dotenv(hermes_home=str(home)) == [user_env]
+        assert os.environ["MANAGED_PERMISSION_TEST"] == "from_user"
+    finally:
+        managed.chmod(0o700)
