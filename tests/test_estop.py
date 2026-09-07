@@ -15,6 +15,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +45,36 @@ def test_engage_creates_sentinel_and_is_engaged(hermes_home):
     assert estop.is_engaged() is True
 
 
+def test_engage_reports_when_shared_stop_cannot_be_created(
+    hermes_home, monkeypatch
+):
+    """An unrelated fail-closed state cannot hide a failed shared write."""
+    profile_home = hermes_home / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    sentinel = hermes_home / "ESTOP"
+    real_write_text = estop.Path.write_text
+    real_touch = estop.Path.touch
+
+    def denied_write_text(path, *args, **kwargs):
+        if path == sentinel:
+            raise PermissionError("shared root is read-only")
+        return real_write_text(path, *args, **kwargs)
+
+    def denied_touch(path, *args, **kwargs):
+        if path == sentinel:
+            raise PermissionError("shared root is read-only")
+        return real_touch(path, *args, **kwargs)
+
+    monkeypatch.setattr(estop.Path, "write_text", denied_write_text)
+    monkeypatch.setattr(estop.Path, "touch", denied_touch)
+    monkeypatch.setattr(estop, "is_engaged", lambda: True)
+
+    with pytest.raises(estop.EngageError, match="could not be created"):
+        estop.engage(reason="maintenance")
+    assert not os.path.lexists(sentinel)
+
+
 def test_disengage_removes_sentinel(hermes_home):
     estop.engage()
     assert estop.disengage() is True
@@ -46,6 +82,24 @@ def test_disengage_removes_sentinel(hermes_home):
     assert estop.is_engaged() is False
     # Disengaging when not engaged is a no-op that reports False.
     assert estop.disengage() is False
+
+
+@pytest.mark.linux_only
+def test_disengage_anchors_a_configured_symlinked_home(tmp_path, monkeypatch):
+    """A deliberate HERMES_HOME alias still cleans its own physical stop."""
+    physical_home = tmp_path / "physical-home"
+    physical_home.mkdir()
+    configured_home = tmp_path / "configured-home"
+    configured_home.symlink_to(physical_home, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(configured_home))
+    estop._reset_log_state_for_tests()
+
+    estop.engage(reason="maintenance")
+
+    assert (physical_home / "ESTOP").is_file()
+    assert estop.disengage() is True
+    assert not (physical_home / "ESTOP").exists()
+    assert estop.is_engaged() is False
 
 
 def test_reason_and_timestamp_stored(hermes_home):
@@ -70,6 +124,725 @@ def test_corrupt_sentinel_still_engages(hermes_home):
     state = estop.get_state()
     assert state is not None
     assert state.get("reason") is None
+
+
+@pytest.mark.linux_only
+def test_broken_symlink_sentinel_still_engages(hermes_home):
+    """A broken ESTOP link is still an authoritative stop entry."""
+    sentinel = hermes_home / "ESTOP"
+    sentinel.symlink_to(hermes_home / "missing-estop-target")
+
+    assert estop.is_engaged() is True
+    assert estop.get_state() == {"reason": None, "engaged_at": None}
+    assert estop.check_paused("kanban", logging.getLogger(__name__)) is True
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("broken_at_home", [True, False])
+def test_broken_hermes_home_ancestor_fails_closed(
+    hermes_home, monkeypatch, broken_at_home
+):
+    """A broken HERMES_HOME path must never make ESTOP look absent."""
+    broken = hermes_home / "broken-home"
+    broken.symlink_to(hermes_home / "missing-home", target_is_directory=True)
+    active_home = broken if broken_at_home else broken / "profiles" / "planner"
+    monkeypatch.setenv("HERMES_HOME", str(active_home))
+
+    assert estop.is_engaged() is True
+    assert estop.get_state() == {"reason": None, "engaged_at": None}
+    assert estop.check_paused("kanban", logging.getLogger(__name__)) is True
+
+
+@pytest.mark.linux_only
+def test_missing_stop_rechecks_ancestor_after_home_symlink_breaks(
+    tmp_path, monkeypatch
+):
+    """A home link broken after the first absence check must stay paused."""
+    physical_home = tmp_path / "physical-home"
+    physical_home.mkdir()
+    configured_home = tmp_path / "configured-home"
+    configured_home.symlink_to(physical_home, target_is_directory=True)
+    missing_target = tmp_path / "missing-home"
+    sentinel = configured_home / "ESTOP"
+    check_ancestor = estop._missing_path_has_usable_ancestor
+    checks = 0
+
+    def check_then_break(path):
+        nonlocal checks
+        result = check_ancestor(path)
+        checks += 1
+        if checks == 1:
+            configured_home.unlink()
+            configured_home.symlink_to(missing_target, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(
+        estop,
+        "_missing_path_has_usable_ancestor",
+        check_then_break,
+    )
+
+    assert estop._path_is_engaged(sentinel) is True
+    assert checks == 2
+
+
+@pytest.mark.linux_only
+def test_canonical_stop_read_anchors_configured_home_during_temporary_swaps(
+    tmp_path, monkeypatch
+):
+    """Two temporary symlink retargets cannot hide the canonical stop."""
+    physical_home = tmp_path / "physical-home"
+    physical_home.mkdir()
+    stop = physical_home / "ESTOP"
+    stop.write_text(
+        json.dumps({"reason": "keep stopped", "engaged_at": "test"}) + "\n",
+        encoding="utf-8",
+    )
+    empty_home = tmp_path / "empty-home"
+    empty_home.mkdir()
+    configured_home = tmp_path / "configured-home"
+    configured_home.symlink_to(physical_home, target_is_directory=True)
+    logical_stop = configured_home / "ESTOP"
+    monkeypatch.setenv("HERMES_HOME", str(configured_home))
+    estop._reset_log_state_for_tests()
+    real_lstat = estop.os.lstat
+    real_optional_entry_info = estop._optional_entry_info
+    path_attacks = 0
+    anchored_attacks = 0
+
+    def lstat_with_root_temporarily_retargeted(path, *args, **kwargs):
+        nonlocal path_attacks
+        if os.fspath(path) != os.fspath(logical_stop):
+            return real_lstat(path, *args, **kwargs)
+        configured_home.unlink()
+        configured_home.symlink_to(empty_home, target_is_directory=True)
+        try:
+            return real_lstat(path, *args, **kwargs)
+        finally:
+            configured_home.unlink()
+            configured_home.symlink_to(physical_home, target_is_directory=True)
+            path_attacks += 1
+
+    def anchored_stat_with_root_temporarily_retargeted(parent_fd, name):
+        nonlocal anchored_attacks
+        if name != estop.SENTINEL_NAME:
+            return real_optional_entry_info(parent_fd, name)
+        configured_home.unlink()
+        configured_home.symlink_to(empty_home, target_is_directory=True)
+        try:
+            return real_optional_entry_info(parent_fd, name)
+        finally:
+            configured_home.unlink()
+            configured_home.symlink_to(physical_home, target_is_directory=True)
+            anchored_attacks += 1
+
+    monkeypatch.setattr(estop.os, "lstat", lstat_with_root_temporarily_retargeted)
+
+    # Reproduce the old path race: both leaf lookups miss while each ancestor
+    # validation sees the restored, valid shared-root link.
+    assert estop._path_is_engaged(logical_stop) is False
+    assert path_attacks == 2
+    path_attacks = 0
+
+    monkeypatch.setattr(
+        estop,
+        "_optional_entry_info",
+        anchored_stat_with_root_temporarily_retargeted,
+    )
+
+    # The public checks open the physical shared root once and read ESTOP
+    # relative to that retained directory. Even while the logical root points
+    # at the empty replacement during each leaf lookup, the stop remains seen.
+    assert estop.is_engaged() is True
+    assert estop.get_state() == {
+        "reason": "keep stopped",
+        "engaged_at": "test",
+    }
+    assert path_attacks == 0
+    assert anchored_attacks == 2
+    assert stop.is_file()
+
+
+@pytest.mark.windows_only
+@pytest.mark.parametrize("root_kind", ["directory", "junction"])
+def test_canonical_stop_read_anchors_configured_home_on_windows(
+    tmp_path, monkeypatch, root_kind
+):
+    """A real Windows root replacement or redirect cannot hide the stop."""
+    configured_home = tmp_path / "configured-home"
+    physical_home = (
+        configured_home
+        if root_kind == "directory"
+        else tmp_path / "physical-home"
+    )
+    physical_home.mkdir()
+    empty_home = tmp_path / "empty-home"
+    empty_home.mkdir()
+
+    def create_junction(path, target):
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(path), str(target)],
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    def remove_junction(path):
+        result = subprocess.run(
+            ["cmd", "/c", "rmdir", str(path)],
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    if root_kind == "junction":
+        create_junction(configured_home, physical_home)
+
+    stop = physical_home / "ESTOP"
+    logical_stop = configured_home / "ESTOP"
+    stop.write_text(
+        json.dumps({"reason": "keep stopped", "engaged_at": "test"}) + "\n",
+        encoding="utf-8",
+    )
+    moved_home = tmp_path / "configured-home-original"
+    monkeypatch.setenv("HERMES_HOME", str(configured_home))
+    estop._reset_log_state_for_tests()
+    real_lstat = estop.os.lstat
+    stop_keys = {
+        os.path.normcase(os.path.abspath(os.fspath(stop))),
+        os.path.normcase(os.path.abspath(os.fspath(logical_stop))),
+    }
+    replacement_attempts = 0
+    completed_swaps = 0
+    locked_attempts = 0
+    expect_locked = False
+
+    def lstat_during_temporary_root_replacement(path, *args, **kwargs):
+        nonlocal replacement_attempts, completed_swaps, locked_attempts
+        path_key = os.path.normcase(os.path.abspath(os.fspath(path)))
+        if path_key not in stop_keys:
+            return real_lstat(path, *args, **kwargs)
+        replacement_attempts += 1
+        try:
+            configured_home.rename(moved_home)
+        except OSError as exc:
+            if (
+                not expect_locked
+                or getattr(exc, "winerror", None) not in {5, 32, 33}
+            ):
+                raise
+            locked_attempts += 1
+            return real_lstat(path, *args, **kwargs)
+        if root_kind == "directory":
+            empty_home.rename(configured_home)
+        else:
+            create_junction(configured_home, empty_home)
+        try:
+            return real_lstat(path, *args, **kwargs)
+        finally:
+            if root_kind == "directory":
+                configured_home.rename(empty_home)
+            else:
+                remove_junction(configured_home)
+            moved_home.rename(configured_home)
+            completed_swaps += 1
+
+    monkeypatch.setattr(
+        estop.os,
+        "lstat",
+        lstat_during_temporary_root_replacement,
+    )
+
+    # Reproduce the old Windows path race before any directory handle exists.
+    assert estop._path_is_engaged(logical_stop) is False
+    assert replacement_attempts == 2
+    assert completed_swaps == 2
+
+    replacement_attempts = 0
+    completed_swaps = 0
+    expect_locked = True
+
+    # A real directory is locked against replacement. A junction may still be
+    # retargeted, but both public reads use its locked physical target instead.
+    assert estop.is_engaged() is True
+    assert estop.get_state() == {
+        "reason": "keep stopped",
+        "engaged_at": "test",
+    }
+    assert replacement_attempts == 2
+    assert completed_swaps == (0 if root_kind == "directory" else 2)
+    assert locked_attempts == (2 if root_kind == "directory" else 0)
+    assert logical_stop.is_file()
+    assert stop.is_file()
+
+
+def test_genuinely_missing_hermes_home_below_real_parent_is_not_engaged(
+    hermes_home, monkeypatch
+):
+    """An absent home under a real directory remains a normal no-ESTOP case."""
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home / "missing-home"))
+
+    assert estop.is_engaged() is False
+    assert estop.get_state() is None
+
+
+def test_named_profile_uses_shared_root_estop(tmp_path, monkeypatch):
+    """Every profile must read, write, and remove the same global stop."""
+    root = tmp_path / "shared-root"
+    profile_home = root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    estop._reset_log_state_for_tests()
+
+    assert estop.sentinel_path() == root / "ESTOP"
+    assert estop.is_engaged() is False
+    assert estop.engage(reason="global maintenance") == root / "ESTOP"
+    assert (root / "ESTOP").is_file()
+    assert not (profile_home / "ESTOP").exists()
+    assert estop.get_state()["reason"] == "global maintenance"
+    assert estop.disengage() is True
+    assert not (root / "ESTOP").exists()
+
+
+def test_named_profile_honors_and_removes_legacy_profile_estop(
+    tmp_path, monkeypatch
+):
+    """An upgrade must not silently lift a profile-local existing stop."""
+    root = tmp_path / "shared-root"
+    profile_home = root / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    estop._reset_log_state_for_tests()
+    (profile_home / "ESTOP").write_text(
+        '{"reason": "legacy pause"}\n', encoding="utf-8"
+    )
+
+    assert estop.is_engaged() is True
+    assert estop.get_state()["reason"] == "legacy pause"
+    assert estop.disengage() is True
+    assert estop.is_engaged() is False
+    assert not (profile_home / "ESTOP").exists()
+
+
+@pytest.mark.parametrize("active_kind", ["default", "sibling"])
+def test_every_gateway_honors_and_removes_all_legacy_profile_estops(
+    tmp_path, monkeypatch, active_kind
+):
+    """A stop left by any old profile is global after an upgrade."""
+    root = tmp_path / "shared-root"
+    coder_home = root / "profiles" / "coder"
+    reviewer_home = root / "profiles" / "reviewer"
+    planner_home = root / "profiles" / "planner"
+    for profile_home in (coder_home, reviewer_home, planner_home):
+        profile_home.mkdir(parents=True)
+    monkeypatch.setenv(
+        "HERMES_HOME",
+        str(root if active_kind == "default" else planner_home),
+    )
+    estop._reset_log_state_for_tests()
+    (coder_home / "ESTOP").write_text(
+        '{"reason": "coder legacy pause"}\n', encoding="utf-8"
+    )
+    (reviewer_home / "ESTOP").write_text(
+        '{"reason": "reviewer legacy pause"}\n', encoding="utf-8"
+    )
+
+    assert estop.is_engaged() is True
+    assert estop.get_state()["reason"] == "coder legacy pause"
+    assert estop.disengage() is True
+    assert estop.is_engaged() is False
+    assert not (coder_home / "ESTOP").exists()
+    assert not (reviewer_home / "ESTOP").exists()
+
+
+@pytest.mark.linux_only
+def test_symlinked_profile_directory_fails_closed_without_external_delete(
+    tmp_path, monkeypatch
+):
+    """Resume must not follow a profile symlink and unlink outside the root."""
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profiles_root.mkdir(parents=True)
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    external_stop = outside / "ESTOP"
+    external_stop.write_text("{}\n", encoding="utf-8")
+    (profiles_root / "linked").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+
+    assert estop.is_engaged() is True
+    with pytest.raises(estop.DisengageError, match="could not be checked safely"):
+        estop.disengage()
+    assert external_stop.is_file()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])
+def test_legacy_stop_read_fails_closed_when_profile_replaced_after_discovery(
+    tmp_path, monkeypatch, replacement_kind
+):
+    """A profile swap cannot hide the stop found in the original directory."""
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profile = profiles_root / "coder"
+    profile.mkdir(parents=True)
+    (profile / "ESTOP").write_text("{}\n", encoding="utf-8")
+    moved_profile = tmp_path / "coder-original"
+    replacement_target = tmp_path / "replacement-target"
+    replacement_target.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+    discover_entries = estop._legacy_profile_sentinel_entries
+
+    def discover_then_replace(shared_root):
+        entries = discover_entries(shared_root)
+        profile.rename(moved_profile)
+        if replacement_kind == "symlink":
+            profile.symlink_to(replacement_target, target_is_directory=True)
+        else:
+            profile.mkdir()
+        return entries
+
+    monkeypatch.setattr(
+        estop,
+        "_legacy_profile_sentinel_entries",
+        discover_then_replace,
+    )
+
+    assert estop.is_engaged() is True
+    assert (moved_profile / "ESTOP").is_file()
+    assert not (profile / "ESTOP").exists()
+    assert not (replacement_target / "ESTOP").exists()
+
+
+@pytest.mark.linux_only
+def test_legacy_stop_leaf_read_uses_anchored_profile_during_temporary_swaps(
+    tmp_path, monkeypatch
+):
+    """Two temporary empty replacements cannot hide the original stop leaf."""
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profile = profiles_root / "coder"
+    profile.mkdir(parents=True)
+    stop = profile / "ESTOP"
+    stop.write_text("{}\n", encoding="utf-8")
+    moved_profile = tmp_path / "coder-original"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+    real_lstat = estop.os.lstat
+    attacks = 0
+
+    def lstat_with_stop_temporarily_hidden(path, *args, **kwargs):
+        nonlocal attacks
+        if os.fspath(path) != os.fspath(stop):
+            return real_lstat(path, *args, **kwargs)
+        profile.rename(moved_profile)
+        profile.mkdir()
+        try:
+            return real_lstat(path, *args, **kwargs)
+        finally:
+            profile.rmdir()
+            moved_profile.rename(profile)
+            attacks += 1
+
+    monkeypatch.setattr(estop.os, "lstat", lstat_with_stop_temporarily_hidden)
+
+    # This recreates the old race: both path lookups miss while every parent
+    # validation sees the restored original directory.
+    assert estop._path_is_engaged(stop) is False
+    assert attacks == 2
+    attacks = 0
+
+    # The public gate reads ESTOP relative to its already-open, identity-
+    # checked profile directory and never performs the vulnerable path lookup.
+    assert estop.is_engaged() is True
+    assert attacks == 0
+    assert stop.is_file()
+
+
+@pytest.mark.linux_only
+def test_legacy_stop_scan_anchors_profiles_root_during_replacement(
+    tmp_path, monkeypatch
+):
+    """A temporary root replacement cannot hide an already-engaged stop."""
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profile = profiles_root / "coder"
+    profile.mkdir(parents=True)
+    (profile / "ESTOP").write_text("{}\n", encoding="utf-8")
+    moved_profiles = tmp_path / "profiles-original"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+    real_scandir = estop.os.scandir
+    swapped = False
+
+    class FrozenScandir:
+        def __init__(self, entries):
+            self._entries = iter(entries)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self._entries)
+
+    def scan_during_temporary_replacement(target):
+        nonlocal swapped
+        if swapped:
+            return real_scandir(target)
+        swapped = True
+        profiles_root.rename(moved_profiles)
+        profiles_root.mkdir()
+        try:
+            entries = list(real_scandir(target))
+        finally:
+            profiles_root.rmdir()
+            moved_profiles.rename(profiles_root)
+        return FrozenScandir(entries)
+
+    monkeypatch.setattr(
+        estop,
+        "_supports_anchored_profile_scan",
+        lambda: True,
+    )
+    monkeypatch.setattr(estop.os, "scandir", scan_during_temporary_replacement)
+
+    assert estop.is_engaged() is True
+    assert swapped is True
+    assert (profile / "ESTOP").is_file()
+
+
+@pytest.mark.linux_only
+@pytest.mark.asyncio
+async def test_gateway_pause_off_anchors_profile_during_symlink_swap(
+    tmp_path, monkeypatch
+):
+    """Chat cleanup stays on the captured directory after a profile swap."""
+    from gateway.run import GatewayRunner
+
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profile = profiles_root / "linked"
+    profile.mkdir(parents=True)
+    original_stop = profile / "ESTOP"
+    original_stop.write_text("{}\n", encoding="utf-8")
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    external_stop = outside / "ESTOP"
+    external_stop.write_text("{}\n", encoding="utf-8")
+    moved_profile = profiles_root / "linked-original"
+
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+    capture_targets = estop._sentinel_cleanup_targets
+
+    def capture_then_replace():
+        targets = capture_targets()
+        profile.rename(moved_profile)
+        profile.symlink_to(outside, target_is_directory=True)
+        return targets
+
+    monkeypatch.setattr(estop, "_sentinel_cleanup_targets", capture_then_replace)
+    runner = object.__new__(GatewayRunner)
+
+    reply = await runner._handle_pause_command(_FakePauseEvent("off"))
+
+    assert "hermes is still paused" in reply.lower()
+    assert external_stop.is_file()
+    assert not (moved_profile / "ESTOP").exists()
+
+
+def test_profile_redirect_detector_rejects_windows_reparse_attribute():
+    """The junction attribute is unsafe even when its mode says directory."""
+    junction_info = SimpleNamespace(
+        st_mode=0o040000,
+        st_file_attributes=0x400,
+    )
+
+    assert estop._is_unsafe_profile_redirect(junction_info) is True
+
+
+def test_linux_mountinfo_path_decoder_preserves_literal_escape_text():
+    encoded = r"/tmp/a\040b/actual\134040text"
+
+    assert estop._decode_mountinfo_path(encoded) == "/tmp/a b/actual\\040text"
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    "mounted_kind",
+    ["profile", "profiles_root", "post_anchor_profiles_root"],
+)
+def test_gateway_pause_off_rejects_real_bind_mounted_profiles(
+    tmp_path, mounted_kind
+):
+    """Real profile mounts cannot make chat resume delete an outside stop."""
+    unshare = shutil.which("unshare")
+    mount = shutil.which("mount")
+    if not unshare or not mount:
+        pytest.skip("unshare and mount are required for the bind-mount proof")
+
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profiles_root.mkdir(parents=True)
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    original_stop = root / "unused-original-stop"
+    if mounted_kind == "profile":
+        mount_target = profiles_root / "mounted"
+        mount_target.mkdir()
+        external_stop = outside / "ESTOP"
+    else:
+        mount_target = profiles_root
+        outside_profile = outside / "mounted"
+        outside_profile.mkdir()
+        external_stop = outside_profile / "ESTOP"
+        if mounted_kind == "post_anchor_profiles_root":
+            original_profile = profiles_root / "mounted"
+            original_profile.mkdir()
+            original_stop = original_profile / "ESTOP"
+            original_stop.write_text("{}\n", encoding="utf-8")
+    external_stop.write_text("{}\n", encoding="utf-8")
+    child = r'''
+import asyncio
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+root = Path(sys.argv[1])
+outside = Path(sys.argv[2])
+mount_target = Path(sys.argv[3])
+external_stop = Path(sys.argv[5])
+mounted_kind = sys.argv[6]
+subprocess.run([sys.argv[4], "--make-rprivate", "/"], check=True)
+if mounted_kind != "post_anchor_profiles_root":
+    subprocess.run(
+        [sys.argv[4], "--bind", str(outside), str(mount_target)],
+        check=True,
+    )
+os.environ["HERMES_HOME"] = str(root)
+
+from agent import estop
+from gateway.run import GatewayRunner
+
+if mounted_kind == "post_anchor_profiles_root":
+    original_fd_mount_id = estop._fd_mount_id
+    mount_id_calls = 0
+
+    def mount_after_profiles_anchor(fd):
+        global mount_id_calls
+        result = original_fd_mount_id(fd)
+        mount_id_calls += 1
+        if mount_id_calls == 2:
+            subprocess.run(
+                [sys.argv[4], "--bind", str(outside), str(mount_target)],
+                check=True,
+            )
+        return result
+
+    estop._fd_mount_id = mount_after_profiles_anchor
+
+class Event:
+    def get_command_args(self):
+        return "off"
+
+reply = asyncio.run(
+    object.__new__(GatewayRunner)._handle_pause_command(Event())
+)
+print(json.dumps({
+    "reply": reply,
+    "external_stop_present": external_stop.is_file(),
+}))
+'''
+    result = subprocess.run(
+        [
+            unshare,
+            "-Ur",
+            "-m",
+            sys.executable,
+            "-c",
+            child,
+            str(root),
+            str(outside),
+            str(mount_target),
+            mount,
+            str(external_stop),
+            mounted_kind,
+        ],
+        cwd=os.fspath(Path(__file__).resolve().parents[1]),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 and "Operation not permitted" in result.stderr:
+        pytest.skip("this Linux host disables unprivileged mount namespaces")
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.splitlines()[-1])
+
+    assert "hermes is still paused" in payload["reply"].lower()
+    assert payload["external_stop_present"] is True
+    assert external_stop.is_file()
+    if mounted_kind == "post_anchor_profiles_root":
+        assert not original_stop.exists()
+
+
+@pytest.mark.windows_only
+@pytest.mark.asyncio
+async def test_gateway_pause_off_rejects_windows_profile_junction(
+    tmp_path, monkeypatch
+):
+    """A post-capture Windows junction cannot redirect the real chat cleanup."""
+    from gateway.run import GatewayRunner
+
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profile = profiles_root / "linked"
+    profile.mkdir(parents=True)
+    original_stop = profile / "ESTOP"
+    original_stop.write_text("{}\n", encoding="utf-8")
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    external_stop = outside / "ESTOP"
+    external_stop.write_text("{}\n", encoding="utf-8")
+    moved_profile = profiles_root / "linked-original"
+
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+    capture_targets = estop._sentinel_cleanup_targets
+
+    def capture_then_replace():
+        targets = capture_targets()
+        profile.rename(moved_profile)
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(profile), str(outside)],
+            capture_output=True,
+        )
+        assert result.returncode == 0, result.stderr.decode(
+            "utf-8", errors="replace"
+        )
+        return targets
+
+    monkeypatch.setattr(estop, "_sentinel_cleanup_targets", capture_then_replace)
+    runner = object.__new__(GatewayRunner)
+
+    reply = await runner._handle_pause_command(_FakePauseEvent("off"))
+
+    assert "hermes is still paused" in reply.lower()
+    assert external_stop.is_file()
+    assert (moved_profile / "ESTOP").is_file()
+    assert estop.is_engaged() is True
 
 
 # ── paused notice for new gateway turns ─────────────────────────────────────
@@ -246,6 +1019,22 @@ def test_cli_pause_idempotent(hermes_home, capsys):
     assert estop.is_engaged() is True
 
 
+def test_cli_pause_reports_creation_failure(hermes_home, monkeypatch, capsys):
+    from hermes_cli.subcommands.pause import cmd_pause
+
+    def failed_engage(reason=None):
+        raise estop.EngageError("the shared stop file could not be created")
+
+    monkeypatch.setattr(estop, "engage", failed_engage)
+
+    rc = cmd_pause(argparse.Namespace(reason="maintenance"))
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert "was not paused" in captured.err.lower()
+
+
 def test_cli_resume_disengages(hermes_home, capsys):
     from hermes_cli.subcommands.pause import cmd_pause, cmd_resume
 
@@ -256,12 +1045,61 @@ def test_cli_resume_disengages(hermes_home, capsys):
     assert "resumed" in capsys.readouterr().out.lower()
 
 
+@pytest.mark.parametrize("brake_name", ["dispatch_pause.json", "halt.json"])
+def test_cli_resume_reports_remaining_kanban_brake(
+    hermes_home, capsys, brake_name
+):
+    from hermes_cli.subcommands.pause import cmd_resume
+
+    estop.engage(reason="maintenance")
+    brake = hermes_home / "state" / brake_name
+    brake.parent.mkdir()
+    brake.write_text("{}\n", encoding="utf-8")
+
+    rc = cmd_resume(argparse.Namespace())
+
+    output = capsys.readouterr().out.lower()
+    assert rc == 0
+    assert estop.is_engaged() is False
+    assert brake.is_file()
+    assert "emergency stop removed" in output
+    assert "kanban dispatch is still paused" in output
+    assert "dispatch picks up" not in output
+
+
 def test_cli_resume_when_not_paused(hermes_home, capsys):
     from hermes_cli.subcommands.pause import cmd_resume
 
     rc = cmd_resume(argparse.Namespace())
     assert rc == 0
     assert "not paused" in capsys.readouterr().out.lower()
+
+
+@pytest.mark.linux_only
+def test_cli_resume_reports_an_unsafe_profile_layout_as_still_paused(
+    tmp_path, monkeypatch, capsys
+):
+    from hermes_cli.subcommands.pause import cmd_resume
+
+    root = tmp_path / "shared-root"
+    profiles_root = root / "profiles"
+    profiles_root.mkdir(parents=True)
+    outside = tmp_path / "outside-profile"
+    outside.mkdir()
+    external_stop = outside / "ESTOP"
+    external_stop.write_text("{}\n", encoding="utf-8")
+    (profiles_root / "linked").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    rc = cmd_resume(argparse.Namespace())
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert captured.out == ""
+    assert "still paused" in captured.err.lower()
+    assert "could not be checked safely" in captured.err.lower()
+    assert estop.is_engaged() is True
+    assert external_stop.is_file()
 
 
 def test_builtin_subcommands_include_pause_resume():
@@ -294,12 +1132,24 @@ def test_is_engaged_fails_safe_on_stat_error(hermes_home, monkeypatch):
     """A stat failure must report ENGAGED (fail safe) — the pause has to
     hold even when HERMES_HOME is misbehaving, matching the module's
     corrupt-sentinel doctrine."""
-    class _BoomPath:
-        def exists(self):
-            raise OSError("permission denied")
+    sentinel = hermes_home / "ESTOP"
+    real_lstat = estop.os.lstat
+    real_optional_entry_info = estop._optional_entry_info
 
-    monkeypatch.setattr(estop, "sentinel_path", lambda: _BoomPath())
+    def denied_lstat(path, *args, **kwargs):
+        if path == sentinel:
+            raise PermissionError("permission denied")
+        return real_lstat(path, *args, **kwargs)
+
+    def denied_anchored_stat(parent_fd, name):
+        if name == estop.SENTINEL_NAME:
+            raise PermissionError("permission denied")
+        return real_optional_entry_info(parent_fd, name)
+
+    monkeypatch.setattr(estop.os, "lstat", denied_lstat)
+    monkeypatch.setattr(estop, "_optional_entry_info", denied_anchored_stat)
     assert estop.is_engaged() is True
+    assert estop.get_state() == {"reason": None, "engaged_at": None}
 
 
 class _FakeCmdEvent(_FakeEvent):
@@ -366,6 +1216,67 @@ async def test_gateway_pause_command_engages_and_resumes(hermes_home):
 
     reply = await runner._handle_pause_command(_FakePauseEvent("off"))
     assert "wasn't paused" in reply.lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("brake_name", ["dispatch_pause.json", "halt.json"])
+async def test_gateway_pause_off_reports_remaining_kanban_brake(
+    hermes_home, brake_name
+):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    estop.engage(reason="maintenance")
+    brake = hermes_home / "state" / brake_name
+    brake.parent.mkdir()
+    brake.write_text("{}\n", encoding="utf-8")
+
+    reply = await runner._handle_pause_command(_FakePauseEvent("off"))
+
+    assert estop.is_engaged() is False
+    assert brake.is_file()
+    assert "emergency stop removed" in reply.lower()
+    assert "kanban dispatch is still paused" in reply.lower()
+    assert "new work is accepted again" not in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_gateway_pause_command_reports_creation_failure(
+    hermes_home, monkeypatch
+):
+    from gateway.run import GatewayRunner
+
+    def failed_engage(reason=None):
+        raise estop.EngageError("the shared stop file could not be created")
+
+    monkeypatch.setattr(estop, "engage", failed_engage)
+    runner = object.__new__(GatewayRunner)
+
+    reply = await runner._handle_pause_command(_FakePauseEvent("maintenance"))
+
+    assert "was not paused" in reply.lower()
+    assert "new work may still be accepted" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_gateway_pause_off_reports_unsafe_cleanup(hermes_home, monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    estop.engage(reason="maintenance")
+
+    def unsafe_disengage():
+        raise estop.DisengageError("the stop paths could not be checked safely")
+
+    monkeypatch.setattr(estop, "disengage", unsafe_disengage)
+
+    reply = await runner._handle_pause_command(_FakePauseEvent("off"))
+
+    assert reply == (
+        "⏸️ Hermes is still paused — "
+        "the stop paths could not be checked safely."
+    )
+    assert estop.is_engaged() is True
 
 
 def test_pause_command_registered_for_gateway():

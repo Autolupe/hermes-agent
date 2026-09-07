@@ -619,7 +619,11 @@ def _handle_list(args: dict, **kw) -> str:
         try:
             # Match CLI list: dependencies that cleared since the last
             # dispatcher tick should be visible to orchestrators immediately.
-            promoted = kb.recompute_ready(conn)
+            try:
+                promoted = kb.recompute_ready(conn)
+            except kb.DispatchPausedError:
+                # Listing stays available, but paused cards remain parked.
+                promoted = 0
             # Fetch one extra row so model-facing output can report that
             # a bounded listing was truncated without dumping the board.
             rows = kb.list_tasks(

@@ -182,7 +182,11 @@ def create_swarm(
         # Outside the outer transaction: promote the root's children now
         # that its 'done' flip is durable (recompute_ready opens its own
         # txn and must never run under an open write_txn).
-        kb.recompute_ready(conn)
+        try:
+            kb.recompute_ready(conn)
+        except kb.DispatchPausedError:
+            # The committed swarm stays parked until dispatch resumes.
+            pass
         root = kb.get_task(conn, created.root_id)
         run = kb.latest_run(conn, created.root_id)
         kb._fire_kanban_lifecycle_hook(

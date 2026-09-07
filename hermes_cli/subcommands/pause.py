@@ -1,9 +1,10 @@
 """``hermes pause`` / ``hermes resume`` — the global emergency stop.
 
-``hermes pause`` writes the ESTOP sentinel at ``$HERMES_HOME/ESTOP``, which
-halts cron dispatch, kanban dispatch, and new gateway turns on their next
-check. In-flight work is never killed. ``hermes resume`` removes the
-sentinel and normal operation resumes on the next tick — no restart needed.
+``hermes pause`` writes the ESTOP sentinel at ``<shared-root>/ESTOP``. The
+default profile and every named profile use that same global stop, which halts
+cron dispatch, kanban dispatch, and new gateway turns on their next check.
+In-flight work is never killed. ``hermes resume`` removes the sentinel with no
+restart needed; a separate kanban dispatch pause or full halt remains in force.
 
 Ported from: gastownhall/gastown estop.go (MIT); related prior art:
 #26778 (/panic — kill/exit semantics, different), #44617.
@@ -12,15 +13,21 @@ Ported from: gastownhall/gastown estop.go (MIT); related prior art:
 from __future__ import annotations
 
 import argparse
+import sys
 
 
 def cmd_pause(args: argparse.Namespace) -> int:
     """Engage the global emergency stop."""
-    from agent.estop import engage, get_state, is_engaged
+    from agent.estop import EngageError, engage, get_state, is_engaged, sentinel_path
 
     reason = getattr(args, "reason", None)
     already = is_engaged()
-    path = engage(reason=reason)
+    try:
+        path = engage(reason=reason)
+    except EngageError as exc:
+        print(f"Hermes was not paused — {exc}.", file=sys.stderr)
+        print(f"    sentinel: {sentinel_path()}", file=sys.stderr)
+        return 1
     state = get_state() or {}
     verb = "Still paused" if already else "Hermes paused"
     detail = f" — reason: {state['reason']}" if state.get("reason") else ""
@@ -35,12 +42,37 @@ def cmd_pause(args: argparse.Namespace) -> int:
 
 def cmd_resume(args: argparse.Namespace) -> int:
     """Disengage the global emergency stop."""
-    from agent.estop import disengage, sentinel_path
+    from agent.estop import DisengageError, disengage, sentinel_path
 
-    if disengage():
+    try:
+        removed = disengage()
+    except DisengageError as exc:
+        print(f"Hermes is still paused — {exc}.", file=sys.stderr)
+        print(f"    sentinel: {sentinel_path()}", file=sys.stderr)
+        return 1
+    try:
+        from hermes_cli.kanban_db import dispatch_is_paused
+        kanban_still_paused = dispatch_is_paused()
+    except Exception:
+        kanban_still_paused = True
+    if kanban_still_paused:
+        if removed:
+            print(
+                "▶️  Emergency stop removed. Cron and new gateway turns may "
+                "resume, but kanban dispatch is still paused by its manual "
+                "pause, full halt, or unreadable brake state."
+            )
+        else:
+            print(
+                "Hermes had no emergency stop, but kanban dispatch is still "
+                "paused by its manual pause, full halt, or unreadable brake "
+                "state."
+            )
+        return 0
+    if removed:
         print("▶️  Hermes resumed — dispatch picks up on the next tick.")
-    else:
-        print(f"Hermes is not paused (no sentinel at {sentinel_path()}).")
+        return 0
+    print(f"Hermes is not paused (no sentinel at {sentinel_path()}).")
     return 0
 
 
@@ -65,6 +97,9 @@ def build_pause_parser(subparsers) -> None:
     resume_parser = subparsers.add_parser(
         "resume",
         help="Lift the emergency stop set by `hermes pause`",
-        description="Remove the ESTOP sentinel; dispatch resumes on the next tick.",
+        description=(
+            "Remove the ESTOP sentinel. A separate kanban dispatch pause or "
+            "full halt remains in force."
+        ),
     )
     resume_parser.set_defaults(func=cmd_resume)

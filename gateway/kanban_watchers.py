@@ -58,19 +58,38 @@ def _resolve_auto_decompose_settings(
 
 
 def _kanban_dispatch_allowed() -> bool:
-    """Return False while the global emergency stop (`hermes pause`) is engaged.
+    """Return False while any shared new-work brake is engaged.
 
-    Checked every dispatcher tick BEFORE spawning new workers so a pause takes
-    effect on the next tick without a gateway restart. In-flight workers are
-    never touched — this only stops NEW spawns. Fails open: if the estop
-    module is unimportable, dispatch proceeds (the sentinel gate must not
-    become a new crash surface for the dispatcher).
+    Checked before auto-decompose and dispatch on every gateway tick. The
+    resumable global emergency stop (``hermes pause``), the shared-root manual
+    dispatch pause, and the shared-root full halt all stop new work without
+    touching in-flight workers. Shared dispatch-state lookup/import failures
+    fail closed: a gateway must not start model work when it cannot prove the
+    operator brakes are absent.
     """
     try:
         from agent.estop import check_paused
-    except ImportError:
-        return True
-    return not check_paused("kanban", logger)
+    except Exception:
+        return False
+    try:
+        if check_paused("kanban", logger):
+            return False
+    except Exception:
+        return False
+    try:
+        from hermes_cli import kanban_db as _kb
+        return not _kb.dispatch_is_paused()
+    except Exception:
+        return False
+
+
+def _decompose_if_dispatch_allowed(
+    decompose_task: Callable[..., Any], task_id: str, *, author: str
+) -> Optional[Any]:
+    """Call the auto-decomposer only after a final shared-brake check."""
+    if not _kanban_dispatch_allowed():
+        return None
+    return decompose_task(task_id, author=author)
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
@@ -1533,8 +1552,10 @@ class GatewayKanbanWatchersMixin:
                             break
                         attempted += 1
                         try:
-                            outcome = _decomp.decompose_task(
-                                tid, author="auto-decomposer",
+                            outcome = _decompose_if_dispatch_allowed(
+                                _decomp.decompose_task,
+                                tid,
+                                author="auto-decomposer",
                             )
                         except Exception:
                             logger.exception(
@@ -1542,6 +1563,10 @@ class GatewayKanbanWatchersMixin:
                                 tid,
                             )
                             continue
+                        if outcome is None:
+                            # A pause/halt landed after the outer tick gate.
+                            # Stop this tick before any further model work.
+                            return successes
                         if outcome.ok:
                             successes += 1
                             if outcome.fanout and outcome.child_ids:
@@ -1586,9 +1611,10 @@ class GatewayKanbanWatchersMixin:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
-                # Global emergency stop (`hermes pause`): skip auto-decompose
-                # and dispatch entirely — no new workers while paused. Running
-                # workers finish naturally; zombie reaping above still runs.
+                # Shared new-work brakes: skip auto-decompose and dispatch
+                # entirely under the global emergency stop, a manual dispatch
+                # pause, or a full halt. Running workers finish naturally;
+                # zombie reaping above still runs.
                 if not _kanban_dispatch_allowed():
                     ready_pending = False
                     bad_ticks = 0

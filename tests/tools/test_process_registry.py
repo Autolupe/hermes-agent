@@ -2413,3 +2413,21 @@ class TestGetByPrefix:
         result = registry.poll("4dae56ca")
         assert result["session_id"] == "proc_4dae56ca81f6"
         assert result["status"] == "running"
+
+
+def test_dashboard_cgroup_is_treated_as_supervised_runtime(monkeypatch):
+    import tools.process_registry as pr
+
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+    monkeypatch.setattr(
+        pr.Path,
+        "read_text",
+        lambda self, **kwargs: (
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            "hermes-dashboard.service\n"
+        )
+        if str(self) == "/proc/self/cgroup"
+        else "max\n",
+    )
+
+    assert pr._is_supervised_gateway_process() is True

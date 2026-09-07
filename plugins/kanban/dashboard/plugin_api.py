@@ -1130,6 +1130,20 @@ def _set_status_direct(
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
+    try:
+        if new_status in {"ready", "review"}:
+            kanban_db._raise_if_dispatch_paused()
+        return _set_status_direct_guarded(conn, task_id, new_status)
+    except kanban_db.DispatchPausedError:
+        # The dashboard already maps False to a conflict response. A brake
+        # should refuse this status action without leaking an internal error.
+        return False
+
+
+def _set_status_direct_guarded(
+    conn: sqlite3.Connection, task_id: str, new_status: str,
+) -> bool:
+    """Apply a direct status write with in-transaction brake checks."""
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
@@ -1152,6 +1166,11 @@ def _set_status_direct(
                     if kanban_db._parents_satisfied(conn, task_id)
                     else "todo"
                 )
+
+        if effective_status in {"ready", "review"}:
+            # Repeat after BEGIN IMMEDIATE: a stop may have appeared while the
+            # dashboard waited behind another writer.
+            kanban_db._raise_if_dispatch_paused()
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.
         # Prevents the dispatcher from spawning a child whose upstream work
@@ -1219,11 +1238,24 @@ def _set_status_direct(
                 task_id,
                 terminations,
             )
+        if effective_status in {"ready", "review"}:
+            # A brake raised by a trace hook or concurrent operator during the
+            # writes rolls the task update and its audit event back together.
+            kanban_db._raise_if_dispatch_paused()
+    if effective_status in {"ready", "review"}:
+        kanban_db._park_runnable_transitions_after_commit(
+            conn,
+            ((task_id, effective_status, "status"),),
+        )
     for pid, claim_lock in terminations:
         kanban_db._terminate_reclaimed_worker(pid, claim_lock)
     # If we re-opened something, children may have gone stale.
     if effective_status in {"done", "ready", "review"}:
-        kanban_db.recompute_ready(conn)
+        try:
+            kanban_db.recompute_ready(conn)
+        except kanban_db.DispatchPausedError:
+            # Keep the edit, but do not create runnable work while paused.
+            pass
     return True
 
 
@@ -1807,9 +1839,9 @@ def specify_task_endpoint(
     it to ``todo``. Maps 1:1 to ``hermes kanban specify <task_id>``.
 
     Returns the outcome shape used by the CLI: ``{ok, task_id, reason,
-    new_title}``. A non-OK outcome is NOT an HTTP error — the UI renders
-    the reason inline (e.g. "no auxiliary client configured") so the
-    operator knows what to fix, and retries without a page reload.
+    new_title, parked}``. A non-OK or parked outcome is NOT an HTTP error —
+    the UI renders the reason inline so the operator knows what happened and
+    can retry without a page reload.
 
     This endpoint runs in FastAPI's threadpool (sync ``def``) because
     the underlying LLM call can take tens of seconds to minutes on
@@ -1838,6 +1870,7 @@ def specify_task_endpoint(
         "task_id": outcome.task_id,
         "reason": outcome.reason,
         "new_title": outcome.new_title,
+        "parked": bool(getattr(outcome, "parked", False)),
     }
 
 
@@ -2763,8 +2796,8 @@ def decompose_task_endpoint(
     1:1 to ``hermes kanban decompose <task_id>``.
 
     Returns the outcome shape used by the CLI: ``{ok, task_id, reason,
-    fanout, child_ids, new_title}``. A non-OK outcome is NOT an HTTP
-    error — the UI renders the reason inline.
+    fanout, child_ids, new_title, parked}``. A non-OK or parked outcome is
+    NOT an HTTP error — the UI renders the reason inline.
 
     Runs in FastAPI's threadpool (sync ``def``) because the LLM call
     can take minutes on reasoning models.
@@ -2788,6 +2821,7 @@ def decompose_task_endpoint(
         "fanout": bool(outcome.fanout),
         "child_ids": outcome.child_ids or [],
         "new_title": outcome.new_title,
+        "parked": bool(getattr(outcome, "parked", False)),
     }
 
 

@@ -97,6 +97,7 @@ class SpecifyOutcome:
     ok: bool
     reason: str = ""
     new_title: Optional[str] = None
+    parked: bool = False
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -139,6 +140,15 @@ def _profile_author() -> str:
     )
 
 
+def _new_work_is_blocked() -> bool:
+    """Return True unless the full Kanban stop boundary is definitely clear."""
+    try:
+        kb._raise_if_dispatch_paused()
+    except Exception:
+        return True
+    return False
+
+
 def specify_task(
     task_id: str,
     *,
@@ -160,6 +170,8 @@ def specify_task(
         return SpecifyOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    if _new_work_is_blocked():
+        return SpecifyOutcome(task_id, False, "dispatch is paused or halted")
 
     try:
         from agent.auxiliary_client import call_llm
@@ -172,6 +184,11 @@ def specify_task(
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
     )
+
+    # Imports and prompt setup can take time. Recheck at the actual model edge
+    # so an operator stop never starts a new planning request.
+    if _new_work_is_blocked():
+        return SpecifyOutcome(task_id, False, "dispatch is paused or halted")
 
     try:
         # Route through call_llm so auxiliary.triage_specifier.* config
@@ -187,6 +204,10 @@ def specify_task(
             max_tokens=HERMES_KANBAN_SPECIFY_MAX_TOKENS,
             timeout=timeout or 120,
         )
+        # An in-flight request cannot be safely cancelled here, but a stop that
+        # lands while it runs must prevent parsing and every later DB mutation.
+        if _new_work_is_blocked():
+            return SpecifyOutcome(task_id, False, "dispatch is paused or halted")
     except Exception as exc:
         logger.info(
             "specify: API call failed for %s (%s) — skipping",
@@ -232,21 +253,33 @@ def specify_task(
                 task_id, False, "LLM response missing title and body"
             )
 
+    if _new_work_is_blocked():
+        return SpecifyOutcome(task_id, False, "dispatch is paused or halted")
     with kb.connect_closing() as conn:
-        ok = kb.specify_triage_task(
-            conn,
-            task_id,
-            title=new_title,
-            body=new_body,
-            author=author or _profile_author(),
-        )
+        try:
+            ok = kb.specify_triage_task(
+                conn,
+                task_id,
+                title=new_title,
+                body=new_body,
+                author=author or _profile_author(),
+            )
+        except kb.DispatchPausedError:
+            return SpecifyOutcome(task_id, False, "dispatch is paused or halted")
     if not ok:
         # Race: someone else promoted / archived the task between our
         # read above and the write. Report, don't crash.
         return SpecifyOutcome(
             task_id, False, "task moved out of triage before promotion"
         )
-    return SpecifyOutcome(task_id, True, "specified", new_title=new_title)
+    parked = _new_work_is_blocked()
+    return SpecifyOutcome(
+        task_id,
+        True,
+        "specified; dispatch is paused or halted" if parked else "specified",
+        new_title=new_title,
+        parked=parked,
+    )
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
