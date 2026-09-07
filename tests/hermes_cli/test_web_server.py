@@ -5013,3 +5013,33 @@ class TestSessionPatchUnread:
         # a string outside the accepted set to prove validation rejects it.
         resp = self.auth_client.patch("/api/sessions/s1", json={"unread": "maybe"})
         assert resp.status_code == 422  # pydantic validation
+
+
+def test_wildcard_bind_uses_configured_dashboard_host_allowlist(monkeypatch):
+    from hermes_cli import web_server
+
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_ALLOWED_HOSTS",
+        "127.0.0.1,100.115.1.128,openclaw-cax41.tail465e59.ts.net",
+    )
+
+    assert web_server._is_accepted_host("127.0.0.1:9120", "0.0.0.0")
+    assert web_server._is_accepted_host("100.115.1.128:9120", "0.0.0.0")
+    assert web_server._is_accepted_host(
+        "openclaw-cax41.tail465e59.ts.net.:9120", "0.0.0.0"
+    )
+    assert not web_server._is_accepted_host("attacker.example", "0.0.0.0")
+
+
+def test_dashboard_security_headers_are_applied():
+    from fastapi import Response
+    from hermes_cli import web_server
+
+    response = Response()
+
+    web_server._apply_dashboard_security_headers(response)
+
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "SAMEORIGIN"
+    assert response.headers["Referrer-Policy"] == "no-referrer"
+    assert response.headers["X-XSS-Protection"] == "0"

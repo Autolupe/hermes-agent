@@ -246,14 +246,29 @@ def _systemd_run_user_scope_available() -> bool:
 
 
 def _is_supervised_gateway_process() -> bool:
-    """Return whether this process is in a supervised Hermes gateway runtime.
+    """Return whether this process belongs to a supervised Hermes runtime.
 
-    Both supervisor markers and ``_HERMES_GATEWAY`` are inherited by every
-    descendant, and importing ``gateway.run`` also sets the latter. Require
-    this process to own the live gateway PID file as well. That keeps transient
-    systemd scopes limited to the gateway itself instead of terminal children
-    or unrelated interactive CLIs in the same supervised process tree.
+    Dashboard and Serve chat descendants are identified from their systemd
+    cgroup. Their local terminal workers need the same sibling-scope isolation
+    as gateway workers; otherwise a test/build runs inside the web service's
+    memory budget and can freeze HTTP and WebSocket handling.
+
+    The gateway path retains the stricter marker + live-PID identity check.
+    A worker already moved into ``hermes-worker-*.scope`` no longer matches a
+    dashboard/Serve cgroup, preventing unnecessary nested scopes.
     """
+    try:
+        cgroup_text = Path("/proc/self/cgroup").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        if any(
+            f"/{unit}" in cgroup_text
+            for unit in ("hermes-dashboard.service", "hermes-serve.service")
+        ):
+            return True
+    except OSError:
+        pass
+
     if os.environ.get("_HERMES_GATEWAY") != "1":
         return False
 
