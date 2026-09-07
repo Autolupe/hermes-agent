@@ -136,6 +136,33 @@ def test_no_enrollment_preserves_ordinary_behavior_without_import(enrolled):
     assert f.registry.select() is None
 
 
+def test_production_registry_is_independent_of_private_legacy_hermes_ancestry():
+    requested = []
+
+    class AbsentFiles:
+        def read(self, path, **kwargs):
+            requested.append(path)
+            assert kwargs["missing_ok"] is True
+            return None
+
+    registry = policy._RequiredPolicyRegistry(policy._REGISTRY_DIRECTORY,
+                                             files=AbsentFiles(), identity=lambda: (12345, 12345))
+    assert registry.select() is None
+    assert requested == [Path("/etc/hermes-required-kanban-policies.d/uid-12345.toml")]
+
+
+def test_unreadable_fixture_registry_stays_failed_closed(enrolled, monkeypatch):
+    def denied(*args, **kwargs):
+        raise PermissionError("fixture denied")
+
+    with monkeypatch.context() as blocked:
+        blocked.setattr(policy.os, "open", denied)
+        with pytest.raises(policy.RequiredPolicyError, match="read safely"):
+            enrolled.registry.select()
+    with pytest.raises(policy.RequiredPolicyError, match="invalidated"):
+        enrolled.registry.select()
+
+
 def test_other_uid_enrollment_does_not_change_ordinary_behavior(enrolled):
     f = enrolled
     f.identities[:] = [55555, 55555]

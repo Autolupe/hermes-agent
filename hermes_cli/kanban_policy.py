@@ -1,10 +1,10 @@
 """Select an administrator-required Kanban policy without granting admission.
 
-This module is deliberately not wired into dispatch or completion yet. A loaded
-provider is not permission to materialize a workspace, launch a worker, or finish
-a task. Those boundaries still need live request and opened-database binding.
+The native workspace request calls this provider directly, not through optional
+observer hooks. A loaded provider is not permission to materialize a workspace,
+launch a worker, or finish a task. No positive provider ships here.
 
-POSIX enrollment is fixed at /etc/hermes/required-kanban-policies.d/uid-N.toml.
+POSIX enrollment is fixed at /etc/hermes-required-kanban-policies.d/uid-N.toml.
 Only initial absence means ordinary Hermes behavior. User config, profiles,
 environment overrides and optional plugin discovery cannot remove an obligation.
 The isolated service deployment is the concrete external consumer; its provider,
@@ -31,7 +31,7 @@ from typing import Callable, Mapping
 import uuid
 
 
-_REGISTRY_DIRECTORY = Path("/etc/hermes/required-kanban-policies.d")
+_REGISTRY_DIRECTORY = Path("/etc/hermes-required-kanban-policies.d")
 _ENTRY_POINT_GROUP = "hermes_agent.plugins"
 _MAX_REGISTRATION = 64 * 1024
 _MAX_FILE = 512 * 1024
@@ -44,12 +44,32 @@ class RequiredPolicyError(RuntimeError):
 
 
 class RequiredKanbanPolicy:
-    """Base for the selected external provider, not an admission interface.
+    """Base for the selected external provider; unsupported by default.
 
-    The provider registers with ``ctx.register_kanban_policy(instance)``. There
-    are intentionally no success, workspace-admission or completion methods in
-    this first increment. Registration cannot substitute for either boundary.
+    The concrete protected provider must prove the actual opened database and
+    fresh request. Merely importing this class cannot grant workspace access.
     """
+
+    def open_workspace_request(self, request) -> RequiredWorkspaceAdmission:
+        raise RequiredPolicyError("Required workspace admission is unsupported.")
+
+
+class RequiredWorkspaceAdmission:
+    """Live provider-owned checks, never a serialized approval record.
+
+    ``request`` retains the original native connection. A future supported
+    adapter must examine that actual connection; its pathname or Python object
+    identity is not opened-file proof. Checkpoints grant no worker launch.
+    """
+
+    def checkpoint(self, boundary: str, observation: Mapping[str, object]) -> None:
+        raise RequiredPolicyError("Required workspace admission is unsupported.")
+
+    def cancel(self, reason: str) -> None:
+        """Release provider resources after native cancellation is already sticky."""
+
+    def close(self) -> None:
+        """Release provider resources; closing never grants or restores admission."""
 
 
 @dataclass(frozen=True)
@@ -447,8 +467,8 @@ _production_registry = _RequiredPolicyRegistry(_REGISTRY_DIRECTORY)
 def select_required_policy() -> RequiredPolicyRegistration | None:
     """Load a required provider for this OS identity, with no caller overrides.
 
-    This currently has no production callers. It performs no workspace, board,
-    credential or completion action. Native non-POSIX installations retain their
+    Selection itself performs no workspace, board, credential or completion
+    action. Native non-POSIX installations retain their
     ordinary behavior; this enrollment contract is POSIX-only.
     """
     if os.name != "posix":

@@ -2131,8 +2131,26 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, task.id, str(workspace))
+        try:
+            with kb.required_workspace_request(
+                conn, task_id=task.id, expected_run_id=task.current_run_id,
+                expected_claim_lock=task.claim_lock,
+            ) as request:
+                if request is None:
+                    workspace = kb.resolve_workspace(task)
+                    kb.set_workspace_path(conn, task.id, str(workspace))
+                else:
+                    branch = None
+                    if task.workspace_kind == "worktree":
+                        workspace, branch = kb._resolve_worktree_workspace(task, conn=conn)
+                    else:
+                        workspace = kb.resolve_workspace(task)
+                    kb._persist_dispatch_workspace(
+                        conn, task, workspace, branch, request.materialization, board=None,
+                    )
+        except kb._required_policy.RequiredPolicyError:
+            print("cannot claim: required workspace admission is unavailable", file=sys.stderr)
+            return 1
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
     return 0

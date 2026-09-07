@@ -91,6 +91,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli import kanban_policy as _required_policy
+from hermes_cli import kanban_workspace_policy as _workspace_policy
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -9791,6 +9793,9 @@ def _directory_identity(path: Path) -> Optional[tuple[int, int]]:
 
 def _mkdir_workspace(path: Path) -> bool:
     """Create ``path`` and report whether this call created the leaf."""
+    request = _workspace_policy.current_request(boundary="before_directory_create")
+    if request is not None:
+        request.checkpoint("directory_target", workspace=str(path))
     try:
         path.mkdir(parents=True, exist_ok=False)
         return True
@@ -10199,6 +10204,25 @@ def _fetch_origin_main(repo_root: Path) -> None:
     worktree. Any failure is logged and ignored — the caller falls back to
     the local ``origin/main`` ref.
     """
+    request = _workspace_policy.current_request(boundary="before_fetch")
+    if request is not None:
+        request.bind_repository(str(_git_common_dir(repo_root)))
+        try:
+            fetched = subprocess.run(
+                ["git", "-C", str(repo_root), "fetch", "origin", "main"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=_ORIGIN_MAIN_FETCH_TIMEOUT_SECONDS, check=False,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+            if fetched.returncode != 0:
+                raise _required_policy.RequiredPolicyError("Required workspace fetch failed.")
+            request.checkpoint("after_fetch", repository=str(repo_root.resolve()))
+        except BaseException as exc:
+            request.cancel("fetch_failed")
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise _required_policy.RequiredPolicyError("Required workspace fetch failed.") from exc
+        return  # Do not read or populate the ordinary attempt cache.
     key = str(repo_root)
     now = time.monotonic()
     last = _ORIGIN_MAIN_FETCHED_AT.get(key)
@@ -10216,6 +10240,7 @@ def _fetch_origin_main(repo_root: Path) -> None:
         )
     except Exception:
         _log.debug("git fetch origin main failed in %s", repo_root, exc_info=True)
+    _workspace_policy.current_request(boundary="after_fetch")
 
 
 def _worktree_base_ref(repo_root: Path) -> tuple[str, bool]:
@@ -10226,6 +10251,7 @@ def _worktree_base_ref(repo_root: Path) -> tuple[str, bool]:
     (no token → fail-soft), then verifies the local ``origin/main`` ref.
     Returns ``(ref, fell_back)``.
     """
+    request = _workspace_policy.current_request(boundary="before_base_selection")
     _fetch_origin_main(repo_root)
     try:
         verify = subprocess.run(
@@ -10237,9 +10263,20 @@ def _worktree_base_ref(repo_root: Path) -> tuple[str, bool]:
             check=False,
         )
     except Exception:
+        _workspace_policy.current_request(boundary="base_failed")
+        if request is not None:
+            request.cancel("base_ref_unavailable")
+            raise _required_policy.RequiredPolicyError("Required workspace base is unavailable.") from None
         return "HEAD", True
+    _workspace_policy.current_request(boundary="after_base_selection")
     if verify.returncode == 0 and (verify.stdout or "").strip():
+        if request is not None:
+            request.checkpoint("base_ready", repository=str(repo_root.resolve()),
+                               base_oid=verify.stdout.strip())
         return "origin/main", False
+    if request is not None:
+        request.cancel("base_ref_unavailable")
+        raise _required_policy.RequiredPolicyError("Required workspace cannot fall back to HEAD.")
     return "HEAD", True
 
 
@@ -10280,6 +10317,7 @@ def _capture_created_worktree(
         )
 
 
+@_workspace_policy.guard_materialization
 def _ensure_git_worktree(
     repo_root: Path,
     target: Path,
@@ -10294,6 +10332,10 @@ def _ensure_git_worktree(
     ``worktree_base_fallback`` event). Raises ``WorkspaceBusyError`` when
     the tree already exists and a live hermes process holds its lock.
     """
+    request = _workspace_policy.current_request(boundary="before_materialize")
+    if request is not None:
+        request.bind_repository(str(_git_common_dir(repo_root)))
+        request.checkpoint("worktree_target", workspace=str(target), branch=branch_name)
     target = target.expanduser()
     target_was_missing = False
     try:
@@ -10307,6 +10349,8 @@ def _ensure_git_worktree(
         target_common = _git_common_dir(target)
         if target_common == repo_common:
             _assert_worktree_not_busy(repo_root, target)
+            if request is not None:
+                request.checkpoint("worktree_reused", workspace=str(target), branch=branch_name)
             return False
     target.parent.mkdir(parents=True, exist_ok=True)
     fell_back = False
@@ -10320,6 +10364,8 @@ def _ensure_git_worktree(
             str(target), base_ref,
         ]
     try:
+        if request is not None:
+            request.checkpoint("before_worktree_add", workspace=str(target), branch=branch_name)
         result = subprocess.run(
             cmd,
             capture_output=True,
@@ -10367,6 +10413,7 @@ def _note_worktree_base_fallback(
         _log.debug("could not record worktree_base_fallback for %s", task_id, exc_info=True)
 
 
+@_workspace_policy.guard_workspace
 def _resolve_worktree_workspace(
     task: Task,
     *,
@@ -10426,6 +10473,9 @@ def _resolve_worktree_workspace(
     requested_resolved = requested.resolve(strict=False)
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
+        request = _workspace_policy.current_request(boundary="before_worktree_reuse")
+        if request is not None:
+            request.bind_repository(str(_git_common_dir(requested)))
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
             # Another live hermes process may still own this checkout.
@@ -10453,6 +10503,9 @@ def _resolve_worktree_workspace(
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
         # than failing dispatch.
+        if request is not None:
+            request.cancel("worktree_branch_mismatch")
+            raise _required_policy.RequiredPolicyError("Required workspace branch does not match.")
         _assert_worktree_not_busy(requested, requested)
         return requested_resolved, actual_branch or branch_name
 
@@ -10478,6 +10531,7 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+@_workspace_policy.guard_workspace
 def resolve_workspace(
     task: Task,
     *,
@@ -10556,6 +10610,10 @@ def resolve_workspace(
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
+    request = _workspace_policy.current_request(conn=conn, task_id=task_id, boundary="set_workspace")
+    if request is not None:
+        _persist_required_workspace(conn, request, str(path), request.stored_workspace[1])
+        return
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
@@ -10566,11 +10624,176 @@ def set_workspace_path(
 def set_branch_name(
     conn: sqlite3.Connection, task_id: str, branch_name: str
 ) -> None:
+    request = _workspace_policy.current_request(conn=conn, task_id=task_id, boundary="set_branch")
+    if request is not None:
+        _persist_required_workspace(conn, request, request.stored_workspace[0], str(branch_name))
+        return
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
             (str(branch_name), task_id),
         )
+
+
+def _persist_required_workspace(conn, request, workspace, branch) -> None:
+    """Only mutate the request's exact run; caller owns compensating cleanup."""
+    if conn is not request.connection:
+        request.cancel("connection_mismatch")
+        raise _required_policy.RequiredPolicyError("Required workspace connection does not match.")
+    proposed = (workspace, branch)
+    request.checkpoint("before_persist", workspace=workspace, branch=branch)
+    request.pending_workspace = proposed
+    with write_txn(conn):
+        _raise_if_dispatch_paused()
+        request.checkpoint("persist_locked", workspace=workspace, branch=branch)
+        changed = conn.execute(
+            "UPDATE tasks SET workspace_path = ?, branch_name = ? "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? AND claim_lock = ? "
+            "AND workspace_path IS ? AND branch_name IS ?",
+            (*proposed, request.claim.task_id, request.claim.run_id,
+             request.claim.claim_lock, *request.stored_workspace),
+        )
+        if changed.rowcount != 1:
+            request.cancel("workspace_compare_failed")
+            raise _required_policy.RequiredPolicyError("Required workspace changed before persistence.")
+        request.checkpoint("before_persist_commit", expected_workspace=proposed,
+                           workspace=workspace, branch=branch)
+        _raise_if_dispatch_paused()
+    _raise_if_dispatch_paused()
+    request.workspace_persisted(proposed)
+
+
+def _restore_required_workspace(conn, request) -> bool:
+    """Compensate exact owned pointers only, never the next claim's state."""
+    claim = request.claim
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock, workspace_path, branch_name, worker_pid "
+            "FROM tasks WHERE id = ?", (claim.task_id,),
+        ).fetchone()
+        run = conn.execute(
+            "SELECT task_id, claim_lock, status, ended_at, worker_pid FROM task_runs WHERE id = ?",
+            (claim.run_id,),
+        ).fetchone()
+        if (row is None or row["status"] != "running"
+                or row["current_run_id"] != claim.run_id or row["claim_lock"] != claim.claim_lock
+                or row["worker_pid"] is not None or run is None
+                or run["task_id"] != claim.task_id or run["claim_lock"] != claim.claim_lock
+                or run["status"] != "running" or run["ended_at"] is not None
+                or run["worker_pid"] is not None):
+            return False
+        current = (row["workspace_path"], row["branch_name"])
+        if current == claim.original_workspace:
+            return True
+        if request.pending_workspace is None or current != request.pending_workspace:
+            return False
+        return conn.execute(
+            "UPDATE tasks SET workspace_path = ?, branch_name = ? "
+            "WHERE id = ? AND status = 'running' AND current_run_id = ? AND claim_lock = ? "
+            "AND workspace_path IS ? AND branch_name IS ?",
+            (*claim.original_workspace, claim.task_id, claim.run_id, claim.claim_lock, *current),
+        ).rowcount == 1
+
+
+@contextlib.contextmanager
+def required_workspace_request(
+    conn, *, task_id, expected_run_id, expected_claim_lock, board=None,
+    lane="manual", materialization=None,
+):
+    """Native request plus exact-claim compensation, never a pathname proof.
+
+    Direct callers keep this context open through workspace persistence. No
+    serialized object or closed context can authorize subsequent worker start.
+    """
+    request = None
+    required = True
+    binding_valid = (
+        isinstance(conn, sqlite3.Connection) and type(task_id) is str and bool(task_id)
+        and type(expected_run_id) is int and expected_run_id > 0
+        and type(expected_claim_lock) is str and bool(expected_claim_lock)
+    )
+    materialization = materialization or _WorkspaceMaterialization()
+    try:
+        required = _required_policy.select_required_policy() is not None
+        if required and not binding_valid:
+            raise _required_policy.RequiredPolicyError("Required workspace claim binding is missing or invalid.")
+        with _workspace_policy.workspace_request(
+            conn, task_id=task_id, expected_run_id=expected_run_id,
+            expected_claim_lock=expected_claim_lock,
+            board=board if board is not None else get_current_board(), lane=lane,
+        ) as request:
+            if request is not None:
+                request.materialization = materialization
+            yield request
+    except BaseException:
+        if required and binding_valid:
+            if request is not None:
+                request.cancel("native_request_failed")
+                try:
+                    restored = _restore_required_workspace(conn, request)
+                except Exception:
+                    restored = False
+                if not restored:
+                    materialization.identity = None
+            _rollback_workspace_materialization(materialization)
+            _release_required_claim(conn, task_id, expected_run_id, expected_claim_lock)
+        raise
+
+
+def _release_required_claim(conn, task_id, run_id, claim_lock) -> None:
+    """Never downgrade missing request binding to optional, task-ID-only guards."""
+    if (not isinstance(conn, sqlite3.Connection) or type(task_id) is not str or not task_id
+            or type(run_id) is not int or run_id <= 0 or type(claim_lock) is not str or not claim_lock):
+        return
+    try:
+        _release_paused_claim(
+            conn, task_id, event_kind="required_workspace_denied",
+            summary="required workspace request refused before worker start",
+            expected_run_id=run_id, expected_claim_lock=claim_lock, require_unspawned=True,
+        )
+    except Exception:
+        # Preserve the primary refusal if the connection was closed or cleanup
+        # cannot obtain its transaction. No worker is admitted on this path.
+        _log.warning("Could not compensate an exact required workspace claim; preserved its state")
+
+
+def _required_dispatch_workspace(conn, claimed, *, board, lane, result) -> bool:
+    """Handle an enrolled claim in one shared lane, without optional hooks.
+
+    Controlled launch is unsupported. A provider which approves preparation
+    still cannot enable a native or injected process start in this increment.
+    """
+    task_id, run_id, claim_lock = claimed.id, claimed.current_run_id, claimed.claim_lock
+    try:
+        if _required_policy.select_required_policy() is None:
+            return False
+        materialization = _WorkspaceMaterialization()
+        with required_workspace_request(
+            conn, task_id=task_id, expected_run_id=run_id,
+            expected_claim_lock=claim_lock, board=board, lane=lane,
+            materialization=materialization,
+        ) as request:
+            _raise_if_dispatch_paused()
+            branch = None
+            if claimed.workspace_kind == "worktree":
+                workspace, branch = _resolve_worktree_workspace(
+                    claimed, board=board, conn=conn, materialization=materialization,
+                )
+            else:
+                workspace = resolve_workspace(claimed, board=board, materialization=materialization)
+            _persist_dispatch_workspace(conn, claimed, workspace, branch, materialization, board=board)
+            request.checkpoint("before_spawn", workspace=str(workspace), branch=branch)
+            # No callback-name, signature, JSON or provider return can replace
+            # the missing controlled-launch contract. Do not call spawn_fn.
+            _workspace_policy.require_supported_worker_launch(request)
+    except (Exception, KeyboardInterrupt, SystemExit) as exc:
+        # The context already compensates admitted requests. This exact release
+        # also covers selector failure before context entry; it is idempotent.
+        _release_required_claim(conn, task_id, run_id, claim_lock)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        result.claim_guarded.append((task_id, "required_workspace_denied"))
+    return True
 
 
 def _remove_created_empty_directory(
@@ -10707,6 +10930,14 @@ def _persist_dispatch_workspace(
     board: Optional[str],
 ) -> None:
     """Persist one resolved workspace only while every dispatch brake is open."""
+    request = _workspace_policy.current_request(conn=conn, task_id=claimed.id,
+                                                board=board, boundary="persist_workspace")
+    if request is not None:
+        request.check_task(claimed)
+        branch = resolved_branch_name if claimed.workspace_kind == "worktree" else claimed.branch_name
+        _persist_required_workspace(conn, request, str(workspace), branch)
+        claimed.workspace_path, claimed.branch_name = request.stored_workspace
+        return
     original_workspace_path = claimed.workspace_path
     original_branch_name = claimed.branch_name
     branch_name: Optional[str] = None
@@ -10739,13 +10970,17 @@ def _persist_dispatch_workspace(
         # A brake that closed while this transaction was writing rolls every
         # workspace, branch, and fallback-event change back together.
         _raise_if_dispatch_paused()
+        _workspace_policy.current_request(conn=conn, task_id=claimed.id,
+                                           board=board, boundary="before_workspace_commit")
     try:
         # A stop can win while SQLite is executing COMMIT, after the final
         # in-transaction check. Recheck at the first post-commit edge so the
         # caller's existing resolution cleanup removes the exact directory or
         # worktree it just created instead of retaining an unspawned workspace.
         _raise_if_dispatch_paused()
-    except DispatchPausedError:
+        _workspace_policy.current_request(conn=conn, task_id=claimed.id,
+                                           board=board, boundary="after_workspace_commit")
+    except (DispatchPausedError, _required_policy.RequiredPolicyError):
         persisted_branch_name = (
             branch_name if branch_name is not None else original_branch_name
         )
@@ -12439,6 +12674,7 @@ def _release_paused_claim(
     payload_extra: Optional[dict] = None,
     expected_claim_lock: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    require_unspawned: bool = False,
 ) -> None:
     """Release a claimed task without counting a failure.
 
@@ -12451,7 +12687,7 @@ def _release_paused_claim(
     now = int(time.time())
     with write_txn(conn):
         row = conn.execute(
-            "SELECT current_run_id, claim_lock FROM tasks "
+            "SELECT current_run_id, claim_lock, worker_pid FROM tasks "
             "WHERE id = ? AND status = 'running'",
             (task_id,),
         ).fetchone()
@@ -12459,6 +12695,15 @@ def _release_paused_claim(
             return
         run_id = row["current_run_id"]
         claim_lock = row["claim_lock"]
+        if require_unspawned:
+            run = conn.execute(
+                "SELECT task_id, claim_lock, status, ended_at, worker_pid FROM task_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if (row["worker_pid"] is not None or run is None or run["worker_pid"] is not None
+                    or run["task_id"] != task_id or run["claim_lock"] != claim_lock
+                    or run["status"] != "running" or run["ended_at"] is not None):
+                return
         if (
             expected_run_id is not None
             and run_id != int(expected_run_id)
@@ -12541,6 +12786,10 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
+    request = _workspace_policy.current_request(conn=conn, task_id=task_id, boundary="before_pid_write")
+    if request is not None:
+        _set_required_worker_pid(conn, request, pid)
+        return
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
@@ -12553,6 +12802,104 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 (int(pid), run_id),
             )
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+
+
+def _set_required_worker_pid(conn, request, pid) -> None:
+    """Exact-claim PID bookkeeping; not permission to create a process."""
+    if conn is not request.connection:
+        request.cancel("connection_mismatch")
+        raise _required_policy.RequiredPolicyError("Required worker connection does not match.")
+    if type(pid) is not int or pid <= 0:
+        request.cancel("invalid_worker_pid")
+        raise _required_policy.RequiredPolicyError("Required worker PID is invalid.")
+    claim = request.claim
+    event_id = None
+    try:
+        with write_txn(conn):
+            request.checkpoint("pid_write_locked")
+            task_changed = conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ? AND status = 'running' "
+                "AND current_run_id = ? AND claim_lock = ? AND worker_pid IS NULL",
+                (pid, claim.task_id, claim.run_id, claim.claim_lock),
+            ).rowcount
+            run_changed = conn.execute(
+                "UPDATE task_runs SET worker_pid = ? WHERE id = ? AND task_id = ? "
+                "AND claim_lock = ? AND status = 'running' AND ended_at IS NULL AND worker_pid IS NULL",
+                (pid, claim.run_id, claim.task_id, claim.claim_lock),
+            ).rowcount
+            if task_changed != 1 or run_changed != 1:
+                raise _required_policy.RequiredPolicyError("Required worker claim changed before PID persistence.")
+            _append_event(conn, claim.task_id, "spawned", {"pid": pid}, run_id=claim.run_id)
+            event_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            request.checkpoint("before_pid_commit")
+        request.checkpoint("after_pid_commit")
+    except BaseException:
+        request.cancel("worker_pid_write_failed")
+        # A failure may occur just after COMMIT. Compensate both rows and the
+        # introduced event together only if every exact old-value check wins.
+        if event_id is not None:
+            with write_txn(conn):
+                row = conn.execute(
+                    "SELECT 1 FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+                    "WHERE t.id = ? AND t.status = 'running' AND t.current_run_id = ? "
+                    "AND t.claim_lock = ? AND t.worker_pid = ? AND r.task_id = t.id "
+                    "AND r.claim_lock = ? AND r.worker_pid = ? AND r.ended_at IS NULL",
+                    (claim.task_id, claim.run_id, claim.claim_lock, pid, claim.claim_lock, pid),
+                ).fetchone()
+                if row is not None:
+                    conn.execute("UPDATE tasks SET worker_pid = NULL WHERE id = ?", (claim.task_id,))
+                    conn.execute("UPDATE task_runs SET worker_pid = NULL WHERE id = ?", (claim.run_id,))
+                    conn.execute("DELETE FROM task_events WHERE id = ? AND task_id = ? "
+                                 "AND run_id = ? AND kind = 'spawned'",
+                                 (event_id, claim.task_id, claim.run_id))
+        raise
+
+
+@dataclass
+class _SpawnAttempt:
+    # Once arbitrary callback code is entered, an exception or a missing PID
+    # cannot prove it did not start a child. This is not a process receipt.
+    entered: bool = False
+
+
+def _invoke_spawn_once(spawn, task, workspace, *, board, attempt=None):
+    """Signature failure may choose old arguments; callback failure never retries."""
+    import inspect
+    try:
+        accepts_board = "board" in inspect.signature(spawn).parameters
+    except (TypeError, ValueError):
+        accepts_board = False
+    _raise_if_dispatch_paused()
+    request = _workspace_policy.current_request(task_id=task.id, board=board, boundary="before_spawn")
+    if request is not None:
+        request.check_task(task)
+        _workspace_policy.require_supported_worker_launch(request)
+    if attempt is not None:
+        attempt.entered = True
+    if accepts_board:
+        return spawn(task, workspace, board=board)
+    return spawn(task, workspace)
+
+
+def _handle_required_spawn_denial(conn, claim_binding, attempt, result) -> None:
+    if attempt.entered:
+        # Enrollment may change after an ordinary callback started a worker,
+        # including a callback which raises without returning its PID. Neither
+        # NULL database PIDs nor that exception prove there is no child. Keep
+        # the original claim/workspace; do not kill an unproved bare PID.
+        _log.warning("Required policy refused after worker callback entry; preserved claim and workspace")
+        reason = "required_workspace_after_callback_entry"
+    else:
+        _release_required_claim(conn, *claim_binding)
+        reason = "required_workspace_denied"
+    result.claim_guarded.append((claim_binding[0], reason))
+
+
+def _required_policy_present_or_invalid() -> bool:
+    try:
+        return _required_policy.select_required_policy() is not None
+    except _required_policy.RequiredPolicyError:
+        return True
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -13692,6 +14039,11 @@ def _dispatch_once_locked(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        claim_binding = (claimed.id, claimed.current_run_id, claimed.claim_lock)
+        if _required_dispatch_workspace(
+            conn, claimed, board=board, lane="ready", result=result,
+        ):
+            continue
         materialization = _WorkspaceMaterialization()
         try:
             # A stop may arrive after claim_task commits its running row.
@@ -13719,6 +14071,14 @@ def _dispatch_once_locked(
                 materialization,
                 board=board,
             )
+        except _required_policy.RequiredPolicyError:
+            # Enrollment may appear after this attempt began as ordinary
+            # Hermes. Do not count failure or mutate a replacement claim.
+            # Preserve prepared artifacts rather than assume ownership across
+            # that policy transition; no worker was admitted.
+            _release_required_claim(conn, *claim_binding)
+            result.claim_guarded.append((claim_binding[0], "required_workspace_denied"))
+            continue
         except DispatchPausedError:
             _rollback_workspace_materialization(materialization)
             _release_paused_claim(conn, claimed.id)
@@ -13751,22 +14111,9 @@ def _dispatch_once_locked(
             continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        spawn_attempt = _SpawnAttempt()
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    _raise_if_dispatch_paused()
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    _raise_if_dispatch_paused()
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                _raise_if_dispatch_paused()
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_spawn_once(_spawn, claimed, str(workspace), board=board, attempt=spawn_attempt)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): fires AFTER spawn_fn
@@ -13792,9 +14139,17 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except _required_policy.RequiredPolicyError:
+            _handle_required_spawn_denial(conn, claim_binding, spawn_attempt, result)
         except DispatchPausedError:
+            if spawn_attempt.entered and _required_policy_present_or_invalid():
+                _handle_required_spawn_denial(conn, claim_binding, spawn_attempt, result)
+                continue
             _release_paused_claim(conn, claimed.id)
         except Exception as exc:
+            if spawn_attempt.entered and _required_policy_present_or_invalid():
+                _handle_required_spawn_denial(conn, claim_binding, spawn_attempt, result)
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -13863,6 +14218,11 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        claim_binding = (claimed.id, claimed.current_run_id, claimed.claim_lock)
+        if _required_dispatch_workspace(
+            conn, claimed, board=board, lane="review", result=result,
+        ):
+            continue
         materialization = _WorkspaceMaterialization()
         try:
             # Match the ready lane: no review workspace or branch may be
@@ -13888,6 +14248,10 @@ def _dispatch_once_locked(
                 materialization,
                 board=board,
             )
+        except _required_policy.RequiredPolicyError:
+            _release_required_claim(conn, *claim_binding)
+            result.claim_guarded.append((claim_binding[0], "required_workspace_denied"))
+            continue
         except DispatchPausedError:
             _rollback_workspace_materialization(materialization)
             _release_paused_claim(conn, claimed.id)
@@ -13928,19 +14292,9 @@ def _dispatch_once_locked(
             dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
         )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        spawn_attempt = _SpawnAttempt()
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    _raise_if_dispatch_paused()
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    _raise_if_dispatch_paused()
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                _raise_if_dispatch_paused()
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_spawn_once(_spawn, claimed, str(workspace), board=board, attempt=spawn_attempt)
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # Worker-lifecycle observer (RFC #58548): same contract as the
@@ -13954,9 +14308,17 @@ def _dispatch_once_locked(
                 _per_profile_running[claimed.assignee] = (
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
+        except _required_policy.RequiredPolicyError:
+            _handle_required_spawn_denial(conn, claim_binding, spawn_attempt, result)
         except DispatchPausedError:
+            if spawn_attempt.entered and _required_policy_present_or_invalid():
+                _handle_required_spawn_denial(conn, claim_binding, spawn_attempt, result)
+                continue
             _release_paused_claim(conn, claimed.id)
         except Exception as exc:
+            if spawn_attempt.entered and _required_policy_present_or_invalid():
+                _handle_required_spawn_denial(conn, claim_binding, spawn_attempt, result)
+                continue
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -14290,6 +14652,10 @@ def _default_spawn(
     from. Workers cannot accidentally see other boards.
     """
     _raise_if_dispatch_paused()
+    request = _workspace_policy.current_request(task_id=task.id, board=board, boundary="default_spawn_entry")
+    if request is not None:
+        request.check_task(task)
+        _workspace_policy.require_supported_worker_launch(request)
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
@@ -14482,6 +14848,10 @@ def _default_spawn(
         # arrive after the entry guard.  Recheck immediately before Popen and
         # release the opened parent-side log handle on that path.
         _raise_if_dispatch_paused()
+        request = _workspace_policy.current_request(task_id=task.id, board=board, boundary="before_popen")
+        if request is not None:
+            request.check_task(task)
+            _workspace_policy.require_supported_worker_launch(request)
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             cwd=workspace if os.path.isdir(workspace) else None,
@@ -14492,7 +14862,7 @@ def _default_spawn(
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
-    except DispatchPausedError:
+    except (DispatchPausedError, _required_policy.RequiredPolicyError):
         log_f.close()
         raise
     except FileNotFoundError:
