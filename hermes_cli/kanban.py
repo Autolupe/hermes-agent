@@ -18,6 +18,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -68,6 +69,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
+        "worktree_base_sha": t.worktree_base_sha,
         "project_id": t.project_id,
         "created_by": t.created_by,
         "created_at": t.created_at,
@@ -131,6 +133,17 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     if any(ch.isspace() for ch in branch):
         raise argparse.ArgumentTypeError("--branch must not contain whitespace")
     return branch
+
+
+def _parse_base_sha_flag(value: Optional[str]) -> Optional[str]:
+    """Accept an immutable commit id from ``kanban create --base-sha``."""
+    if value is None:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+        raise argparse.ArgumentTypeError(
+            "--base-sha requires a full, nonzero, lowercase 40-character commit SHA"
+        )
+    return value
 
 
 def _check_dispatcher_presence(
@@ -338,6 +351,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument("--base-sha", default=None,
+                          help="Exact starting commit for a worktree (40 lowercase hex "
+                               "characters). Omit to start a new task branch from "
+                               "main when its workspace is prepared.")
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -1547,6 +1564,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
+        worktree_base_sha = _parse_base_sha_flag(getattr(args, "base_sha", None))
     except argparse.ArgumentTypeError as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
@@ -1576,6 +1594,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
+            worktree_base_sha=worktree_base_sha,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
             priority=args.priority,
@@ -1765,6 +1784,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
+    if task.worktree_base_sha:
+        print(f"  worktree_base_sha: {task.worktree_base_sha}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:
@@ -2132,7 +2153,9 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             )
             return 1
         workspace = kb.resolve_workspace(task)
-        kb.set_workspace_path(conn, task.id, str(workspace))
+        kb.set_workspace_path(
+            conn, task.id, str(workspace), worktree_base_sha=task.worktree_base_sha,
+        )
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
     return 0
