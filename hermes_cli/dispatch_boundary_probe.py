@@ -20,6 +20,10 @@ _CHECK_NAMES = (
     "absent_brakes_allow",
     "dispatch_pause_regular_blocks",
     "dispatch_pause_broken_symlink_blocks",
+    "retiring_pause_regular_blocks",
+    "retiring_pause_broken_symlink_blocks",
+    "admission_lock_held_blocks",
+    "admission_lock_unsafe_blocks",
     "halt_regular_blocks",
     "halt_broken_symlink_blocks",
     "profile_shared_root_halt_blocks",
@@ -31,13 +35,15 @@ _CHECK_NAMES = (
 
 
 def _failed_payload() -> dict[str, object]:
-    """Return the fixed v1 failure shape without importing runtime modules."""
+    """Return the fixed v2 failure shape without importing runtime modules."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "contract": "hermes-kanban-dispatch-boundary",
         "state": "failed",
         "probe_scope": "temporary_shared_root",
         "shared_halt_path": "state/halt.json",
+        "retiring_pause_path": "state/dispatch_pause.retiring.json",
+        "admission_lock_path": "state/dispatch_pause.lock",
         "live_writes_performed": False,
         "checks": {name: False for name in _CHECK_NAMES},
     }

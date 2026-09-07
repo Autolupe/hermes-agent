@@ -2646,16 +2646,22 @@ def test_dispatch_boundary_probe_emits_exact_contract_without_live_writes(
     assert captured.out.count("\n") == 1
     payload = json.loads(captured.out)
     assert payload == {
-        "schema_version": 1,
+        "schema_version": 2,
         "contract": "hermes-kanban-dispatch-boundary",
         "state": "verified",
         "probe_scope": "temporary_shared_root",
         "shared_halt_path": "state/halt.json",
+        "retiring_pause_path": "state/dispatch_pause.retiring.json",
+        "admission_lock_path": "state/dispatch_pause.lock",
         "live_writes_performed": False,
         "checks": {
             "absent_brakes_allow": True,
             "dispatch_pause_regular_blocks": True,
             "dispatch_pause_broken_symlink_blocks": True,
+            "retiring_pause_regular_blocks": True,
+            "retiring_pause_broken_symlink_blocks": True,
+            "admission_lock_held_blocks": True,
+            "admission_lock_unsafe_blocks": True,
             "halt_regular_blocks": True,
             "halt_broken_symlink_blocks": True,
             "profile_shared_root_halt_blocks": True,
@@ -2698,12 +2704,13 @@ def test_dispatch_boundary_probe_accepts_windows_symlink_privilege_limit(
 
     monkeypatch.setattr(kb.Path, "symlink_to", symlink_privilege_unavailable)
 
-    assert boundary_probe.run_probe() == 0
+    expected_code = 0 if os.name == "posix" else 1
+    assert boundary_probe.run_probe() == expected_code
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out.count("\n") == 1
     payload = json.loads(captured.out)
-    assert payload["state"] == "verified"
+    assert payload["state"] == ("verified" if expected_code == 0 else "failed")
     assert payload["checks"]["dispatch_pause_broken_symlink_blocks"] is True
     assert payload["checks"]["halt_broken_symlink_blocks"] is True
     assert payload["checks"]["lookup_errors_fail_closed"] is True
@@ -2713,11 +2720,13 @@ def test_dispatch_boundary_probe_returns_nonzero_when_any_check_fails(
     monkeypatch, capsys
 ):
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "contract": "hermes-kanban-dispatch-boundary",
         "state": "failed",
         "probe_scope": "temporary_shared_root",
         "shared_halt_path": "state/halt.json",
+        "retiring_pause_path": "state/dispatch_pause.retiring.json",
+        "admission_lock_path": "state/dispatch_pause.lock",
         "live_writes_performed": False,
         "checks": {name: True for name in kb.DISPATCH_BOUNDARY_CHECKS},
     }
@@ -2743,7 +2752,7 @@ def test_dispatch_boundary_probe_exception_still_emits_strict_failure_json(
     assert captured.err == ""
     assert captured.out.count("\n") == 1
     payload = json.loads(captured.out)
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["contract"] == "hermes-kanban-dispatch-boundary"
     assert payload["state"] == "failed"
     assert payload["probe_scope"] == "temporary_shared_root"

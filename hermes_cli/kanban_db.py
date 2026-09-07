@@ -644,6 +644,16 @@ def dispatch_halt_path() -> Path:
     return kanban_home() / "state" / "halt.json"
 
 
+def dispatch_retiring_pause_path() -> Path:
+    """Return the crash-surviving brake held during a controlled resume."""
+    return kanban_home() / "state" / "dispatch_pause.retiring.json"
+
+
+def dispatch_pause_lock_path() -> Path:
+    """Return the stable reader/remover lock shared by every profile."""
+    return kanban_home() / "state" / "dispatch_pause.lock"
+
+
 def _dispatch_brake_entry_exists(path: Path) -> bool:
     """Return whether any entry occupies *path*, failing closed on errors.
 
@@ -883,16 +893,62 @@ def _dispatch_state_shares_root_mount(root_fd: int, state_fd: int) -> bool:
     return root_mount_id is None or state_mount_id == root_mount_id
 
 
+def _dispatch_pause_lock_matches(state_fd: int, lock_fd: int) -> bool:
+    """Require one private, owner-held inode at the fixed admission lock."""
+    opened = os.fstat(lock_fd)
+    named = os.stat(
+        "dispatch_pause.lock", dir_fd=state_fd, follow_symlinks=False
+    )
+    return all(
+        stat_module.S_ISREG(info.st_mode)
+        and info.st_uid == os.getuid()
+        and stat_module.S_IMODE(info.st_mode) == 0o600
+        and info.st_nlink == 1
+        for info in (opened, named)
+    ) and (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino)
+
+
+def _open_dispatch_pause_reader_lock(state_fd: int) -> int:
+    """Take a shared lock immediately or raise so dispatch stays paused.
+
+    The controller takes the exclusive lock only while moving and retiring a
+    pause. Emergency writers never need this lock. A retained retiring file
+    remains authoritative after a controller crash releases its lock.
+
+    Only the lock leaf may be created; the anchored caller has already opened
+    and verified the existing state directory. Never unlink this lock file.
+    """
+    import fcntl
+
+    descriptor = os.open(
+        "dispatch_pause.lock",
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+        | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+        dir_fd=state_fd,
+    )
+    try:
+        if not _dispatch_pause_lock_matches(state_fd, descriptor):
+            raise OSError("unsafe dispatch pause lock")
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        if not _dispatch_pause_lock_matches(state_fd, descriptor):
+            raise OSError("dispatch pause lock changed while acquired")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _anchored_dispatch_brakes_present(
     state_dir: Path,
     brake_names: tuple[str, ...],
     expected_snapshot: tuple[Any, ...],
 ) -> Optional[bool]:
-    """Read both brakes through a fixed, unmounted state-directory handle.
+    """Read the brakes while holding their shared admission lock.
 
     ``None`` means the shared root is genuinely absent and the caller should
     use its path-snapshot fallback. Every unsafe or changing state returns
-    ``True`` (paused), while ``False`` means both anchored leaf reads and all
+    ``True`` (paused), while ``False`` means all anchored leaf reads and all
     identity checks proved stable absence.
     """
     root = state_dir.parent
@@ -915,6 +971,7 @@ def _anchored_dispatch_brakes_present(
 
     root_fd: int | None = None
     state_fd: int | None = None
+    lock_fd: int | None = None
     try:
         root_fd = os.open(physical_root, _dispatch_directory_open_flags())
         opened_root = os.fstat(root_fd)
@@ -934,6 +991,7 @@ def _anchored_dispatch_brakes_present(
                 _dispatch_stat_fingerprint(os.fstat(root_fd))
                 != root_fingerprint
                 or _dispatch_stat_identity(os.stat(root)) != root_identity
+                or _dispatch_state_snapshot(state_dir) != expected_snapshot
             )
         if (
             not stat_module.S_ISDIR(state_info.st_mode)
@@ -955,6 +1013,19 @@ def _anchored_dispatch_brakes_present(
         ):
             return True
 
+        lock_fd = _open_dispatch_pause_reader_lock(state_fd)
+        # The first reader may create the lock, changing directory timestamps.
+        # Rebase only those change fields after taking the lock, while keeping
+        # the original root and state-directory identities pinned.
+        locked_snapshot = _dispatch_state_snapshot(state_dir)
+        if (
+            locked_snapshot is None
+            or locked_snapshot[0] != expected_snapshot[0]
+            or locked_snapshot[1:5] != expected_snapshot[1:5]
+        ):
+            return True
+        state_fingerprint = _dispatch_stat_fingerprint(os.fstat(state_fd))
+
         for brake_name in brake_names:
             if _dispatch_optional_entry_info(state_fd, brake_name) is not None:
                 return True
@@ -973,10 +1044,14 @@ def _anchored_dispatch_brakes_present(
             or _dispatch_stat_fingerprint(os.fstat(root_fd))
             != root_fingerprint
             or _dispatch_stat_identity(os.stat(root)) != root_identity
+            or not _dispatch_pause_lock_matches(state_fd, lock_fd)
+            or _dispatch_state_snapshot(state_dir) != locked_snapshot
         )
     except (OSError, RuntimeError):
         return True
     finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
         if state_fd is not None:
             os.close(state_fd)
         if root_fd is not None:
@@ -1115,11 +1190,16 @@ def _windows_anchored_dispatch_brakes_present(
 
 
 def dispatch_is_paused() -> bool:
-    """Fail closed while a shared-root dispatch pause or full halt exists."""
+    """Fail closed while a brake exists or its retirement owns admission."""
     try:
         pause_path = dispatch_pause_path()
         halt_path = dispatch_halt_path()
-        if pause_path.parent != halt_path.parent:
+        retiring_path = dispatch_retiring_pause_path()
+        lock_path = dispatch_pause_lock_path()
+        if any(
+            path.parent != pause_path.parent
+            for path in (halt_path, retiring_path, lock_path)
+        ):
             return True
         state_dir = pause_path.parent
         before = _dispatch_state_snapshot(state_dir)
@@ -1129,25 +1209,35 @@ def dispatch_is_paused() -> bool:
         if _supports_anchored_dispatch_state_read():
             anchored_result = _anchored_dispatch_brakes_present(
                 state_dir,
-                (pause_path.name, halt_path.name),
+                (pause_path.name, halt_path.name, retiring_path.name),
                 before,
             )
-        elif os.name == "nt":
+            if anchored_result is not None:
+                # This helper verifies the final snapshot before releasing
+                # its shared lock, including first-reader lock creation.
+                return anchored_result
+        elif _dispatch_brake_entry_exists(lock_path):
+            # The retirement protocol needs POSIX flock. A host that cannot
+            # honor it may keep legacy operation only without the lock file.
+            return True
+        if anchored_result is None and os.name == "nt":
             anchored_result = _windows_anchored_dispatch_brakes_present(
                 state_dir,
-                (pause_path.name, halt_path.name),
+                (pause_path.name, halt_path.name, retiring_path.name),
                 before,
             )
         if anchored_result is None:
             if (
                 _dispatch_brake_entry_exists(pause_path)
                 or _dispatch_brake_entry_exists(halt_path)
+                or _dispatch_brake_entry_exists(retiring_path)
+                or _dispatch_brake_entry_exists(lock_path)
             ):
                 return True
         elif anchored_result:
             return True
-        # Detect an ancestor replacement during the two child lookups.  A
-        # changed state directory is not proof that both brakes were absent.
+        # Detect an ancestor replacement during the child lookups. A changed
+        # state directory is not proof that the brakes were absent.
         return _dispatch_state_snapshot(state_dir) != before
     except Exception:
         # Path resolution is part of the trust decision.  If the shared root
@@ -1302,19 +1392,26 @@ def _park_retry_transitions_after_commit(
 
 
 def _dispatch_brake_description() -> str:
-    """Return a safe operator-facing description of both dispatch brakes."""
+    """Return a safe operator-facing description of the dispatch brakes."""
     try:
-        return f"{dispatch_pause_path()} or {dispatch_halt_path()}"
+        return (
+            f"{dispatch_pause_path()}, {dispatch_halt_path()}, "
+            f"{dispatch_retiring_pause_path()}, or the dispatch admission lock"
+        )
     except Exception:
         return "the unreadable shared-root dispatch state"
 
 
 DISPATCH_BOUNDARY_CONTRACT = "hermes-kanban-dispatch-boundary"
-DISPATCH_BOUNDARY_SCHEMA_VERSION = 1
+DISPATCH_BOUNDARY_SCHEMA_VERSION = 2
 DISPATCH_BOUNDARY_CHECKS = (
     "absent_brakes_allow",
     "dispatch_pause_regular_blocks",
     "dispatch_pause_broken_symlink_blocks",
+    "retiring_pause_regular_blocks",
+    "retiring_pause_broken_symlink_blocks",
+    "admission_lock_held_blocks",
+    "admission_lock_unsafe_blocks",
     "halt_regular_blocks",
     "halt_broken_symlink_blocks",
     "profile_shared_root_halt_blocks",
@@ -1328,7 +1425,7 @@ DISPATCH_BOUNDARY_CHECKS = (
 def normalize_dispatch_boundary_self_test(
     candidate: object,
 ) -> tuple[dict[str, Any], bool]:
-    """Return the strict v1 capability payload and whether it verified.
+    """Return the strict v2 capability payload and whether it verified.
 
     Keep validation beside the contract constants so the standalone probe
     fails closed in one place when a behavior check crashes or returns a
@@ -1340,6 +1437,8 @@ def normalize_dispatch_boundary_self_test(
         "state",
         "probe_scope",
         "shared_halt_path",
+        "retiring_pause_path",
+        "admission_lock_path",
         "live_writes_performed",
         "checks",
     }
@@ -1363,6 +1462,9 @@ def normalize_dispatch_boundary_self_test(
         and candidate.get("contract") == DISPATCH_BOUNDARY_CONTRACT
         and candidate.get("probe_scope") == "temporary_shared_root"
         and candidate.get("shared_halt_path") == "state/halt.json"
+        and candidate.get("retiring_pause_path")
+        == "state/dispatch_pause.retiring.json"
+        and candidate.get("admission_lock_path") == "state/dispatch_pause.lock"
         and type(candidate.get("live_writes_performed")) is bool
         and candidate.get("live_writes_performed") is False
         and checks_shape_ok
@@ -1379,6 +1481,8 @@ def normalize_dispatch_boundary_self_test(
             "state": "verified" if verified else "failed",
             "probe_scope": "temporary_shared_root",
             "shared_halt_path": "state/halt.json",
+            "retiring_pause_path": "state/dispatch_pause.retiring.json",
+            "admission_lock_path": "state/dispatch_pause.lock",
             "live_writes_performed": False,
             "checks": normalized_checks,
         },
@@ -1668,6 +1772,58 @@ raise SystemExit(0 if ok else 1)
                 base, "pause-broken-symlink", "dispatch_pause.json"
             ),
         )
+        _run(
+            "retiring_pause_regular_blocks",
+            lambda: _regular_brake(
+                base, "retiring-regular", "dispatch_pause.retiring.json"
+            ),
+        )
+        _run(
+            "retiring_pause_broken_symlink_blocks",
+            lambda: _broken_symlink_brake(
+                base, "retiring-broken-symlink", "dispatch_pause.retiring.json"
+            ),
+        )
+
+        def _admission_lock_held_probe() -> bool:
+            import fcntl
+
+            root = _root(base, "admission-lock-held")
+            state = root / "state"
+            state.mkdir()
+            lock = state / "dispatch_pause.lock"
+            descriptor = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                blocked = _probe(root)
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                return blocked and not _probe(root) and lock.is_file()
+            finally:
+                os.close(descriptor)
+
+        def _admission_lock_unsafe_probe() -> bool:
+            for kind in ("directory", "symlink", "hardlink", "public"):
+                root = _root(base, "admission-lock-" + kind)
+                state = root / "state"
+                state.mkdir()
+                lock = state / "dispatch_pause.lock"
+                if kind == "directory":
+                    lock.mkdir()
+                elif kind == "symlink":
+                    if not _create_probe_symlink(lock, root / "missing"):
+                        continue
+                else:
+                    lock.touch(mode=0o600)
+                    if kind == "hardlink":
+                        os.link(lock, root / "extra-link")
+                    else:
+                        lock.chmod(0o644)
+                if not _probe(root):
+                    return False
+            return True
+
+        _run("admission_lock_held_blocks", _admission_lock_held_probe)
+        _run("admission_lock_unsafe_blocks", _admission_lock_unsafe_probe)
         _run(
             "halt_regular_blocks",
             lambda: _halt_runtime_boundaries_probe(),
@@ -2307,6 +2463,8 @@ raise SystemExit(0 if pre_ok and post_ok else 1)
         "state": "verified" if verified else "failed",
         "probe_scope": "temporary_shared_root",
         "shared_halt_path": "state/halt.json",
+        "retiring_pause_path": "state/dispatch_pause.retiring.json",
+        "admission_lock_path": "state/dispatch_pause.lock",
         "live_writes_performed": False,
         "checks": checks,
     }

@@ -245,6 +245,38 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Controlled pause removal
+
+Every profile reads dispatch brakes from the shared Hermes root. Any entry at
+`state/dispatch_pause.json`, `state/halt.json`, or
+`state/dispatch_pause.retiring.json` keeps dispatch paused, including a broken
+symbolic link. Readers never remove these files.
+
+On POSIX hosts, readers take a shared, nonblocking lock on
+`state/dispatch_pause.lock` before checking the brakes. An exclusive lock held
+by a resume controller stops dispatch immediately. The lock must be a regular
+file owned by the current user, have permissions `0600`, and have one hard link.
+Unreadable or unsafe locks keep dispatch paused. A reader may create this lock
+inside an existing state directory; it does not create a missing root or state
+directory. Never remove or replace the lock file while Hermes is running.
+
+A compatible resume controller takes the exclusive lock, moves the canonical
+pause to the retiring path, and checks the moved file before removing it. It
+must retain a mismatched pause and preserve any new canonical pause written by
+an emergency stop. If the controller dies after the move, the retiring file
+continues to stop dispatch after the lock is released. Recover that file through
+the controller's validated recovery procedure; deleting it manually can discard
+an emergency stop. Emergency pause writers do not need to acquire this lock.
+
+Before enabling this protocol, check the installed interpreter with
+`python3 -m hermes_cli.dispatch_boundary_probe`. Its version 2 report includes
+`retiring_pause_path` and `admission_lock_path` and exercises real temporary
+brakes and lock contention without changing live Hermes files. A version 1
+reader cannot safely participate in retirement. Platforms without compatible
+POSIX locking do not report version 2 as verified; their existing dispatch
+behavior remains available without an admission lock, and a present admission
+lock keeps them paused.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash

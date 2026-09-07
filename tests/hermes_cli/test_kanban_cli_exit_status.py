@@ -142,16 +142,22 @@ def test_dispatch_boundary_probe_is_stdout_only_and_never_writes_live_root(
     assert proc.stdout.count("\n") == 1
     payload = json.loads(proc.stdout)
     assert payload == {
-        "schema_version": 1,
+        "schema_version": 2,
         "contract": "hermes-kanban-dispatch-boundary",
         "state": "verified",
         "probe_scope": "temporary_shared_root",
         "shared_halt_path": "state/halt.json",
+        "retiring_pause_path": "state/dispatch_pause.retiring.json",
+        "admission_lock_path": "state/dispatch_pause.lock",
         "live_writes_performed": False,
         "checks": {
             "absent_brakes_allow": True,
             "dispatch_pause_regular_blocks": True,
             "dispatch_pause_broken_symlink_blocks": True,
+            "retiring_pause_regular_blocks": True,
+            "retiring_pause_broken_symlink_blocks": True,
+            "admission_lock_held_blocks": True,
+            "admission_lock_unsafe_blocks": True,
             "halt_regular_blocks": True,
             "halt_broken_symlink_blocks": True,
             "profile_shared_root_halt_blocks": True,
