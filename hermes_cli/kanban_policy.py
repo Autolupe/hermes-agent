@@ -14,6 +14,7 @@ scope and eventual installation are not shipped or activated here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import contextlib
 import hashlib
 import importlib
 import importlib.abc
@@ -214,10 +215,13 @@ class _ProtectedFiles:
 class _RegistrationContext:
     """A single owned registration, separate from best-effort observer hooks."""
 
-    def __init__(self, scope: Mapping[str, object], package: str):
+    def __init__(self, scope: Mapping[str, object], package: str, *, runtime_identity=None):
         self.scope = scope
         self._package = package
         self._provider = None
+        # An actual in-process descriptor capture, never scope data or an
+        # approval record. Schema 1 retains its existing None value.
+        self._runtime_identity = runtime_identity
 
     def register_kanban_policy(self, provider: RequiredKanbanPolicy) -> None:
         _require(self._provider is None and isinstance(provider, RequiredKanbanPolicy)
@@ -287,10 +291,15 @@ class _RequiredPolicyRegistry:
     """Private library seam for hermetic fixtures; production has fixed anchors."""
 
     def __init__(self, directory: Path, *, files: _ProtectedFiles | None = None,
-                 identity: Callable[[], tuple[int, int]] | None = None):
+                 identity: Callable[[], tuple[int, int]] | None = None,
+                 _runtime_artifact_loader=None):
         self.directory = directory
         self.files = files or _ProtectedFiles()
         self.identity = identity or (lambda: (os.getuid(), os.geteuid()))
+        # Private library dependency for artifact-only capture. Production has
+        # no loader: complete interpreter/dependency provenance is unimplemented.
+        # No CLI, environment or enrollment field can supply this dependency.
+        self._runtime_artifact_loader = _runtime_artifact_loader
         self._selected: dict[int, RequiredPolicyRegistration] = {}
         self._seen: dict[int, _Snapshot] = {}
         self._failed = False
@@ -336,10 +345,14 @@ class _RequiredPolicyRegistry:
         return selected
 
     def _load(self, uid: int, enrollment: _Snapshot) -> RequiredPolicyRegistration:
+        runtime_identity = None
+        runtime_retained = False
         try:
             document = tomllib.loads(enrollment.data.decode("utf-8"))
-            _require(set(document) == {"schema_version", "uid", "provider", "files", "scope"}
-                     and type(document["schema_version"]) is int and document["schema_version"] == 1
+            version = document.get("schema_version")
+            keys = {"schema_version", "uid", "provider", "files", "scope"}
+            _require(type(version) is int and version in (1, 2)
+                     and set(document) == (keys if version == 1 else keys | {"runtime"})
                      and type(document["uid"]) is int and document["uid"] == uid,
                      "Required policy enrollment schema or user does not match.")
             provider = document["provider"]
@@ -407,14 +420,35 @@ class _RequiredPolicyRegistry:
                      "Required policy installed entry point differs or is ambiguous.")
             # Retain the original selected object; do not globally rediscover by name.
             entry = entries[0]
-            return self._import(uid, enrollment, tuple(snapshots.values()), scope, provider,
-                                distribution, entry, package, modules)
+            if version == 2:
+                from hermes_cli.kanban_runtime_artifact import (
+                    _CapturedSQLiteExtension, _verify_inventory,
+                )
+                verified = _verify_inventory(document["runtime"], self.files)
+                _require(self._runtime_artifact_loader is not None,
+                         "Runtime-required enrollment needs protected bootstrap; complete runtime provenance is unsupported.")
+                runtime_identity = self._runtime_artifact_loader(verified)
+                _require(type(runtime_identity) is _CapturedSQLiteExtension
+                         and runtime_identity._verified_inventory is verified,
+                         "Required runtime loader did not return its actual descriptor capture.")
+                runtime_identity.check_integrity()
+            selected = self._import(uid, enrollment, tuple(snapshots.values()), scope, provider,
+                                    distribution, entry, package, modules, runtime_identity=runtime_identity)
+            runtime_retained = True
+            return selected
         except RequiredPolicyError:
             raise
         except Exception:
             raise RequiredPolicyError("Required policy enrollment or distribution could not be loaded.") from None
+        finally:
+            # _import retains the capture only after completing registration.
+            # Errors before that handoff must not leak its sealed descriptor.
+            if runtime_identity is not None and not runtime_retained:
+                with contextlib.suppress(BaseException):
+                    runtime_identity.close()
 
-    def _import(self, uid, enrollment, snapshots, scope, provider, distribution, entry, package, modules):
+    def _import(self, uid, enrollment, snapshots, scope, provider, distribution, entry, package, modules,
+                *, runtime_identity=None):
         invalid = False
 
         def verify_files():
@@ -425,8 +459,13 @@ class _RequiredPolicyRegistry:
                 self.files.unchanged(enrollment)
                 for snapshot in snapshots:
                     self.files.unchanged(snapshot)
+                if runtime_identity is not None:
+                    runtime_identity.check_integrity()
             except Exception:
                 invalid = True
+                if runtime_identity is not None:
+                    with contextlib.suppress(BaseException):
+                        runtime_identity.close()
                 raise RequiredPolicyError("Required policy registration no longer matches its protected files or user.") from None
 
         finder = _VerifiedPackage(package, modules, verify_files)
@@ -438,6 +477,9 @@ class _RequiredPolicyRegistry:
                 finder.check_modules()
             except RequiredPolicyError:
                 invalid = True
+                if runtime_identity is not None:
+                    with contextlib.suppress(BaseException):
+                        runtime_identity.close()
                 raise
 
         with _IMPORT_LOCK:
@@ -450,7 +492,9 @@ class _RequiredPolicyRegistry:
                 register = getattr(module, entry.attr or "register", None)
                 _require(callable(register) and getattr(register, "__module__", None) in finder.loaded,
                          "Required policy entry point does not expose its own registration function.")
-                context = _RegistrationContext(scope, package)
+                if runtime_identity is not None:
+                    runtime_identity._attach_registration(verify)
+                context = _RegistrationContext(scope, package, runtime_identity=runtime_identity)
                 _require(register(context) is None and context._provider is not None,
                          "Required policy did not register its provider.")
                 verify()
