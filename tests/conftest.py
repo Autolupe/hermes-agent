@@ -591,6 +591,22 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_required_kanban_registry(tmp_path, monkeypatch):
+    """Ordinary in-process tests never read an operator's enrollment files.
+
+    Required-policy tests replace this private library dependency with their
+    own enrolled fixtures. Production has no environment/config/path override.
+    Fresh subprocess behavior probes still honor the production selector.
+    """
+    from hermes_cli import kanban_policy as policy
+    root = tmp_path / "required-policy-root"
+    root.mkdir(mode=0o755)
+    files = policy._ProtectedFiles(root=root, owner_uid=os.getuid() if hasattr(os, "getuid") else 0)
+    registry = policy._RequiredPolicyRegistry(root / "absent-registry", files=files)
+    monkeypatch.setattr(policy, "_production_registry", registry)
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_webbrowser(monkeypatch):
     """Record browser-open attempts instead of opening real browser windows."""
     import webbrowser as _webbrowser
