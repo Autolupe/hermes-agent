@@ -24,6 +24,11 @@ ancestry, changed enrollment, changed account identity and disappearing selected
 sources refuse the operation. No environment variable, user configuration,
 command-line flag or optional plugin hook can remove an obligation.
 
+Schema 1 remains unchanged. Source-only schema 2 describes a required
+[SQLite extension artifact](./sqlite-extension-artifact.md); ordinary startup
+refuses it before provider execution because complete protected runtime startup
+is not implemented. Its inventory is not a runtime approval or launch permit.
+
 ## One request belongs to one claimed run
 
 `kanban_db.required_workspace_request` takes the original open SQLite connection
@@ -39,7 +44,9 @@ does not reopen the database by pathname or serialize an approval record.
 Neither a pathname, `PRAGMA database_list`, a Python object identifier nor a copy
 of JSON proves the file SQLite actually opened. A future supported capability
 adapter must obtain that proof from this exact connection and invalidate it on
-close, replacement or backend change. No such adapter is supplied here.
+close, replacement or backend change. The separate extension-artifact fixtures
+now retain the actual compiled method through the registration context, but no
+protected production adapter or startup is supplied here.
 
 The request freezes task instruction/routing values including title, body,
 project, creator, workflow/step, assignee, tenant, workspace kind, skills,
