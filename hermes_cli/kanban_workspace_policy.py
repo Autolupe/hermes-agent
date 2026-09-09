@@ -1,7 +1,8 @@
 """Native lifetime and claim binding for required workspace preparation.
 
-No provider, opened-database substitute, credential transport or controlled
-worker launch is implemented here. The original SQLite object is deliberately
+No provider, opened-database substitute, credential transport or production
+worker launch is implemented here. Source-only held-child mechanics remain
+separate from the unsupported launch gate. The original SQLite object is
 retained for a future supported capability adapter. Optional hooks are not used.
 """
 
@@ -66,6 +67,7 @@ class WorkspaceRequest:
         self._stored_workspace = claim.original_workspace
         self.pending_workspace = None
         self._repository = None
+        self._held_worker = None
 
     @property
     def claim(self) -> WorkspaceClaim:
@@ -88,22 +90,35 @@ class WorkspaceRequest:
         # re-enters this request or later recovers a different request's fence.
         already_cancelled = self._cancelled.is_set()
         self._cancelled.set()
-        if not already_cancelled and self._admission is not None:
-            try:
-                self._admission.cancel(reason)
-            except Exception:
-                pass  # A cleanup failure can never turn denial into approval.
+        if not already_cancelled:
+            for owner in (self._held_worker, self._admission):
+                if owner is not None:
+                    try:
+                        owner.cancel(reason)
+                    except BaseException:
+                        # Attempt both cleanup owners even if one fails. Native
+                        # cancellation stays set; cleanup cannot replace the
+                        # original refusal/interrupt with another exception.
+                        pass
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        if self._admission is not None:
-            try:
-                self._admission.close()
-            except Exception:
-                self.cancel("provider_close_failed")
-                raise policy.RequiredPolicyError("Required workspace provider cleanup failed.") from None
+        first_failure = None
+        for name, owner in (("worker", self._held_worker), ("provider", self._admission)):
+            if owner is not None:
+                try:
+                    owner.close()
+                except BaseException as error:
+                    if first_failure is None:
+                        first_failure = (name, error)
+        if first_failure is not None:
+            name, error = first_failure
+            self.cancel(f"{name}_close_failed")
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise error
+            raise policy.RequiredPolicyError(f"Required workspace {name} cleanup failed.") from error
 
     def _check_native(self, expected_workspace=None) -> None:
         if self.cancelled or self._closed or _CURRENT.get() is not self:

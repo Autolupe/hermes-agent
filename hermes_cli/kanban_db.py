@@ -4945,9 +4945,8 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     recomputation, failure-counter clears) would fire while the outer
     transaction can still roll back.
 
-    The explicit ROLLBACK on exception is wrapped in try/except so that
-    a SQLite auto-rollback (which leaves no active transaction) does not
-    shadow the original exception with a spurious rollback error.
+    Interrupts also roll back. Cleanup failures must not replace the original
+    error, including a SQLite auto-rollback which leaves no active transaction.
     """
     _assert_not_delegated_child_mutation()
     if getattr(conn, "in_transaction", False):
@@ -4959,27 +4958,26 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
                 "the outer transaction commits)."
             )
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
-        conn.execute(f"SAVEPOINT {savepoint}")
         try:
+            conn.execute(f"SAVEPOINT {savepoint}")
             yield conn
-        except Exception:
+            conn.execute(f"RELEASE {savepoint}")
+        except BaseException:
             try:
                 conn.execute(f"ROLLBACK TO {savepoint}")
                 conn.execute(f"RELEASE {savepoint}")
-            except sqlite3.OperationalError:
+            except BaseException:
                 pass
             raise
-        else:
-            conn.execute(f"RELEASE {savepoint}")
         return
 
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
+        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
         yield conn
-    except Exception:
+    except BaseException:
         try:
             conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
+        except BaseException:
             # SQLite has already auto-rolled-back the transaction (typical
             # under EIO, lock contention, or corruption). Nothing to undo;
             # do not let this secondary failure shadow the real one.
@@ -4988,12 +4986,12 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     else:
         try:
             _execute_boundary_with_retry(conn, "COMMIT")
-        except Exception:
+        except BaseException:
             # COMMIT exhausted retries with the txn still open; roll back so the
             # connection isn't poisoned for the next BEGIN IMMEDIATE.
             try:
                 conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
+            except BaseException:
                 pass
             raise
         # Post-commit file-length check: header page_count must match actual file pages.
@@ -6228,6 +6226,27 @@ def _append_event(
     )
 
 
+def _controlled_worker_pending(conn: sqlite3.Connection, task_id: str) -> bool:
+    """A durable negative fence, never proof from an absent/reused worker PID.
+
+    Only the live held-worker owner appends the matching drained event. The
+    ordinary reclaimer does not turn saved JSON or liveness into that proof.
+    Malformed records retain the fence. Ordinary tasks have no such events.
+    """
+    return conn.execute(
+        "SELECT 1 FROM task_events h WHERE h.task_id = ? "
+        "AND h.kind = 'controlled_worker_held' AND NOT EXISTS ("
+        "SELECT 1 FROM task_events d WHERE d.task_id = h.task_id "
+        "AND d.run_id IS h.run_id AND d.id > h.id AND d.kind = 'controlled_worker_drained' "
+        "AND CASE WHEN json_valid(d.payload) AND json_valid(h.payload) THEN "
+        "json_type(d.payload, '$.held_event_id') = 'integer' "
+        "AND json_extract(d.payload, '$.held_event_id') = h.id "
+        "AND json_type(d.payload, '$.request_id') = 'text' "
+        "AND json_extract(d.payload, '$.request_id') = json_extract(h.payload, '$.request_id') "
+        "ELSE 0 END) LIMIT 1", (task_id,),
+    ).fetchone() is not None
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6247,6 +6266,8 @@ def _end_run(
     existed (e.g. a CLI user calling ``hermes kanban complete`` on a
     task that was never claimed).
     """
+    if _controlled_worker_pending(conn, task_id):
+        raise _required_policy.RequiredPolicyError("Controlled worker cleanup is still unresolved.")
     now = int(time.time())
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
@@ -6602,6 +6623,8 @@ def claim_task(
         # BEGIN IMMEDIATE may wait behind another writer. A stop engaged during
         # that wait must win before this transaction changes a task or run.
         _raise_if_dispatch_paused()
+        if _controlled_worker_pending(conn, task_id):
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -6753,6 +6776,8 @@ def claim_review_task(
         # Match the ready lane: the acquired transaction is the final claim
         # boundary after any SQLite busy wait.
         _raise_if_dispatch_paused()
+        if _controlled_worker_pending(conn, task_id):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -6993,6 +7018,8 @@ def release_stale_claims(
         (now,),
     ).fetchall()
     for row in stale:
+        if _controlled_worker_pending(conn, row["id"]):
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -7058,6 +7085,8 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            if _controlled_worker_pending(conn, row["id"]):
+                continue
             retry_status = _retry_status_for_run(conn, row["id"])
             landing_status, parked_by_dispatch_brake = (
                 _park_runnable_status_if_dispatch_paused(retry_status)
@@ -7155,6 +7184,8 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    if _controlled_worker_pending(conn, task_id):
+        return False
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
         (task_id,),
@@ -7164,11 +7195,17 @@ def reclaim_task(
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
+    # A held worker may have been recorded after the entry guard but before
+    # this PID snapshot. Never feed that newly visible PID to legacy signaling.
+    if _controlled_worker_pending(conn, task_id):
+        return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
     with write_txn(conn):
+        if _controlled_worker_pending(conn, task_id):
+            return False
         retry_status = _retry_status_for_run(conn, task_id)
         landing_status, parked_by_dispatch_brake = (
             _park_runnable_status_if_dispatch_paused(retry_status)
@@ -7439,6 +7476,8 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    if _controlled_worker_pending(conn, task_id):
+        return False
     # Fail before validating cards or staging artifacts; re-check inside the
     # final write transaction below to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -7482,7 +7521,7 @@ def complete_task(
         # Parent completion is a hard invariant even for direct human review
         # approval. A parent may have been reopened after this task entered
         # ``review`` or ``running``.
-        if not _parents_satisfied(conn, task_id):
+        if _controlled_worker_pending(conn, task_id) or not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -7937,6 +7976,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     remote-tracking ref); ``dir`` workspaces are intentionally preserved.
     """
     try:
+        if _controlled_worker_pending(conn, task_id):
+            return
         row = conn.execute(
             "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
             (task_id,),
@@ -8122,6 +8163,8 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
 def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
     """Kill the tmux session associated with a task's assignee, if dead."""
     try:
+        if _controlled_worker_pending(conn, task_id):
+            return
         row = conn.execute(
             "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
@@ -10667,6 +10710,8 @@ def _restore_required_workspace(conn, request) -> bool:
     """Compensate exact owned pointers only, never the next claim's state."""
     claim = request.claim
     with write_txn(conn):
+        if _controlled_worker_pending(conn, claim.task_id):
+            return False
         row = conn.execute(
             "SELECT status, current_run_id, claim_lock, workspace_path, branch_name, worker_pid "
             "FROM tasks WHERE id = ?", (claim.task_id,),
@@ -11577,6 +11622,8 @@ def enforce_max_runtime(
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
     for row in rows:
+        if _controlled_worker_pending(conn, row["id"]):
+            continue
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
@@ -11640,6 +11687,8 @@ def enforce_max_runtime(
             continue
 
         with write_txn(conn):
+            if _controlled_worker_pending(conn, tid):
+                continue
             retry_status = _retry_status_for_run(conn, tid)
             landing_status, parked_by_dispatch_brake = (
                 _park_runnable_status_if_dispatch_paused(retry_status)
@@ -11777,6 +11826,8 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
+        if _controlled_worker_pending(conn, tid):
+            continue
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
@@ -11792,6 +11843,8 @@ def detect_stale_running(
             continue
 
         with write_txn(conn):
+            if _controlled_worker_pending(conn, tid):
+                continue
             retry_status = _retry_status_for_run(conn, tid)
             landing_status, parked_by_dispatch_brake = (
                 _park_runnable_status_if_dispatch_paused(retry_status)
@@ -11898,6 +11951,8 @@ def reconcile_orphaned_running(
     ).fetchall()
     for row in rows:
         tid = row["id"]
+        if _controlled_worker_pending(conn, tid):
+            continue
         pid = row["worker_pid"]
         if pid and _pid_alive(pid):
             # The recorded worker may still be doing real work — never
@@ -11908,6 +11963,8 @@ def reconcile_orphaned_running(
             )
             continue
         with write_txn(conn):
+            if _controlled_worker_pending(conn, tid):
+                continue
             retry_status = _retry_status_for_run(conn, tid)
             landing_status, parked_by_dispatch_brake = (
                 _park_runnable_status_if_dispatch_paused(retry_status)
@@ -12115,6 +12172,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
+            if _controlled_worker_pending(conn, row["id"]):
+                continue
             # Only check liveness for claims owned by this host.
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -12686,6 +12745,8 @@ def _release_paused_claim(
     """
     now = int(time.time())
     with write_txn(conn):
+        if _controlled_worker_pending(conn, task_id):
+            return
         row = conn.execute(
             "SELECT current_run_id, claim_lock, worker_pid FROM tasks "
             "WHERE id = ? AND status = 'running'",

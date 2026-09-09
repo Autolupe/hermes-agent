@@ -123,10 +123,12 @@ injected launch. The check is also present at the default spawn entry and final
 process edge. The ordinary command-building and environment behavior is unchanged.
 
 Before/after checks cannot make SQLite claim validation atomic with `Popen`.
-A future positive contract needs a supported controlled-launch handoff and exact
-child ownership. This source does not provide that barrier, credential transport,
-request broker, deployment permission or trusted task completion. It must not be
-presented as completed activation or stopped-worker proof.
+The separate [held-worker mechanics](./held-kanban-worker.md) now test an actual
+held child and cancellation with temporary boards. They do not replace this
+unsupported production gate. A positive contract still needs protected launch
+admission, actual-open database identity, a complete frozen worker instruction
+bundle, credential transport and trusted task completion. Neither the mechanics
+nor a saved journal may be presented as completed activation.
 
 ## Verification boundaries
 
