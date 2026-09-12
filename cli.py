@@ -5544,6 +5544,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._preload_skills_thread: Optional[threading.Thread] = None
         self._preload_skills_result: Optional[tuple] = None
         self._preload_skills_error: Optional[BaseException] = None
+        self._preload_skills_finalize_error: Optional[BaseException] = None
         self._preload_skills_requested: list = []
         self._preload_skills_finalized = False
         self._active_session_lease = None
@@ -8321,44 +8322,57 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         and safe to call from any other consumer of the system prompt.
         Raises ``ValueError`` when EVERY requested skill was unknown —
         the same contract the old synchronous path enforced in cmd_chat.
+        A timed-out or failed wait stays failed even if the background
+        preload later finishes; it must never permit startup without skills.
         """
+        prior_error = getattr(self, "_preload_skills_finalize_error", None)
+        if prior_error is not None:
+            raise prior_error
         if getattr(self, "_preload_skills_finalized", False):
             return
         thread = getattr(self, "_preload_skills_thread", None)
         if thread is None:
             self._preload_skills_finalized = True
             return
-        thread.join(timeout=120)
-        self._preload_skills_finalized = True
-        err = getattr(self, "_preload_skills_error", None)
-        if err is not None:
-            raise err
-        result = getattr(self, "_preload_skills_result", None)
-        if not result:
-            return
-        skills_prompt, loaded_skills, missing_skills = result
-        if missing_skills:
-            missing_display = ", ".join(missing_skills)
-            # If at least one skill loaded, degrade gracefully: skip the
-            # unknown ones and continue. A typo'd skill name should not crash
-            # the worker (which auto-blocks the Kanban task after retries).
-            # Only when EVERY requested skill is missing do we hard-fail, so a
-            # fully-misconfigured worker fails loudly instead of running blind.
-            if loaded_skills:
-                logger.warning(
-                    "Unknown skill(s) requested, skipping: %s. "
-                    "Continuing with: %s. "
-                    "List available skills with `hermes skills list`.",
-                    missing_display,
-                    ", ".join(loaded_skills),
-                )
-            else:
-                raise ValueError(f"Unknown skill(s): {missing_display}")
-        if skills_prompt:
-            self.system_prompt = "\n\n".join(
-                part for part in (self.system_prompt, skills_prompt) if part
-            ).strip()
-            self.preloaded_skills = loaded_skills
+        try:
+            thread.join(timeout=120)
+            if thread.is_alive():
+                raise TimeoutError("Timed out waiting for requested skills to finish loading.")
+            err = getattr(self, "_preload_skills_error", None)
+            if err is not None:
+                raise err
+            result = getattr(self, "_preload_skills_result", None)
+            if result is None:
+                raise RuntimeError("Requested skills finished loading without a result.")
+            skills_prompt, loaded_skills, missing_skills = result
+            if missing_skills:
+                missing_display = ", ".join(missing_skills)
+                # If at least one skill loaded, degrade gracefully: skip the
+                # unknown ones and continue. A typo'd skill name should not crash
+                # the worker (which auto-blocks the Kanban task after retries).
+                # Only when EVERY requested skill is missing do we hard-fail, so a
+                # fully-misconfigured worker fails loudly instead of running blind.
+                if loaded_skills:
+                    logger.warning(
+                        "Unknown skill(s) requested, skipping: %s. "
+                        "Continuing with: %s. "
+                        "List available skills with `hermes skills list`.",
+                        missing_display,
+                        ", ".join(loaded_skills),
+                    )
+                else:
+                    raise ValueError(f"Unknown skill(s): {missing_display}")
+            if skills_prompt:
+                self.system_prompt = "\n\n".join(
+                    part for part in (self.system_prompt, skills_prompt) if part
+                ).strip()
+                self.preloaded_skills = loaded_skills
+            self._preload_skills_finalized = True
+        except BaseException as exc:
+            # Separate from the background producer's error slot: a late
+            # result or producer failure cannot replace this first refusal.
+            self._preload_skills_finalize_error = exc
+            raise
 
     def show_banner(self):
         """Display the welcome banner in Claude Code style."""
