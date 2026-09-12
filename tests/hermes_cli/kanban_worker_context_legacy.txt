@@ -1,0 +1,47 @@
+# Kanban task task-main: Keep the task handoff intact
+
+Assignee: writer
+Status:   running
+Tenant:   example-tenant
+Workspace: worktree @ /fixture/workspaces/task-main
+Max runtime: 90s
+Terminal timeout: 60s
+Branch:   task/context-capture
+
+## Body
+First line.
+Second line with café.
+
+## Attachments
+Files attached to this task. Read them with the file/terminal tools at the absolute paths below:
+- `earlier.txt`, text/plain, 1 KB → `/fixture/attachments/earlier.txt`
+- `later.pdf`, application/pdf, 2 KB → `/fixture/attachments/later.pdf`
+- `empty.bin` → `/fixture/attachments/empty.bin`
+
+## Prior attempts on this task
+### Attempt 1 — crashed ((unknown), 2027-01-15 06:00, 2h ago)
+First try.
+_error_: Retry after interruption.
+_metadata_: `{"a": "café", "z": 2}`
+
+### Attempt 2 — released (writer, 2027-01-15 07:00, 1h ago)
+Second try.
+
+## Parent task results
+_Handoffs from upstream tasks, captured when each parent completed (see age below). These are point-in-time snapshots, not live state — if a result drives your current work and it's not recent, re-verify against the source before acting on it as current._
+### parent-a (completed 1h ago)
+Latest completed handoff.
+_metadata_: `{"a": {"b": "résumé", "y": true}, "z": 9}`
+
+### parent-z (completed 1d ago)
+Legacy parent result.
+
+## Recent work by @writer
+- role-other — Earlier writing job (2027-01-15 07:50, 10m ago): First summary line.
+
+## Comment thread
+comment from worker `writer` at 2027-01-15 07:30, 30m ago:
+Earlier comment.
+
+comment from worker `operator` at 2027-01-15 07:55, 5m ago:
+Latest comment.
