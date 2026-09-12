@@ -526,61 +526,10 @@ def _handle_show(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            task = kb.get_task(conn, tid)
-            if task is None:
+            snapshot = kb.collect_task_show(conn, tid)
+            if snapshot is None:
                 return tool_error(f"task {tid} not found")
-            comments = kb.list_comments(conn, tid)
-            events = kb.list_events(conn, tid)
-            runs = kb.list_runs(conn, tid)
-            parents = kb.parent_ids(conn, tid)
-            children = kb.child_ids(conn, tid)
-
-            def _task_dict(t):
-                return {
-                    "id": t.id, "title": t.title, "body": t.body,
-                    "assignee": t.assignee, "status": t.status,
-                    "tenant": t.tenant, "priority": t.priority,
-                    "workspace_kind": t.workspace_kind,
-                    "workspace_path": t.workspace_path,
-                    "created_by": t.created_by, "created_at": t.created_at,
-                    "started_at": t.started_at,
-                    "completed_at": t.completed_at,
-                    "result": t.result,
-                    "current_run_id": t.current_run_id,
-                    "model_override": t.model_override,
-                    "provider_override": t.provider_override,
-                }
-
-            def _run_dict(r):
-                return {
-                    "id": r.id, "profile": r.profile,
-                    "status": r.status, "outcome": r.outcome,
-                    "summary": r.summary, "error": r.error,
-                    "metadata": r.metadata,
-                    "started_at": r.started_at, "ended_at": r.ended_at,
-                }
-
-            return json.dumps({
-                "task": _task_dict(task),
-                "parents": parents,
-                "children": children,
-                "comments": [
-                    {"author": c.author, "body": c.body,
-                     "created_at": c.created_at}
-                    for c in comments
-                ],
-                "events": [
-                    {"kind": e.kind, "payload": e.payload,
-                     "created_at": e.created_at, "run_id": e.run_id}
-                    for e in events[-50:]   # cap; full log via CLI
-                ],
-                "runs": [_run_dict(r) for r in runs],
-                # Also surface the worker's own context block so the
-                # agent can include it directly if it wants. This is
-                # the same string build_worker_context returns to the
-                # dispatcher at spawn time.
-                "worker_context": kb.build_worker_context(conn, tid),
-            })
+            return snapshot.response_json
         finally:
             conn.close()
     except ValueError as e:
