@@ -288,11 +288,13 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             # host + a dead pid so the crash path acts on it.
             kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
             conn.execute(
-                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
+                "UPDATE tasks SET consecutive_failures=? "
                 "WHERE id=?",
-                (pid, 0, tid),
+                (0, tid),
             )
             conn.commit()
+            # Use the real spawn setter so task and run name the same worker.
+            _kb._set_worker_pid(conn, tid, pid)
             _kb._record_worker_exit(
                 pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
             )

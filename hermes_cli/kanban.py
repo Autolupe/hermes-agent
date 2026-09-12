@@ -1054,6 +1054,26 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        operator_actions = {
+            "init", "boards", "repair", "claim", "assign", "set-model", "reclaim",
+            "reassign", "edit", "unblock", "reopen-review", "promote",
+            "archive", "dispatch", "daemon", "gc", "specify", "decompose",
+        }
+        if action in operator_actions:
+            print("kanban: this action requires an operator outside a worker run", file=sys.stderr)
+            return 1
+        board_override = getattr(args, "board", None)
+        if board_override:
+            try:
+                same_board = kb._normalize_board_slug(board_override) == kb.get_current_board()
+            except ValueError as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 1
+            if not same_board:
+                print("kanban: worker cannot switch its assigned board", file=sys.stderr)
+                return 1
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -1511,11 +1531,12 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
+        run_id = _validated_worker_runs(conn, [args.task_id])[args.task_id]
         ok = kb.heartbeat_worker(
             conn,
             args.task_id,
             note=getattr(args, "note", None),
-            expected_run_id=_worker_run_id_for(args.task_id),
+            expected_run_id=run_id,
         )
     if not ok:
         print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)
@@ -2233,15 +2254,39 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    """Never downgrade an invalid task-bound identity to an operator call."""
+    worker_task = os.environ.get("HERMES_KANBAN_TASK")
+    if not worker_task:
         return None
-    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+    if worker_task != task_id:
+        raise ValueError("worker may only change its own task")
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID", "")
+    if not raw.isascii() or not raw.isdecimal() or int(raw) <= 0:
+        raise ValueError("task-bound worker requires a positive HERMES_KANBAN_RUN_ID")
+    return int(raw)
+
+
+def _validated_worker_runs(conn, task_ids: list[str]) -> dict[str, Optional[int]]:
+    """Validate the whole request before any judge call or lifecycle write.
+
+    Database transitions still compare the captured run id under their write
+    lock, so a run replaced after this advisory check cannot be completed.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") and len(task_ids) != 1:
+        raise ValueError("task-bound worker must target exactly one task")
+    runs = {tid: _worker_run_id_for(tid) for tid in task_ids}
+    for tid, run_id in runs.items():
+        if run_id is None:
+            continue
+        row = conn.execute(
+            "SELECT 1 FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
+            "WHERE t.id=? AND t.status='running' AND t.current_run_id=? "
+            "AND r.task_id=t.id AND r.ended_at IS NULL",
+            (tid, run_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("worker run is no longer the current open attempt")
+    return runs
 
 
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
@@ -2307,6 +2352,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        run_ids = _validated_worker_runs(conn, ids)
         for tid in ids:
             # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
             # to every terminal handoff so request-review cannot bypass the
@@ -2330,7 +2376,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 result=args.result,
                 summary=summary,
                 metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=run_ids[tid],
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
@@ -2370,23 +2416,25 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
-    author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        run_ids = _validated_worker_runs(conn, ids)
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(
                 conn,
                 tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=run_ids[tid],
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
+                # Worker reasons already belong to the exact-run event. Keep
+                # the operator's authored note only after a successful change.
+                if reason and run_ids[tid] is None:
+                    kb.add_comment(conn, tid, _profile_author(), f"BLOCKED: {reason}")
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
@@ -2406,22 +2454,24 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
-    author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        run_ids = _validated_worker_runs(conn, ids)
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
             if not kb.schedule_task(
                 conn,
                 tid,
                 reason=reason,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=run_ids[tid],
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
+                # Worker reasons already belong to the exact-run event. Keep
+                # the operator's authored note only after a successful change.
+                if reason and run_ids[tid] is None:
+                    kb.add_comment(conn, tid, _profile_author(), f"SCHEDULED: {reason}")
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
@@ -2465,6 +2515,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return 2
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
+        run_id = _validated_worker_runs(conn, [tid])[tid]
         rejection = _goal_mode_handoff_rejection(
             kb.get_task(conn, tid),
             summary or "",
@@ -2482,7 +2533,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             summary=summary,
             metadata=metadata,
             reviewer=reviewer,
-            expected_run_id=_worker_run_id_for(tid),
+            expected_run_id=run_id,
             force=bool(getattr(args, "force", False)),
             with_reason=True,
         )
@@ -2506,11 +2557,12 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kb.connect_closing() as conn:
+        run_id = _validated_worker_runs(conn, [tid])[tid]
         ok, detail = kb.request_changes(
             conn,
             tid,
             reason=reason,
-            expected_run_id=_worker_run_id_for(tid),
+            expected_run_id=run_id,
         )
         if not ok:
             print(

@@ -153,17 +153,35 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
     return env_tid or None
 
 
-def _worker_run_id(task_id: str) -> Optional[int]:
-    """Return this worker's dispatcher run id when it is scoped to task_id."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+def _worker_run_id(task_id: str, *, kb, conn) -> Optional[int]:
+    """Validate worker identity before judging or writing lifecycle state.
+
+    Operator calls without a task scope retain the optional run contract.
+    This read is an early refusal, not a transaction guard: lifecycle writes
+    must still compare the returned run id under their database write lock.
+    """
+    worker_task = os.environ.get("HERMES_KANBAN_TASK")
+    if not worker_task:
         return None
+    if worker_task != task_id or not _is_dispatcher_owned_worker():
+        raise ValueError("worker does not own this task context")
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+    if not raw or not raw.isascii() or not raw.isdecimal() or int(raw) <= 0:
+        raise ValueError("HERMES_KANBAN_RUN_ID must be a positive integer for a task worker")
+    run_id = int(raw)
+    task = kb.get_task(conn, task_id)
+    if not task or task.status != "running" or task.current_run_id != run_id:
+        raise ValueError("worker run identity does not match the current running task")
+    run = kb.get_run(conn, run_id)
+    if (
+        not run
+        or run.task_id != task_id
+        or run.status != "running"
+        or run.ended_at is not None
+        or run.outcome is not None
+    ):
+        raise ValueError("worker run identity does not match an open task run")
+    return run_id
 
 
 def _stamp_worker_session_metadata(
@@ -302,16 +320,14 @@ def heartbeat_current_worker_from_env() -> bool:
     """Best-effort: extend the kanban claim + bump board heartbeat for the
     current dispatcher-spawned worker, using identity from env vars.
 
-    Returns True if a write was attempted (whether or not it succeeded);
-    False if the call was skipped (not a kanban worker, rate-limited, or
-    swallowed exception). The boolean is informational — callers should
-    not branch on it.
+    Returns True if the heartbeat succeeded; False if skipped, refused, or
+    failed. The boolean is informational — callers should not branch on it.
 
     Identity comes from:
       * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
       * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
         a stale run that may have already been reclaimed
-      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
+      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for the atomic heartbeat;
         falls back to the default ``_claimer_id()`` for locally-driven
         workers that never went through the dispatcher path
 
@@ -321,7 +337,7 @@ def heartbeat_current_worker_from_env() -> bool:
     """
     global _auto_heartbeat_last_attempt
     tid = os.environ.get("HERMES_KANBAN_TASK")
-    if not tid:
+    if not tid or not _is_dispatcher_owned_worker():
         return False
     import time as _time
     now = _time.monotonic()
@@ -331,27 +347,17 @@ def heartbeat_current_worker_from_env() -> bool:
     try:
         kb, conn = _connect()
         try:
+            run_id = _worker_run_id(tid, kb=kb, conn=conn)
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            try:
-                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
-            run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-            run_id: Optional[int]
-            try:
-                run_id = int(run_id_raw) if run_id_raw else None
-            except (TypeError, ValueError):
-                run_id = None
-            try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
+            return kb.heartbeat_worker(
+                conn, tid, note=None, expected_run_id=run_id,
+                extend_claim=True, claimer=claim_lock,
+            )
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
-        return True
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
         return False
@@ -750,6 +756,7 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            run_id = _worker_run_id(tid, kb=kb, conn=conn)
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
@@ -774,7 +781,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=run_id,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -839,41 +846,40 @@ def _handle_block(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
-        if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
-            conn.close()
-            return tool_error(
-                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
-            )
-        # Goal-mode block gate (Issue #38696, sibling of the kanban_complete
-        # judge gate in #38367). kanban_block is a second exit path out of
-        # the goal loop — run_kanban_goal_loop() treats ANY `blocked` status
-        # as terminal, identically to `done`, regardless of kind. Without
-        # this, a worker that learns kanban_complete is gated can just call
-        # kanban_block(reason="anything") to escape the loop instead.
-        # Restrict goal_mode tasks to the kinds that represent a genuine
-        # external blocker the worker cannot resolve itself; `capability`
-        # and `transient` (or an unset kind) route back through
-        # kanban_complete, which the judge now gates.
-        task = kb.get_task(conn, tid)
-        if (
-            task
-            and task.goal_mode
-            and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
-        ):
-            conn.close()
-            return tool_error(
-                f"goal_mode tasks can only block with kind in "
-                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
-                f"If the task is actually finished or cannot proceed for "
-                f"another reason, call kanban_complete instead — the "
-                f"completion judge will evaluate it."
-            )
         try:
+            run_id = _worker_run_id(tid, kb=kb, conn=conn)
+            if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
+                return tool_error(
+                    f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
+                )
+            # Goal-mode block gate (Issue #38696, sibling of the kanban_complete
+            # judge gate in #38367). kanban_block is a second exit path out of
+            # the goal loop — run_kanban_goal_loop() treats ANY `blocked` status
+            # as terminal, identically to `done`, regardless of kind. Without
+            # this, a worker that learns kanban_complete is gated can just call
+            # kanban_block(reason="anything") to escape the loop instead.
+            # Restrict goal_mode tasks to the kinds that represent a genuine
+            # external blocker the worker cannot resolve itself; `capability`
+            # and `transient` (or an unset kind) route back through
+            # kanban_complete, which the judge now gates.
+            task = kb.get_task(conn, tid)
+            if (
+                task
+                and task.goal_mode
+                and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
+            ):
+                return tool_error(
+                    f"goal_mode tasks can only block with kind in "
+                    f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
+                    f"If the task is actually finished or cannot proceed for "
+                    f"another reason, call kanban_complete instead — the "
+                    f"completion judge will evaluate it."
+                )
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
             )
             if not ok:
                 return tool_error(
@@ -940,6 +946,7 @@ def _handle_request_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            run_id = _worker_run_id(tid, kb=kb, conn=conn)
             task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(task, summary)
             if rejection is not None:
@@ -953,7 +960,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 summary=summary,
                 metadata=metadata,
                 reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
                 with_reason=True,
             )
             if not ok:
@@ -998,11 +1005,12 @@ def _handle_request_changes(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            run_id = _worker_run_id(tid, kb=kb, conn=conn)
             ok, detail = kb.request_changes(
                 conn,
                 tid,
                 reason=reason,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
             )
             if not ok:
                 return tool_error(
@@ -1026,15 +1034,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
-    """Signal that the worker is still alive during a long operation.
-
-    Extends the claim TTL via ``heartbeat_claim`` AND records a heartbeat
-    event via ``heartbeat_worker``. Without the ``heartbeat_claim`` half,
-    a diligent worker that loops this tool while a single tool call
-    blocks the agent for >DEFAULT_CLAIM_TTL_SECONDS still gets reclaimed
-    by ``release_stale_claims`` — which is exactly the trap that
-    ``heartbeat_claim``'s docstring warns against.
-    """
+    """Atomically renew the owned claim and record a worker heartbeat."""
     delegated_err = _reject_delegated_child_mutation("kanban_heartbeat")
     if delegated_err:
         return delegated_err
@@ -1051,19 +1051,19 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Extend the claim TTL first. The dispatcher pins
-            # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
-            # (see _default_spawn in kanban_db.py); falling back to the
-            # default _claimer_id() covers locally-driven workers that
-            # never went through the dispatcher path.
+            run_id = _worker_run_id(tid, kb=kb, conn=conn)
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-
+            if run_id is None:
+                # Operators retain their optional claim-renewal behavior.
+                # Worker renewals below are always one exact-run transaction.
+                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
             ok = kb.heartbeat_worker(
                 conn,
                 tid,
                 note=note,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
+                extend_claim=run_id is not None,
+                claimer=claim_lock,
             )
             if not ok:
                 return tool_error(

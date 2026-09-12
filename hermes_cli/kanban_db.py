@@ -365,6 +365,7 @@ def _fire_dispatch_tick_hook(
             result.promoted,
             result.reconciled_orphans,
             result.crashed,
+            result.terminal_reconciled,
             result.stale,
             result.timed_out,
             result.auto_blocked,
@@ -6347,15 +6348,19 @@ def _synthesize_ended_run(
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    worker/operator ``kanban_block`` call or a reconciled clean exit.
 
-    A ``blocked`` status can come from two very different sources:
+    A ``blocked`` status can come from different sources:
 
     * **Worker- or operator-initiated** — a worker called
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
       ``hermes kanban block <id>``).  This is a deliberate handoff that
       should stay blocked until an operator unblocks it.  The block tool
       emits a ``"blocked"`` event row in ``task_events``.
+
+    * **Clean exit reconciliation** — the dispatcher found an exact open
+      attempt whose worker exited successfully without a terminal handoff.
+      Its ``"terminal_reconciled"`` event also requires explicit unblocking.
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
@@ -6364,9 +6369,9 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       finish, transient infra error clears).
 
     The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
+    ``"blocked"`` / ``"terminal_reconciled"`` / ``"unblocked"`` event for
+    the task. If the most recent one is a block and no later ``"unblocked"``
+    event has fired, the task is sticky and
     ``recompute_ready`` must *not* auto-promote it.
 
     Returns ``False`` when there is no such event at all (e.g. the task
@@ -6376,11 +6381,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'terminal_reconciled', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "terminal_reconciled"}
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
@@ -6394,7 +6399,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     row = conn.execute(
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
-        "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
+        "'blocked', 'terminal_reconciled', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_requested', 'review_reopened', "
         "'status', 'reclaimed', 'reconciled', 'dispatch_parked', "
         "'dispatch_paused', 'workspace_busy', 'stale', 'timed_out', "
@@ -6949,6 +6954,38 @@ def heartbeat_claim(
         return False
 
 
+def _recovery_run_matches(
+    conn: sqlite3.Connection,
+    snapshot: sqlite3.Row,
+    *,
+    allow_untracked: bool = False,
+    allow_pidless_orphan: bool = False,
+) -> bool:
+    """Refuse recovery when a recorded attempt is missing, ended or foreign.
+
+    Use before process actions and again under the recovery write transaction.
+    The snapshot binds the task pointer, PID and claim; the joined run must
+    still describe that same open attempt. Old untracked rows may recover
+    only without any recorded worker process, never by overwriting a run.
+    Orphan recovery may repair a missing task claim when neither row records
+    a PID; this still requires the same current, open, task-owned run.
+    Missing PID records do not prove that a process was never spawned.
+    """
+    return conn.execute(
+        "SELECT 1 FROM tasks t WHERE t.id = ? AND t.status = 'running' "
+        "AND t.current_run_id IS ? AND t.worker_pid IS ? AND t.claim_lock IS ? "
+        "AND ((? AND t.current_run_id IS NULL AND t.worker_pid IS NULL) "
+        "OR EXISTS (SELECT 1 FROM task_runs r WHERE r.id = t.current_run_id "
+        "AND r.task_id = t.id AND r.status = 'running' "
+        "AND r.ended_at IS NULL AND r.outcome IS NULL "
+        "AND r.worker_pid IS t.worker_pid "
+        "AND (r.claim_lock IS t.claim_lock OR (? AND t.worker_pid IS NULL "
+        "AND r.worker_pid IS NULL AND t.claim_lock IS NULL))))",
+        (snapshot["id"], snapshot["current_run_id"], snapshot["worker_pid"],
+         snapshot["claim_lock"], int(allow_untracked), int(allow_pidless_orphan)),
+    ).fetchone() is not None
+
+
 def release_stale_claims(
     conn: sqlite3.Connection,
     *,
@@ -6983,7 +7020,7 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
+        "SELECT id, current_run_id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
         "       assignee "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
@@ -6991,6 +7028,8 @@ def release_stale_claims(
         (now,),
     ).fetchall()
     for row in stale:
+        if not _recovery_run_matches(conn, row, allow_untracked=True):
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -7010,6 +7049,8 @@ def release_stale_claims(
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
             with write_txn(conn):
+                if not _recovery_run_matches(conn, row, allow_untracked=True):
+                    continue
                 cur = conn.execute(
                     "UPDATE tasks SET claim_expires = ? "
                     "WHERE id = ? AND status = 'running' "
@@ -7052,10 +7093,12 @@ def release_stale_claims(
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
-                reason="ttl_expired_worker_alive",
+                reason="ttl_expired_worker_alive", snapshot=row,
             )
             continue
         with write_txn(conn):
+            if not _recovery_run_matches(conn, row, allow_untracked=True):
+                continue
             retry_status = _retry_status_for_run(conn, row["id"])
             landing_status, parked_by_dispatch_brake = (
                 _park_runnable_status_if_dispatch_paused(retry_status)
@@ -7453,6 +7496,14 @@ def complete_task(
         )
         if phantom_cards:
             with write_txn(conn):
+                if expected_run_id is not None and not conn.execute(
+                    "SELECT 1 FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+                    "AND r.task_id = t.id WHERE t.id = ? AND t.current_run_id = ? "
+                    "AND t.status = 'running' AND r.status = 'running' "
+                    "AND r.ended_at IS NULL AND r.outcome IS NULL",
+                    (task_id, int(expected_run_id)),
+                ).fetchone():
+                    return False
                 _append_event(
                     conn, task_id, "completion_blocked_hallucination",
                     {
@@ -7464,6 +7515,7 @@ def complete_task(
                             else None
                         ),
                     },
+                    run_id=_current_run_id(conn, task_id),
                 )
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
@@ -10930,6 +10982,8 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    terminal_reconciled: list[str] = field(default_factory=list)
+    """Exact clean-exit attempts stopped at a capability gate this tick."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -11036,7 +11090,9 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
-    raw, _ = entry
+    raw, reaped_at = entry
+    if time.time() - reaped_at > _RECENT_WORKER_EXIT_TTL_SECONDS:
+        return ("unknown", None)
     try:
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
@@ -11225,6 +11281,7 @@ def _defer_reclaim_for_live_worker(
     termination: dict,
     *,
     reason: str,
+    snapshot: Optional[sqlite3.Row] = None,
 ) -> None:
     """Hold a claim whose worker survived termination instead of releasing it.
 
@@ -11236,6 +11293,8 @@ def _defer_reclaim_for_live_worker(
     """
     grace = now + RECLAIM_DEFER_GRACE_SECONDS
     with write_txn(conn):
+        if snapshot is not None and not _recovery_run_matches(conn, snapshot):
+            return
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
             "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
@@ -11264,6 +11323,8 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    extend_claim: bool = False,
+    claimer: Optional[str] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -11272,11 +11333,39 @@ def heartbeat_worker(
     video encode, web crawl) can have its Python still alive while the
     actual work process is stuck; periodic heartbeats catch that.
 
-    Returns True on success, False if the task is not in a state that
-    should be heartbeating (not running, or claim expired).
+    With ``extend_claim=True``, validate the same open task/run/claim before
+    extending either expiry. An expired but still current claim may renew.
+    Returns False without mutation when the requested identity does not match.
     """
     now = int(time.time())
     with write_txn(conn):
+        if extend_claim:
+            # Validate ownership before touching either expiry. Worker callers
+            # provide their validated run ID; operator callers retain the
+            # existing claim-lock check without gaining another run's claim.
+            lock = claimer or _claimer_id()
+            identity = conn.execute(
+                "SELECT t.current_run_id FROM tasks t JOIN task_runs r "
+                "ON r.id = t.current_run_id AND r.task_id = t.id "
+                "WHERE t.id = ? AND t.status = 'running' AND t.claim_lock = ? "
+                "AND r.claim_lock = t.claim_lock AND r.worker_pid IS t.worker_pid "
+                "AND r.status = 'running' AND r.ended_at IS NULL AND r.outcome IS NULL",
+                (task_id, lock),
+            ).fetchone()
+            if identity is None or (
+                expected_run_id is not None
+                and identity["current_run_id"] != expected_run_id
+            ):
+                return False
+            expires = now + _resolve_claim_ttl_seconds(None)
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+                (expires, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
+                (expires, identity["current_run_id"]),
+            )
         if expected_run_id is None:
             cur = conn.execute(
                 "UPDATE tasks SET last_heartbeat_at = ? "
@@ -11332,7 +11421,7 @@ def enforce_max_runtime(
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.current_run_id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -11342,6 +11431,8 @@ def enforce_max_runtime(
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
     for row in rows:
+        if not _recovery_run_matches(conn, row):
+            continue
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
@@ -11393,6 +11484,8 @@ def enforce_max_runtime(
             # slot stays occupied and retry next tick (never release a
             # claim while its worker is alive — that spawns a duplicate).
             with write_txn(conn):
+                if not _recovery_run_matches(conn, row):
+                    continue
                 _append_event(
                     conn, tid, "kill_pending",
                     {
@@ -11405,6 +11498,8 @@ def enforce_max_runtime(
             continue
 
         with write_txn(conn):
+            if not _recovery_run_matches(conn, row):
+                continue
             retry_status = _retry_status_for_run(conn, tid)
             landing_status, parked_by_dispatch_brake = (
                 _park_runnable_status_if_dispatch_paused(retry_status)
@@ -11517,7 +11612,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.current_run_id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -11525,6 +11620,8 @@ def detect_stale_running(
     ).fetchall()
 
     for row in rows:
+        if not _recovery_run_matches(conn, row, allow_untracked=True):
+            continue
         # Skip if no started_at (shouldn't happen for running, but be safe).
         if row["active_started_at"] is None:
             continue
@@ -11552,11 +11649,13 @@ def detect_stale_running(
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
-                reason="heartbeat_stale_worker_alive",
+                reason="heartbeat_stale_worker_alive", snapshot=row,
             )
             continue
 
         with write_txn(conn):
+            if not _recovery_run_matches(conn, row, allow_untracked=True):
+                continue
             retry_status = _retry_status_for_run(conn, tid)
             landing_status, parked_by_dispatch_brake = (
                 _park_runnable_status_if_dispatch_paused(retry_status)
@@ -11657,7 +11756,7 @@ def reconcile_orphaned_running(
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "SELECT id, current_run_id, claim_lock, claim_expires, worker_pid FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
@@ -11673,6 +11772,10 @@ def reconcile_orphaned_running(
             )
             continue
         with write_txn(conn):
+            if not _recovery_run_matches(
+                conn, row, allow_untracked=True, allow_pidless_orphan=True,
+            ):
+                continue
             retry_status = _retry_status_for_run(conn, tid)
             landing_status, parked_by_dispatch_brake = (
                 _park_runnable_status_if_dispatch_paused(retry_status)
@@ -11759,78 +11862,9 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-# Empirically ~96% of "clean exit without a terminal tool call" tasks complete
-# on a later run (a goal-mode finalize nudge, or the model simply emitting the
-# tool call next time), so a protocol violation is NOT deterministic — give it a
-# bounded retry before the breaker trips instead of blocking on the first hit.
-#
-# The budget is a violation-only STREAK, not a share of the unified
-# ``consecutive_failures`` counter: it counts consecutive clean-exit protocol
-# violations (derived from run history by ``_protocol_violation_streak``), so
-# earlier timeouts / nonzero exits neither consume nor extend it, and a
-# below-budget violation does not tick the unified counter either. A per-task
-# ``max_retries`` overrides this bound — the same "task override wins"
-# precedence ``_record_task_failure`` documents for every other failure kind.
-_PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
-
-# How far back to walk a task's closed runs when counting the violation
-# streak. The streak trips at a handful of violations, so anything beyond a
-# few dozen rows (violations interleaved with neutral rate-limited requeues)
-# can only mean "way past the bound" anyway.
-_PROTOCOL_VIOLATION_SCAN_LIMIT = 50
-
-
-def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
-    """Count the task's trailing run of clean-exit protocol violations.
-
-    Walks the task's closed runs newest-first — including the violation run
-    ``detect_crashed_workers`` just closed — and counts how many in a row were
-    clean-exit protocol violations:
-
-    * ``rate_limited`` runs are neutral and skipped: a quota wall says nothing
-      about the task, exactly as it is neutral for the unified
-      ``consecutive_failures`` counter.
-    * Any other closed run (completed, plain crash, timeout, spawn failure,
-      reclaim, …) breaks the streak, so the bounded retry budget counts ONLY
-      protocol violations — mixed failure kinds can neither consume nor
-      extend it.
-
-    Violation runs are recognized by the ``protocol_violation`` marker that
-    ``detect_crashed_workers`` stamps into the run metadata; the violation
-    error text is matched as a fallback for runs recorded before the marker
-    existed.
-    """
-    streak = 0
-    rows = conn.execute(
-        "SELECT outcome, error, metadata FROM task_runs "
-        "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY id DESC LIMIT ?",
-        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
-    ).fetchall()
-    for row in rows:
-        outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
-            continue
-        if outcome == "crashed":
-            is_violation = False
-            raw_meta = row["metadata"]
-            if raw_meta:
-                try:
-                    is_violation = bool(
-                        json.loads(raw_meta).get("protocol_violation")
-                    )
-                except (ValueError, TypeError):
-                    is_violation = False
-            if not is_violation:
-                is_violation = "protocol violation" in (row["error"] or "")
-            if is_violation:
-                streak += 1
-                continue
-        break
-    return streak
-
-
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and restores the task's source phase.
@@ -11842,12 +11876,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``_default_spawn`` always runs the worker on the same host as the
     dispatcher (the whole design is single-host).
 
-    When the reap registry shows the worker exited cleanly (rc=0) but
-    the task was still ``running`` in the DB, treat it as a protocol
-    violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
+    A fresh clean exit (rc=0) closes only its exact still-open task/run
+    identity at a capability block. It records ``terminal_reconciled``
+    without increasing failure counts or creating a runnable retry. Only an
+    explicit unblock may resume the task; process success is not completion.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -11860,23 +11892,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
-    # Per-crash details collected inside the main txn, used after it
-    # closes to run ``_record_task_failure`` (which needs its own
-    # write_txn so can't nest). ``protocol_violation`` flags the
-    # clean-exit-but-still-running case, which is accounted against its
-    # own bounded violation streak instead of the unified failure
-    # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    terminal_reconciled: list[str] = []
+    observed_exits: dict[int, tuple[int, float]] = {}
+    # Real crash accounting uses its existing post-commit transaction.
+    crash_details: list[tuple[str, int, str, str]] = []
+    # (task_id, pid, claimer, error_text)
     # Worker-exit observer payloads (RFC #58548), collected inside the main
     # txn and fired only after every reclaim/accounting txn has committed.
     exited_hook_payloads: list[dict] = []
     retry_transitions: list[tuple[str, str, str]] = []
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.current_run_id, t.worker_pid, t.claim_lock, t.assignee, "
+            "COALESCE(r.started_at, t.started_at) AS started_at "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -11896,36 +11926,55 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 continue
 
             pid = int(row["worker_pid"])
+            observed = _recent_worker_exits.get(pid)
+            if observed is not None:
+                observed_exits[pid] = observed
             kind, code = _classify_worker_exit(pid)
-            rate_limited_exit = False
+            if observed is not None and started_at is not None and observed[1] < started_at:
+                # A previous incarnation of this PID cannot classify a new run.
+                kind, code = "unknown", None
+            if not _recovery_run_matches(conn, row):
+                continue
             if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
-                # surfaced to the retry worker via the prior-attempt error in
-                # ``build_worker_context`` (guidance approach from #61817).
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
+                run_id = row["current_run_id"]
+                reason = (
+                    "worker exited cleanly (rc=0) without an exact-run terminal "
+                    "handoff; capability reconciliation required before retry"
                 )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
-                    "protocol_violation": True,
-                }
-            elif kind == "rate_limited":
+                # BEGIN IMMEDIATE is already held. Both rows must identify the
+                # same still-open attempt; a stale observation must not close a
+                # successor or overwrite a completed/blocked run.
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+                    "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                    "last_failure_error = ? "
+                    "WHERE id = ? AND status = 'running' AND current_run_id = ? "
+                    "AND worker_pid = ? AND claim_lock IS ? "
+                    "AND EXISTS (SELECT 1 FROM task_runs r WHERE r.id = ? "
+                    "AND r.task_id = tasks.id AND r.status = 'running' "
+                    "AND r.ended_at IS NULL AND r.outcome IS NULL "
+                    "AND r.worker_pid = ? AND r.claim_lock IS ?)",
+                    (reason, row["id"], run_id, pid, lock, run_id, pid, lock),
+                )
+                if cur.rowcount == 1:
+                    payload = {
+                        "pid": pid, "exit_kind": kind, "exit_code": code,
+                        "kind": "capability", "reason": reason,
+                        "resume_status": _retry_status_for_run(conn, row["id"]),
+                    }
+                    _end_run(conn, row["id"], outcome="blocked", status="blocked",
+                             summary=reason, error=reason, metadata=payload)
+                    _append_event(conn, row["id"], "terminal_reconciled", payload,
+                                  run_id=run_id)
+                    terminal_reconciled.append(row["id"])
+                    exited_hook_payloads.append({
+                        "task_id": row["id"], "assignee": row["assignee"],
+                        "run_id": run_id, "worker_pid": pid, "exit_kind": kind,
+                        "exit_code": code, "outcome": "blocked",
+                    })
+                continue
+            rate_limited_exit = False
+            if kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
                 # the task is fine, the account just hit a wall. Release it
@@ -11933,7 +11982,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # quota window clears, and crucially do NOT count a failure
                 # (skip ``_record_task_failure``) so a long quota window can't
                 # trip the circuit breaker and permanently block the card.
-                protocol_violation = False
                 rate_limited_exit = True
                 error_text = (
                     f"pid {pid} exited rate-limited (quota wall) — "
@@ -11946,7 +11994,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "exit_code": code,
                 }
             else:
-                protocol_violation = False
                 if kind == "nonzero_exit":
                     error_text = f"pid {pid} exited with code {code}"
                 elif kind == "signaled":
@@ -12018,100 +12065,33 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     )
                     rate_limited.append(row["id"])
                 else:
-                    if protocol_violation:
-                        # Stamp the failure error now: a below-budget
-                        # violation never reaches ``_record_task_failure``
-                        # (which stamps this column for every other failure
-                        # kind), yet the board UI and the retry worker's
-                        # context still need the violation message + the
-                        # corrective guidance it carries.
-                        conn.execute(
-                            "UPDATE tasks SET last_failure_error = ? "
-                            "WHERE id = ?",
-                            (error_text[:500], row["id"]),
-                        )
                     crashed.append(row["id"])
                     crash_details.append(
-                        (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                        (row["id"], pid, row["claim_lock"], error_text)
                     )
         _park_retry_transitions_before_commit(conn, retry_transitions)
+    # Wait statuses are process memory, not transactional data. Consume only
+    # after COMMIT, including a lost CAS, and never delete a newer observation.
+    for pid, observed in observed_exits.items():
+        if _recent_worker_exits.get(pid) == observed:
+            _recent_worker_exits.pop(pid, None)
     _park_retry_transitions_after_commit(conn, retry_transitions)
     # Dead workers hold no worktree: release each reclaimed card's lock so
     # the retry can enter the checkout (dead-pid locks only — never a live one).
-    for _tid in (*crashed, *rate_limited):
+    for _tid in (*crashed, *rate_limited, *terminal_reconciled):
         _unlock_task_worktree(conn, _tid)
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
     # on top of the event we already emitted).
     #
-    # Protocol-violation crashes (clean exit, no terminal tool call) get a
-    # BOUNDED retry, not an immediate trip: empirically ~96% of these tasks
-    # complete on a later run (a goal-mode finalize nudge, or the model simply
-    # emitting kanban_complete/kanban_block next time), so blocking on the first
-    # occurrence just churned them through the respawn cycle. The retry budget
-    # is a violation-only streak (``_protocol_violation_streak``): earlier
-    # timeouts / nonzero exits neither consume nor extend it, and a
-    # below-budget violation does not tick the unified
-    # ``consecutive_failures`` counter, so the two budgets stay independent.
-    # A per-task ``max_retries`` overrides the violation bound with the same
-    # top precedence it has for every other failure kind. Systemic same-error
-    # crashes still trip immediately.
     auto_blocked: list[str] = []
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, err_text in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
-            if protocol_violation:
-                streak = _protocol_violation_streak(conn, tid)
-                trow = conn.execute(
-                    "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
-                ).fetchone()
-                if trow is None:
-                    continue  # task deleted mid-loop
-                task_override = (
-                    trow["max_retries"] if "max_retries" in trow.keys() else None
-                )
-                violation_limit = (
-                    int(task_override)
-                    if task_override is not None
-                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT
-                )
-                if streak < violation_limit:
-                    # Below budget: the task is back in its source phase, or
-                    # parked in ``todo`` while stopped, with
-                    # ``last_failure_error`` stamped.
-                    # Deliberately no ``_record_task_failure`` call — a
-                    # below-budget violation must not consume the unified
-                    # failure budget, just as other failure kinds don't
-                    # consume this one.
-                    continue
-                # Streak reached the bound: trip the breaker. ``force_trip``
-                # skips the threshold resolution inside
-                # ``_record_task_failure`` because the decision — including
-                # the per-task ``max_retries`` override — was already made
-                # against the violation streak above.
-                tripped = _record_task_failure(
-                    conn, tid,
-                    error=error_text,
-                    outcome="crashed",
-                    failure_limit=violation_limit,
-                    force_trip=True,
-                    release_claim=False,
-                    end_run=False,
-                    event_payload_extra={
-                        "pid": pid,
-                        "claimer": claimer,
-                        "protocol_violations": streak,
-                        "protocol_violation_limit": violation_limit,
-                    },
-                )
-                if tripped:
-                    auto_blocked.append(tid)
-                continue
+        for tid, pid, claimer, error_text in crash_details:
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
             tripped = _record_task_failure(
@@ -12129,6 +12109,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Keeps the public return type (``list[str]``) stable for direct callers
     # and tests that destructure the result; ``dispatch_once`` reads this
     # side-channel attribute to populate ``DispatchResult.auto_blocked``.
+    detect_crashed_workers._last_terminal_reconciled = terminal_reconciled  # type: ignore[attr-defined]
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
@@ -12138,7 +12119,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # AND the breaker accounting above have committed, so subscribers always
     # observe fully durable board state.
     if exited_hook_payloads and _kanban_observer_consumed("on_kanban_worker_exited"):
-        _board = get_current_board()
+        _board = board if board is not None else get_current_board()
         for hook_fields in exited_hook_payloads:
             hook_fields = dict(hook_fields)
             _fire_kanban_lifecycle_hook(
@@ -13318,11 +13299,11 @@ def _dispatch_once_locked(
     """Run one dispatcher tick.
 
     Steps:
-      1. Reclaim stale running tasks (TTL expired).
-      2. Reclaim stale running tasks (no recent heartbeat).
-      3. Reclaim crashed running tasks (host-local PID no longer alive).
-      3. Promote todo -> ready where all parents are done.
-      4. For each ready task with an assignee, atomically claim and call
+      1. Reap child wait statuses; reconcile exact clean exits / real crashes.
+      2. Reclaim stale claims and orphaned running tasks.
+      3. Reclaim stale running tasks (no recent heartbeat).
+      4. Promote todo -> ready where all parents are done.
+      5. For each ready task with an assignee, atomically claim and call
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
          return value (if any) is recorded as ``worker_pid`` so subsequent
          ticks can detect crashes before the TTL expires.
@@ -13355,6 +13336,8 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    result.crashed = detect_crashed_workers(conn, board=board)
+    result.terminal_reconciled = getattr(detect_crashed_workers, "_last_terminal_reconciled", [])
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -13364,8 +13347,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
-    # detect_crashed_workers stashes protocol-violation auto-blocks on
+    # detect_crashed_workers stashes genuine-crash circuit-breaker blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
     _crash_auto_blocked = getattr(
