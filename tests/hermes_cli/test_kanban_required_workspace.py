@@ -14,6 +14,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_policy as policy
 from hermes_cli import kanban_workspace_policy as workspace_policy
+from tests.hermes_cli.delivery_fixtures import ARTIFACT_CONTRACT
 
 
 pytestmark = pytest.mark.linux_only
@@ -66,7 +67,7 @@ def enroll(monkeypatch, provider=None):
 @pytest.mark.parametrize("lane", ["ready", "review"])
 def test_base_provider_refuses_native_dispatch_before_workspace(native, repo, monkeypatch, lane):
     task_id = kb.create_task(native, title="fixture", assignee="default",
-                             workspace_kind="worktree")
+                             workspace_kind="worktree", body=ARTIFACT_CONTRACT)
     if lane == "review":
         native.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
         native.commit()
@@ -88,7 +89,8 @@ def test_base_provider_refuses_native_dispatch_before_workspace(native, repo, mo
 def test_enrolled_public_resolver_cannot_start_implicit_request(native, tmp_path, monkeypatch):
     target = tmp_path / "must-not-exist"
     task_id = kb.create_task(native, title="fixture", assignee="default",
-                             workspace_kind="dir", workspace_path=str(target))
+                             workspace_kind="dir", workspace_path=str(target),
+                             body=ARTIFACT_CONTRACT)
     task = kb.claim_task(native, task_id)
     enroll(monkeypatch)
     with pytest.raises(policy.RequiredPolicyError):
@@ -126,6 +128,8 @@ class FixtureProvider(policy.RequiredKanbanPolicy):
 
 
 def claim(conn, *, lane="ready", **kwargs):
+    if kwargs.get("workspace_kind") in {"dir", "worktree"}:
+        kwargs.setdefault("body", ARTIFACT_CONTRACT)
     task_id = kb.create_task(conn, title="fixture", assignee="default", **kwargs)
     if lane == "review":
         conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
@@ -185,7 +189,8 @@ def test_direct_enrolled_helpers_refuse_missing_request(native, repo, tmp_path, 
 def test_required_fetch_failure_is_sticky_without_materialization_or_cache(
     native, repo, monkeypatch, lane, failure,
 ):
-    task_id = kb.create_task(native, title="fixture", assignee="default", workspace_kind="worktree")
+    task_id = kb.create_task(native, title="fixture", assignee="default", workspace_kind="worktree",
+                             body=ARTIFACT_CONTRACT)
     if lane == "review":
         native.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
         native.commit()
@@ -196,7 +201,8 @@ def test_required_fetch_failure_is_sticky_without_materialization_or_cache(
     fetches = []
 
     def run(command, **kwargs):
-        if command[:2] == ["git", "-C"] and command[3:] == ["fetch", "origin", "main"]:
+        if command[:2] == ["git", "-C"] and command[3:5] == ["fetch", "origin"]:
+            assert command[5:] == ["+refs/heads/main:refs/remotes/origin/main"]
             fetches.append(command)
             if failure == "timeout":
                 raise subprocess.TimeoutExpired(command, kwargs["timeout"])
@@ -217,7 +223,8 @@ def test_required_fetch_failure_is_sticky_without_materialization_or_cache(
 
 @pytest.mark.parametrize("lane", ["ready", "review"])
 def test_required_reuse_is_checked_and_launch_remains_unsupported(native, repo, monkeypatch, lane):
-    task_id = kb.create_task(native, title="fixture", assignee="default", workspace_kind="worktree")
+    task_id = kb.create_task(native, title="fixture", assignee="default", workspace_kind="worktree",
+                             body=ARTIFACT_CONTRACT)
     target = repo / ".worktrees" / task_id
     branch = kb.default_task_branch_name(task_id)
     git("-C", repo, "worktree", "add", "-b", branch, target, "origin/main")
@@ -462,7 +469,8 @@ def test_request_rejects_other_connection_at_same_path(native, tmp_path, monkeyp
 def test_manual_claim_cannot_force_required_admission(native, tmp_path, monkeypatch, capsys):
     from hermes_cli import kanban
     task_id = kb.create_task(native, title="manual fixture", assignee="default",
-                             workspace_kind="dir", workspace_path=str(tmp_path / "manual-workspace"))
+                             workspace_kind="dir", workspace_path=str(tmp_path / "manual-workspace"),
+                             body=ARTIFACT_CONTRACT)
     enroll(monkeypatch)
     monkeypatch.setattr(kb, "connect_closing", lambda: contextlib.nullcontext(native))
     args = SimpleNamespace(task_id=task_id, ttl=None, force=True)
@@ -477,7 +485,8 @@ def test_real_local_fetch_and_worktree_are_removed_after_late_denial(native, rep
     git("init", "--bare", remote)
     git("-C", repo, "remote", "add", "origin", remote)
     git("-C", repo, "push", "origin", "main")
-    task_id = kb.create_task(native, title="fixture", assignee="default", workspace_kind="worktree")
+    task_id = kb.create_task(native, title="fixture", assignee="default", workspace_kind="worktree",
+                             body=ARTIFACT_CONTRACT)
     before = kb.get_task(native, task_id)
     provider = FixtureProvider()
     enroll(monkeypatch, provider)
@@ -541,7 +550,8 @@ def test_policy_change_cannot_make_active_request_ordinary(native, monkeypatch, 
 def test_late_enrollment_never_records_unbound_spawn_failure(native, tmp_path, monkeypatch, lane, edge):
     target = tmp_path / "ordinary-first-workspace"
     task_id = kb.create_task(native, title="fixture", assignee="default",
-                             workspace_kind="dir", workspace_path=str(target))
+                             workspace_kind="dir", workspace_path=str(target),
+                             body=ARTIFACT_CONTRACT)
     if lane == "review":
         native.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
         native.commit()
@@ -629,7 +639,8 @@ def test_enrollment_after_real_callback_entry_preserves_uncertain_worker_claim(
 ):
     target = tmp_path / "ordinary-workspace"
     task_id = kb.create_task(native, title="fixture", assignee="default",
-                             workspace_kind="dir", workspace_path=str(target))
+                             workspace_kind="dir", workspace_path=str(target),
+                             body=ARTIFACT_CONTRACT)
     if lane == "review":
         native.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
         native.commit()

@@ -183,7 +183,9 @@ def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
 # - subagent — a delegated child's session is hidden from every picker, so its
 #   title is never read. A batch at `max_concurrent_children` would pay N title
 #   calls for N names nobody sees.
-_UNTITLED_PLATFORMS = frozenset({"cron", "subagent"})
+# - kanban — the board already names the task and hides worker sessions from
+#   chat pickers. Workers run the CLI but carry the session source `kanban`.
+_UNTITLED_PLATFORMS = frozenset({"cron", "subagent", "kanban"})
 
 
 def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
@@ -202,6 +204,15 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
         return
 
     try:
+        from gateway.session_context import get_session_env
+
+        # Use the session binding first; only unbound CLI subprocesses inherit
+        # the dispatcher's source marker. A worker marker in the host's env
+        # must not suppress titles for other chats in the same gateway.
+        source = str(get_session_env("HERMES_SESSION_SOURCE", "") or "").strip().lower()
+        if source in _UNTITLED_PLATFORMS:
+            return
+
         from agent.message_content import flatten_message_text
         from agent.title_generator import maybe_auto_title
 

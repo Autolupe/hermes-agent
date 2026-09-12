@@ -49,6 +49,28 @@ KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
 
 
+def _shared_kanban_config() -> dict:
+    """Load board lifecycle policy from the default/root Hermes config.
+
+    Dispatcher workers run under assignee-specific HERMES_HOME directories,
+    while the Kanban board and its routing policy are root-scoped.  Reading the
+    active profile config here would silently drop reviewer/max-round policy.
+    """
+    from hermes_constants import (
+        get_default_hermes_root,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(get_default_hermes_root())
+    try:
+        cfg = load_config()
+    finally:
+        reset_hermes_home_override(token)
+    kanban_cfg = cfg.get("kanban") if isinstance(cfg, dict) else None
+    return kanban_cfg if isinstance(kanban_cfg, dict) else {}
+
+
 def _profile_has_kanban_toolset() -> bool:
     # Uses load_config() which has mtime-based caching, so this adds
     # negligible overhead. The check_fn results are further TTL-cached
@@ -119,6 +141,17 @@ def _check_kanban_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _check_kanban_delivery_mode() -> bool:
+    """Hide remote-delivery lifecycle tools from generic sandbox workers."""
+
+    if os.environ.get("HERMES_KANBAN_TERMINAL_SANDBOX") == "systemd-v1":
+        return (
+            os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") == "clauseye-v1"
+            and _check_kanban_mode()
+        )
+    return _check_kanban_mode()
+
+
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock) are intentionally
     hidden from task workers.
@@ -153,17 +186,121 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
     return env_tid or None
 
 
-def _worker_run_id(task_id: str) -> Optional[int]:
-    """Return this worker's dispatcher run id when it is scoped to task_id."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+def _worker_run_id(task_id: str, *, kb, conn, allow_shipping: bool = False) -> Optional[int]:
+    """Validate worker identity before judging or writing lifecycle state.
+
+    Operator calls without a task scope retain the optional run contract.
+    This read is an early refusal, not a transaction guard: lifecycle writes
+    must still compare the returned run id under their database write lock.
+    """
+    worker_task = os.environ.get("HERMES_KANBAN_TASK")
+    if not worker_task:
         return None
+    if worker_task != task_id or not _is_dispatcher_owned_worker():
+        raise ValueError("worker does not own this task context")
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-    if not raw:
-        return None
+    if not raw or not raw.isascii() or not raw.isdecimal() or int(raw) <= 0:
+        raise ValueError("HERMES_KANBAN_RUN_ID must be a positive integer for a task worker")
+    run_id = int(raw)
+    task = kb.get_task(conn, task_id)
+    allowed_statuses = {"running", "shipping"} if allow_shipping else {"running"}
+    if not task or task.status not in allowed_statuses or task.current_run_id != run_id:
+        raise ValueError("worker run identity does not match the current running task")
+    if task.status == "shipping" and kb._active_delivery_operation(conn, task_id, run_id) is None:
+        raise ValueError("worker has no active delivery operation for this run")
+    run = kb.get_run(conn, run_id)
+    if (
+        not run
+        or run.task_id != task_id
+        or run.status != "running"
+        or run.ended_at is not None
+        or run.outcome is not None
+    ):
+        raise ValueError("worker run identity does not match an open task run")
+    return run_id
+
+
+def _marked_delivery_control_action(
+    action: str,
+    task_id: str,
+    summary: str,
+    *,
+    board: Optional[str] = None,
+) -> str:
+    """Route a sandbox-marked lifecycle edge through the fixed root broker."""
+
+    if os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") != "clauseye-v1":
+        raise RuntimeError("delivery control called outside an eligible worker")
+    delegated_err = _reject_delegated_child_mutation("trusted delivery control")
+    if delegated_err:
+        return delegated_err
+    if board is not None:
+        return tool_error("trusted delivery control does not accept a board override")
+    if action not in {"builder_publish", "reviewer_complete"}:
+        return tool_error("unsupported trusted delivery action")
     try:
-        return int(raw)
-    except ValueError:
-        return None
+        kb, conn = _connect()
+        try:
+            run_id = _worker_run_id(task_id, kb=kb, conn=conn, allow_shipping=True)
+            task = kb.get_task(conn, task_id)
+            if task is not None and task.status == "shipping":
+                operation = kb._active_delivery_operation(conn, task_id, run_id)
+                if operation is None or operation["action"] != action:
+                    return tool_error("active delivery operation does not match this action")
+        finally:
+            conn.close()
+    except ValueError as exc:
+        return tool_error(f"trusted delivery control: {exc}")
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK", "")
+    if run_id is None or not claim_lock:
+        return tool_error(
+            "trusted delivery control requires this worker's exact active run; "
+            "the task remains in-flight"
+        )
+    from hermes_cli.delivery_control import (
+        DeliveryControlError,
+        request_worker_action,
+    )
+
+    try:
+        response = request_worker_action(
+            action=action,
+            task_id=task_id,
+            run_id=run_id,
+            claim_lock=claim_lock,
+            summary=summary,
+        )
+    except DeliveryControlError as exc:
+        if exc.pending:
+            return _ok(
+                state="pending",
+                code=exc.code,
+                message=str(exc),
+                retryable=True,
+                retry_after_seconds=30,
+                next_action="kanban_heartbeat_then_retry",
+                task_id=task_id,
+                run_id=run_id,
+            )
+        return tool_error(f"trusted delivery control rejected [{exc.code}]: {exc}")
+    if response.get("ok") is True:
+        return json.dumps(response, sort_keys=True)
+    if response.get("state") == "pending":
+        return _ok(
+            state="pending",
+            code=str(response.get("code") or "delivery_pending"),
+            message=str(response.get("message") or "delivery is still pending"),
+            retryable=True,
+            retry_after_seconds=30,
+            next_action="kanban_heartbeat_then_retry",
+            task_id=task_id,
+            run_id=run_id,
+        )
+    return tool_error(
+        "trusted delivery control rejected "
+        f"[{response.get('code') or 'delivery_rejected'}]: "
+        f"{response.get('message') or 'transition rejected'}"
+    )
 
 
 def _stamp_worker_session_metadata(
@@ -302,16 +439,14 @@ def heartbeat_current_worker_from_env() -> bool:
     """Best-effort: extend the kanban claim + bump board heartbeat for the
     current dispatcher-spawned worker, using identity from env vars.
 
-    Returns True if a write was attempted (whether or not it succeeded);
-    False if the call was skipped (not a kanban worker, rate-limited, or
-    swallowed exception). The boolean is informational — callers should
-    not branch on it.
+    Returns True if the heartbeat succeeded; False if skipped, refused, or
+    failed. The boolean is informational — callers should not branch on it.
 
     Identity comes from:
       * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
       * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
         a stale run that may have already been reclaimed
-      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
+      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for the atomic heartbeat;
         falls back to the default ``_claimer_id()`` for locally-driven
         workers that never went through the dispatcher path
 
@@ -321,7 +456,7 @@ def heartbeat_current_worker_from_env() -> bool:
     """
     global _auto_heartbeat_last_attempt
     tid = os.environ.get("HERMES_KANBAN_TASK")
-    if not tid:
+    if not tid or not _is_dispatcher_owned_worker():
         return False
     import time as _time
     now = _time.monotonic()
@@ -331,27 +466,20 @@ def heartbeat_current_worker_from_env() -> bool:
     try:
         kb, conn = _connect()
         try:
+            run_id = _worker_run_id(
+                tid, kb=kb, conn=conn,
+                allow_shipping=os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") == "clauseye-v1",
+            )
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            try:
-                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_claim failed", exc_info=True)
-            run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-            run_id: Optional[int]
-            try:
-                run_id = int(run_id_raw) if run_id_raw else None
-            except (TypeError, ValueError):
-                run_id = None
-            try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
-            except Exception:
-                logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
+            return kb.heartbeat_worker(
+                conn, tid, note=None, expected_run_id=run_id,
+                extend_claim=True, claimer=claim_lock,
+            )
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
-        return True
     except Exception:
         logger.debug("auto-heartbeat: bridge failed", exc_info=True)
         return False
@@ -620,11 +748,31 @@ def _handle_complete(args: dict, **kw) -> str:
         return ownership_err
     summary = args.get("summary")
     metadata = args.get("metadata")
+    delivery = args.get("delivery")
     result = args.get("result")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
         result = redact_sensitive_text(str(result), force=True)
+    if os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") == "clauseye-v1":
+        if any(args.get(name) is not None for name in (
+            "delivery", "created_cards", "artifacts", "metadata", "board",
+        )):
+            return tool_error(
+                "trusted delivery control accepts only the task and summary; "
+                "it derives delivery evidence itself"
+            )
+        handoff = str(summary or result or "").strip()
+        if not handoff:
+            return tool_error("provide at least one of: summary (preferred), result")
+        return _marked_delivery_control_action("reviewer_complete", tid, handoff)
+    if delivery is not None:
+        if not isinstance(delivery, dict):
+            return tool_error("delivery must be an object/dict")
+        try:
+            delivery = json.loads(redact_sensitive_text(json.dumps(delivery), force=True))
+        except json.JSONDecodeError:
+            return tool_error("delivery could not be safely serialized")
     if metadata is not None and isinstance(metadata, dict):
         meta_json = json.dumps(metadata)
         meta_json = redact_sensitive_text(meta_json, force=True)
@@ -699,6 +847,7 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            run_id = _worker_run_id(tid, kb=kb, conn=conn)
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
@@ -722,8 +871,9 @@ def _handle_complete(args: dict, **kw) -> str:
                 ok = kb.complete_task(
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
+                    delivery=delivery,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=run_id,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -751,6 +901,11 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.DeliveryEvidenceError as delivery_err:
+                return tool_error(
+                    f"kanban_complete blocked [{delivery_err.code}]: {delivery_err}. "
+                    "The task remains in-flight."
                 )
             if not ok:
                 return tool_error(
@@ -788,41 +943,40 @@ def _handle_block(args: dict, **kw) -> str:
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
-        if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
-            conn.close()
-            return tool_error(
-                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
-            )
-        # Goal-mode block gate (Issue #38696, sibling of the kanban_complete
-        # judge gate in #38367). kanban_block is a second exit path out of
-        # the goal loop — run_kanban_goal_loop() treats ANY `blocked` status
-        # as terminal, identically to `done`, regardless of kind. Without
-        # this, a worker that learns kanban_complete is gated can just call
-        # kanban_block(reason="anything") to escape the loop instead.
-        # Restrict goal_mode tasks to the kinds that represent a genuine
-        # external blocker the worker cannot resolve itself; `capability`
-        # and `transient` (or an unset kind) route back through
-        # kanban_complete, which the judge now gates.
-        task = kb.get_task(conn, tid)
-        if (
-            task
-            and task.goal_mode
-            and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
-        ):
-            conn.close()
-            return tool_error(
-                f"goal_mode tasks can only block with kind in "
-                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
-                f"If the task is actually finished or cannot proceed for "
-                f"another reason, call kanban_complete instead — the "
-                f"completion judge will evaluate it."
-            )
         try:
+            run_id = _worker_run_id(tid, kb=kb, conn=conn)
+            if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
+                return tool_error(
+                    f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
+                )
+            # Goal-mode block gate (Issue #38696, sibling of the kanban_complete
+            # judge gate in #38367). kanban_block is a second exit path out of
+            # the goal loop — run_kanban_goal_loop() treats ANY `blocked` status
+            # as terminal, identically to `done`, regardless of kind. Without
+            # this, a worker that learns kanban_complete is gated can just call
+            # kanban_block(reason="anything") to escape the loop instead.
+            # Restrict goal_mode tasks to the kinds that represent a genuine
+            # external blocker the worker cannot resolve itself; `capability`
+            # and `transient` (or an unset kind) route back through
+            # kanban_complete, which the judge now gates.
+            task = kb.get_task(conn, tid)
+            if (
+                task
+                and task.goal_mode
+                and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS
+            ):
+                return tool_error(
+                    f"goal_mode tasks can only block with kind in "
+                    f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
+                    f"If the task is actually finished or cannot proceed for "
+                    f"another reason, call kanban_complete instead — the "
+                    f"completion judge will evaluate it."
+                )
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
             )
             if not ok:
                 return tool_error(
@@ -846,6 +1000,104 @@ def _handle_block(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_block failed")
         return tool_error(f"kanban_block: {e}")
+
+
+def _handle_submit_for_review(args: dict, **kw) -> str:
+    """Atomically hand the current code task to an autonomous reviewer."""
+    delegated_err = _reject_delegated_child_mutation("kanban_submit_for_review")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    if (
+        os.environ.get("HERMES_KANBAN_TERMINAL_SANDBOX") == "systemd-v1"
+        and os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") != "clauseye-v1"
+    ):
+        return tool_error("this worker is not enrolled in trusted delivery control")
+    if os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") == "clauseye-v1":
+        if any(args.get(name) is not None for name in ("pull_request", "metadata", "board")):
+            return tool_error(
+                "sandboxed builders must not supply PR or metadata claims; "
+                "trusted delivery control publishes the exact HEAD and derives "
+                "the canonical PR"
+            )
+        summary = redact_sensitive_text(str(args.get("summary") or ""), force=True)
+        if not summary.strip():
+            return tool_error("summary is required for trusted builder publication")
+        return _marked_delivery_control_action(
+            "builder_publish", tid, summary.strip(),
+        )
+    pull_request = args.get("pull_request")
+    if not isinstance(pull_request, dict):
+        return tool_error("pull_request must be an object/dict")
+    try:
+        pull_request = json.loads(
+            redact_sensitive_text(json.dumps(pull_request), force=True)
+        )
+    except json.JSONDecodeError:
+        pass
+    summary = args.get("summary")
+    if summary:
+        summary = redact_sensitive_text(str(summary), force=True)
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object/dict, got {type(metadata).__name__}"
+        )
+    if isinstance(metadata, dict):
+        try:
+            metadata = json.loads(
+                redact_sensitive_text(json.dumps(metadata), force=True)
+            )
+        except json.JSONDecodeError:
+            pass
+    metadata = _stamp_worker_session_metadata(tid, metadata)
+    reviewer = str(
+        _shared_kanban_config().get("reviewer_profile") or ""
+    ).strip() or None
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            run_id = _worker_run_id(tid, kb=kb, conn=conn)
+            rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), summary or "")
+            if rejection is not None:
+                return tool_error(f"Goal review handoff rejected by judge: {rejection}")
+            try:
+                ok = kb.submit_task_for_review(
+                    conn,
+                    tid,
+                    pull_request=pull_request,
+                    summary=summary,
+                    metadata=metadata,
+                    reviewer_assignee=reviewer,
+                    expected_run_id=run_id,
+                )
+            except kb.DeliveryEvidenceError as delivery_err:
+                return tool_error(
+                    f"kanban_submit_for_review blocked [{delivery_err.code}]: "
+                    f"{delivery_err}. The task remains in-flight and the "
+                    "rejection is recorded in task events."
+                )
+            if not ok:
+                return tool_error(
+                    f"could not submit {tid} for review (unknown id, stale run, "
+                    "or task is not running)"
+                )
+            return _ok(task_id=tid, status="review", reviewer=reviewer)
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_submit_for_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_submit_for_review failed")
+        return tool_error(f"kanban_submit_for_review: {e}")
 
 
 def _handle_request_review(args: dict, **kw) -> str:
@@ -889,7 +1141,12 @@ def _handle_request_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            run_id = _worker_run_id(tid, kb=kb, conn=conn)
             task = kb.get_task(conn, tid)
+            if task and kb._completion_delivery_policy(task)["pr_gate"] != "none":
+                return tool_error(
+                    "code delivery requires kanban_submit_for_review with an exact candidate"
+                )
             rejection = _goal_mode_handoff_rejection(task, summary)
             if rejection is not None:
                 return tool_error(
@@ -902,7 +1159,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 summary=summary,
                 metadata=metadata,
                 reviewer=reviewer,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
                 with_reason=True,
             )
             if not ok:
@@ -947,11 +1204,35 @@ def _handle_request_changes(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            run_id = _worker_run_id(tid, kb=kb, conn=conn)
+            task = kb.get_task(conn, tid)
+            if args.get("reviewed_head_sha") is not None or (
+                task and kb._completion_delivery_policy(task)["pr_gate"] != "none"
+            ):
+                if (
+                    os.environ.get("HERMES_KANBAN_TERMINAL_SANDBOX") == "systemd-v1"
+                    and os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") != "clauseye-v1"
+                ):
+                    return tool_error("this worker is not enrolled in trusted delivery control")
+                status = kb.request_task_changes(
+                    conn, tid,
+                    reason=reason,
+                    reviewed_head_sha=str(args.get("reviewed_head_sha") or "").strip(),
+                    max_review_rounds=_shared_kanban_config().get("max_review_rounds", 2),
+                    expected_run_id=run_id if run_id is not None else task.current_run_id if task else None,
+                )
+                if status is None:
+                    return tool_error(f"could not request changes for {tid}: stale review attempt")
+                return _ok(
+                    task_id=tid,
+                    status=status,
+                    review_round_limit_reached=status == "blocked",
+                )
             ok, detail = kb.request_changes(
                 conn,
                 tid,
                 reason=reason,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
             )
             if not ok:
                 return tool_error(
@@ -975,15 +1256,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
-    """Signal that the worker is still alive during a long operation.
-
-    Extends the claim TTL via ``heartbeat_claim`` AND records a heartbeat
-    event via ``heartbeat_worker``. Without the ``heartbeat_claim`` half,
-    a diligent worker that loops this tool while a single tool call
-    blocks the agent for >DEFAULT_CLAIM_TTL_SECONDS still gets reclaimed
-    by ``release_stale_claims`` — which is exactly the trap that
-    ``heartbeat_claim``'s docstring warns against.
-    """
+    """Atomically renew the owned claim and record a worker heartbeat."""
     delegated_err = _reject_delegated_child_mutation("kanban_heartbeat")
     if delegated_err:
         return delegated_err
@@ -1000,19 +1273,22 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Extend the claim TTL first. The dispatcher pins
-            # HERMES_KANBAN_CLAIM_LOCK in the worker env at spawn time
-            # (see _default_spawn in kanban_db.py); falling back to the
-            # default _claimer_id() covers locally-driven workers that
-            # never went through the dispatcher path.
+            run_id = _worker_run_id(
+                tid, kb=kb, conn=conn,
+                allow_shipping=os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") == "clauseye-v1",
+            )
             claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            kb.heartbeat_claim(conn, tid, claimer=claim_lock)
-
+            if run_id is None:
+                # Operators retain their optional claim-renewal behavior.
+                # Worker renewals below are always one exact-run transaction.
+                kb.heartbeat_claim(conn, tid, claimer=claim_lock)
             ok = kb.heartbeat_worker(
                 conn,
                 tid,
                 note=note,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
+                extend_claim=run_id is not None,
+                claimer=claim_lock,
             )
             if not ok:
                 return tool_error(
@@ -1669,6 +1945,124 @@ KANBAN_SHOW_SCHEMA = {
     },
 }
 
+def _submit_for_review_schema_overrides() -> dict[str, Any]:
+    """Sandboxed builders publish via control and therefore supply no PR claim."""
+
+    if os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") != "clauseye-v1":
+        return {}
+    base_properties = KANBAN_SUBMIT_FOR_REVIEW_SCHEMA["parameters"]["properties"]
+    parameters = {
+        "type": "object",
+        "properties": {
+            name: base_properties[name]
+            for name in ("task_id", "summary")
+        },
+        "required": ["summary"],
+    }
+    return {
+        "description": (
+            "Publish the exact committed local HEAD through trusted delivery "
+            "control. Commit first, then call this tool with only a summary. "
+            "Do not push, run gh, create or edit a PR, or supply PR evidence; "
+            "the control service performs the fixed push and canonical PR "
+            "transition without exposing credentials to this worker."
+        ),
+        "parameters": parameters,
+    }
+
+
+def _complete_schema_overrides() -> dict[str, Any]:
+    """Sandboxed reviewers ask control to advance; it derives all evidence."""
+
+    if os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") != "clauseye-v1":
+        return {}
+    base_properties = KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]
+    parameters = {
+        "type": "object",
+        "properties": {
+            name: base_properties[name]
+            for name in ("task_id", "summary", "result")
+        },
+        "required": [],
+    }
+    return {
+        "description": (
+            "Ask trusted delivery control to recheck the active review run, "
+            "merge its exact accepted HEAD, verify CI/deployment evidence, and "
+            "complete it natively. Do not run gh/gcloud, merge/deploy directly, "
+            "or supply delivery evidence. A structured pending result leaves "
+            "the task running: heartbeat, wait briefly, and retry this same "
+            "tool call."
+        ),
+        "parameters": parameters,
+    }
+
+
+KANBAN_SUBMIT_FOR_REVIEW_SCHEMA = {
+    "name": "kanban_submit_for_review",
+    "description": (
+        "Submit the current worktree/code-delivery task to the autonomous "
+        "review queue. In a sandboxed delivery worker, this is also the "
+        "publish action: trusted delivery control pushes the exact HEAD, "
+        "creates or reuses the canonical PR, and atomically moves running -> "
+        "review. Legacy workers that are not sandbox-marked must open the PR "
+        "and supply pull_request evidence. The transition records the exact "
+        "canonical PR URL/number, immutable head SHA, candidate branch/ref, "
+        "builder profile, and run id. The candidate_ref must match the task's "
+        "branch. Before calling, ensure the PR body contains the exact line "
+        "`Hermes-Task-ID: $HERMES_KANBAN_TASK` and a concrete `Rollback:` "
+        "section; the trusted GitHub gate requires both. Do not call "
+        "kanban_complete from the builder stage."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "pull_request": {
+                "type": "object",
+                "description": "Exact open pull-request candidate evidence.",
+                "properties": {
+                    "pr_url": {
+                        "type": "string",
+                        "description": (
+                            "Canonical https://github.com/<owner>/<repo>/pull/<number> URL."
+                        ),
+                    },
+                    "pr_number": {
+                        "type": "integer",
+                        "description": "Positive PR number; must match pr_url.",
+                    },
+                    "head_sha": {
+                        "type": "string",
+                        "description": "Full 40- or 64-hex immutable PR head SHA.",
+                    },
+                    "candidate_ref": {
+                        "type": "string",
+                        "description": (
+                            "Exact PR branch/ref; must match the task branch_name."
+                        ),
+                    },
+                },
+                "required": ["pr_url", "pr_number", "head_sha", "candidate_ref"],
+            },
+            "summary": {
+                "type": "string",
+                "description": "Short builder handoff for the reviewer.",
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Optional structured changed-files/test handoff.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["pull_request"],
+    },
+}
+
+
 KANBAN_LIST_SCHEMA = {
     "name": "kanban_list",
     "description": (
@@ -1717,7 +2111,7 @@ KANBAN_LIST_SCHEMA = {
 KANBAN_COMPLETE_SCHEMA = {
     "name": "kanban_complete",
     "description": (
-        "Mark your current task done with a structured handoff for "
+        "Mark a non-code task or an accepted review attempt done with a structured handoff for "
         "downstream workers and humans. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
@@ -1731,7 +2125,9 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. Code builders must "
+        "use kanban_submit_for_review; review completion requires exact submitted "
+        "candidate and independently verified delivery evidence."
     ),
     "parameters": {
         "type": "object",
@@ -1765,6 +2161,91 @@ KANBAN_COMPLETE_SCHEMA = {
                     "possible; this exists for compatibility with "
                     "callers that still set --result on the CLI."
                 ),
+            },
+            "delivery": {
+                "type": "object",
+                "description": (
+                    "Terminal delivery evidence. For merge-gated review "
+                    "attempts: {classification:'merged_pr', pr_url, pr_number, "
+                    "head_sha, merge_sha}. pr_url/pr_number/head_sha must "
+                    "exactly match kanban_submit_for_review. When the explicit "
+                    "acceptance contract requires deployment, also provide "
+                    "deployment:{environment,revision,source_sha,workflow_run_url,"
+                    "workflow_run_id,health_status:'healthy',health_reference,"
+                    "health_checked_at,verification:{verifier,status:'passed',"
+                    "reference}}. source_sha must equal merge_sha and the run id "
+                    "must match its URL. This records project-verifier evidence; "
+                    "the registered server-side verifier re-derives the workflow, "
+                    "revision lineage, traffic, and health live before the kernel "
+                    "records it. Scratch/non-code "
+                    "tasks do not need this field."
+                ),
+                "properties": {
+                    "classification": {
+                        "type": "string",
+                        "enum": ["merged_pr", "reviewed_pr", "deployed_revision"],
+                    },
+                    "pr_url": {
+                        "type": "string",
+                        "description": "Canonical submitted GitHub PR URL.",
+                    },
+                    "pr_number": {
+                        "type": "integer",
+                        "description": "Positive number matching pr_url.",
+                    },
+                    "head_sha": {
+                        "type": "string",
+                        "description": "Full immutable submitted head SHA.",
+                    },
+                    "merge_sha": {
+                        "type": "string",
+                        "description": "Full immutable terminal merge SHA.",
+                    },
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["approved", "changes_requested", "commented"],
+                    },
+                    "deployment": {
+                        "type": "object",
+                        "properties": {
+                            "environment": {"type": "string"},
+                            "revision": {"type": "string"},
+                            "source_sha": {
+                                "type": "string",
+                                "description": "Must exactly equal merge_sha.",
+                            },
+                            "workflow_run_url": {"type": "string"},
+                            "workflow_run_id": {"type": "integer"},
+                            "health_status": {
+                                "type": "string",
+                                "enum": ["healthy"],
+                            },
+                            "health_reference": {"type": "string"},
+                            "health_checked_at": {
+                                "type": "string",
+                                "description": "RFC3339 UTC timestamp.",
+                            },
+                            "verification": {
+                                "type": "object",
+                                "properties": {
+                                    "verifier": {"type": "string"},
+                                    "status": {
+                                        "type": "string",
+                                        "enum": ["passed"],
+                                    },
+                                    "reference": {"type": "string"},
+                                },
+                                "required": ["verifier", "status", "reference"],
+                            },
+                        },
+                        "required": [
+                            "environment", "revision", "source_sha",
+                            "workflow_run_url", "workflow_run_id",
+                            "health_status", "health_reference",
+                            "health_checked_at", "verification",
+                        ],
+                    },
+                },
             },
             "created_cards": {
                 "type": "array",
@@ -1856,7 +2337,8 @@ KANBAN_BLOCK_SCHEMA = {
 KANBAN_REQUEST_REVIEW_SCHEMA = {
     "name": "kanban_request_review",
     "description": (
-        "Hand the task off for review: implementation, self-review, and "
+        "Hand a non-code task off for review. Code delivery must use "
+        "kanban_submit_for_review with its exact candidate. Implementation, self-review, and "
         "verification are complete and you want a human (or reviewer) to "
         "look before it is marked done. Moves the task to the 'review' "
         "column and notifies the subscriber. Unlike ``kanban_block`` this is "
@@ -1908,7 +2390,9 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
         "implementer with concrete required changes. This closes the review "
         "run, reapplies parent dependency gating, and requeues the task without "
         "using block-loop accounting. Only use from a task claimed from the "
-        "review column; use kanban_block only for a genuine external blocker."
+        "review column; use kanban_block only for a genuine external blocker. "
+        "Code reviews require reviewed_head_sha to match the submitted candidate; "
+        "the shared review-round limit applies."
     ),
     "parameters": {
         "type": "object",
@@ -1923,6 +2407,10 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
                     "Specific, actionable changes the implementer must make "
                     "before requesting another review."
                 ),
+            },
+            "reviewed_head_sha": {
+                "type": "string",
+                "description": "Required for code review: full immutable submitted head SHA.",
             },
             "board": _board_schema_prop(),
         },
@@ -2325,11 +2813,22 @@ registry.register(
 )
 
 registry.register(
+    name="kanban_submit_for_review",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_FOR_REVIEW_SCHEMA,
+    handler=_handle_submit_for_review,
+    check_fn=_check_kanban_delivery_mode,
+    dynamic_schema_overrides=_submit_for_review_schema_overrides,
+    emoji="🔎",
+)
+
+registry.register(
     name="kanban_complete",
     toolset="kanban",
     schema=KANBAN_COMPLETE_SCHEMA,
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
+    dynamic_schema_overrides=_complete_schema_overrides,
     emoji="✔",
 )
 
@@ -2356,7 +2855,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_REQUEST_CHANGES_SCHEMA,
     handler=_handle_request_changes,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_delivery_mode,
     emoji="↩",
 )
 

@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 _CURRENT: ContextVar[WorkspaceRequest | None] = ContextVar(
     "required_kanban_workspace_request", default=None
 )
+_UNSET = object()
 _LAUNCH_FIELDS = (
     "title", "body", "project_id", "created_by", "workflow_template_id",
     "assignee", "tenant", "workspace_kind", "model_override", "provider_override",
@@ -57,6 +58,7 @@ class WorkspaceClaim:
     request_id: str
     launch_fields: tuple = field(repr=False)
     original_workspace: tuple
+    original_base_sha: str | None = None
 
 
 def effective_worker_skills(skills, lane: str) -> tuple:
@@ -87,7 +89,9 @@ class WorkspaceRequest:
         self._closed = False
         self._admission = None
         self._stored_workspace = claim.original_workspace
+        self._stored_base_sha = claim.original_base_sha
         self.pending_workspace = None
+        self.pending_base_sha = claim.original_base_sha
         self._repository = None
         self._held_worker = None
         self._workspace_was_persisted = False
@@ -109,6 +113,10 @@ class WorkspaceRequest:
     @property
     def stored_workspace(self) -> tuple:
         return self._stored_workspace
+
+    @property
+    def stored_base_sha(self) -> str | None:
+        return self._stored_base_sha
 
     @property
     def database_context(self) -> WorkerDatabaseContext | None:
@@ -150,7 +158,7 @@ class WorkspaceRequest:
                 raise error
             raise policy.RequiredPolicyError(f"Required workspace {name} cleanup failed.") from error
 
-    def _check_native(self, expected_workspace=None) -> None:
+    def _check_native(self, expected_workspace=None, expected_base_sha=_UNSET) -> None:
         if self.cancelled or self._closed or _CURRENT.get() is not self:
             raise policy.RequiredPolicyError("Required workspace request is no longer active.")
         claim = self.claim
@@ -173,19 +181,22 @@ class WorkspaceRequest:
                 or not isinstance(row["claim_expires"], (int, float)) or row["claim_expires"] <= now
                 or not isinstance(run["claim_expires"], (int, float)) or run["claim_expires"] <= now
                 or tuple(row[name] for name in _LAUNCH_FIELDS) != claim.launch_fields
+                or row["worktree_base_sha"] != (
+                    self._stored_base_sha if expected_base_sha is _UNSET else expected_base_sha)
                 or (row["workspace_path"], row["branch_name"]) != (
                     self._stored_workspace if expected_workspace is None else expected_workspace)):
             raise policy.RequiredPolicyError("Required workspace claim or run changed.")
 
-    def checkpoint(self, boundary: str, *, expected_workspace=None, **observation) -> None:
+    def checkpoint(self, boundary: str, *, expected_workspace=None,
+                   expected_base_sha=_UNSET, **observation) -> None:
         try:
-            self._check_native(expected_workspace)
+            self._check_native(expected_workspace, expected_base_sha)
             if self._admission is None:
                 raise policy.RequiredPolicyError("Required workspace admission is unsupported.")
             result = self._admission.checkpoint(boundary, MappingProxyType(observation))
             if result is not None:
                 raise policy.RequiredPolicyError("Required workspace checks cannot return approval records.")
-            self._check_native(expected_workspace)
+            self._check_native(expected_workspace, expected_base_sha)
         except BaseException as exc:
             self.cancel("checkpoint_failed")
             if isinstance(exc, (policy.RequiredPolicyError, KeyboardInterrupt, SystemExit)):
@@ -207,14 +218,19 @@ class WorkspaceRequest:
                 or any(getattr(task, name) != value for name, value in fields.items()
                        if name != "skills")
                 or tuple(task.skills or ()) != expected_skills
+                or task.worktree_base_sha != self._stored_base_sha
                 or (task.workspace_path, task.branch_name) != self._stored_workspace):
             self.cancel("task_object_changed")
             raise policy.RequiredPolicyError("Required workspace task object changed.")
 
-    def workspace_persisted(self, workspace: tuple) -> None:
+    def workspace_persisted(self, workspace: tuple, *, base_sha=_UNSET) -> None:
+        if base_sha is _UNSET:
+            base_sha = self._stored_base_sha
         self.checkpoint("after_persist", expected_workspace=workspace,
-                        workspace=workspace[0], branch=workspace[1])
+                        expected_base_sha=base_sha, workspace=workspace[0],
+                        branch=workspace[1], base_oid=base_sha)
         self._stored_workspace = workspace
+        self._stored_base_sha = base_sha
         self._workspace_was_persisted = True
 
     def capture_database_context(self) -> WorkerDatabaseContext:
@@ -284,7 +300,7 @@ def workspace_request(conn, *, task_id, expected_run_id, expected_claim_lock,
     claim = WorkspaceClaim(conn, task_id, expected_run_id, expected_claim_lock,
                            board, lane, _account(), selected.generation, uuid.uuid4().hex,
                            tuple(row[name] for name in _LAUNCH_FIELDS),
-                           (row["workspace_path"], row["branch_name"]))
+                           (row["workspace_path"], row["branch_name"]), row["worktree_base_sha"])
     request = WorkspaceRequest(claim, selected)
     token = _CURRENT.set(request)
     primary_error = None

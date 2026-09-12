@@ -12,9 +12,11 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_policy as policy
+from tests.hermes_cli.delivery_fixtures import ARTIFACT_CONTRACT
 
 
 pytestmark = pytest.mark.linux_only
+TASK_BODY = "original task body\n\n" + ARTIFACT_CONTRACT
 
 
 class FixtureProvider(policy.RequiredKanbanPolicy):
@@ -70,7 +72,7 @@ def native(tmp_path, monkeypatch):
 
 def make_task(native, lane="ready", *, claimed=True, skills=None):
     task_id = kb.create_task(
-        native.conn, title="captured task", body="original task body", assignee="default",
+        native.conn, title="captured task", body=TASK_BODY, assignee="default",
         workspace_kind="dir", workspace_path=str(native.workspace), skills=skills,
     )
     if lane == "review":
@@ -347,7 +349,7 @@ def test_ordinary_collector_does_not_commit_caller_transaction(native):
     assert "uncommitted display" in kb.render_worker_context(inputs)
     assert native.conn.in_transaction
     native.conn.rollback()
-    assert kb.get_task(native.conn, task.id).body == "original task body"
+    assert kb.get_task(native.conn, task.id).body == TASK_BODY
     assert inputs.task.body == "uncommitted display"
 
 

@@ -444,7 +444,7 @@ def test_prologue_titles_the_surfaces_a_person_reads(platform):
     assert _title_turn(platform).called
 
 
-@pytest.mark.parametrize("platform", ["cron", "CRON", "subagent"])
+@pytest.mark.parametrize("platform", ["cron", "CRON", "subagent", "kanban"])
 def test_prologue_does_not_title_machine_driven_runs(platform):
     """Cron names its own session after the job, and nobody opens a subagent's.
 
@@ -452,3 +452,60 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+@pytest.mark.parametrize("source", ["kanban", " KANBAN ", "cron", "subagent"])
+def test_worker_source_skips_title_before_config_thread_or_database_work(tmp_path, monkeypatch, source):
+    """Exercise the real title entry point with the CLI worker source bridge."""
+    from contextvars import Context
+
+    from agent.turn_context import _maybe_title_session_at_turn_start
+
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", source)
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    db.create_session(session_id="sess-1", source=source.strip().lower())
+    agent = _TitlingAgent("cli")
+    agent._session_db = db
+    before = db.get_session("sess-1")
+    try:
+        with patch("agent.title_generator._auto_title_enabled") as config, \
+             patch("agent.title_generator.threading.Thread") as thread:
+            Context().run(
+                _maybe_title_session_at_turn_start,
+                agent,
+                [{"role": "user", "content": "Work kanban task t_12345678"}],
+            )
+        config.assert_not_called()
+        thread.assert_not_called()
+        assert db.get_session("sess-1") == before
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("source", ["cli", "telegram", "desktop", ""])
+def test_bound_chat_source_masks_worker_process_marker(monkeypatch, source):
+    from contextvars import Context
+
+    from gateway.session_context import _VAR_MAP
+
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+
+    def title_bound_chat():
+        _VAR_MAP["HERMES_SESSION_SOURCE"].set(source)
+        return _title_turn("cli")
+
+    assert Context().run(title_bound_chat).called
+
+
+def test_bound_worker_source_suppresses_title_without_process_marker(monkeypatch):
+    from contextvars import Context
+
+    from gateway.session_context import _VAR_MAP
+
+    monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
+
+    def title_bound_worker():
+        _VAR_MAP["HERMES_SESSION_SOURCE"].set("kanban")
+        return _title_turn("cli")
+
+    assert not Context().run(title_bound_worker).called

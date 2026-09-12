@@ -24,6 +24,13 @@ from agent.i18n import t
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
 
+# Local repair events are deliberately absent: they must not send messages or
+# wake an agent. Keep this selector shared with the notification boundary tests.
+TERMINAL_NOTIFICATION_KINDS = (
+    "completed", "blocked", "gave_up", "crashed", "timed_out", "status",
+    "archived", "unblocked", "block_loop_detected", "review_requested",
+)
+
 
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
@@ -236,7 +243,6 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -457,7 +463,7 @@ class GatewayKanbanWatchersMixin:
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=TERMINAL_NOTIFICATION_KINDS,
                                     )
                                     if not events:
                                         continue

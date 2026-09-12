@@ -27,6 +27,23 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_scope as ks
 
 
+# These fixtures audit workspace lifecycle and ownership without delivering code.
+_WORKSPACE_AUDIT_CONTRACT = """```acceptance-contract
+domain: ops
+target: artifact-file
+tier1:
+  - cmd: "test -d ."
+    expect_exit: 0
+tier2:
+  - "The workspace audit preserves its base, ownership and lifecycle evidence."
+tier3: "Local filesystem audit complete; no repository change is delivered."
+```"""
+_NO_MERGE_EXPECTED = {
+    "classification": "no_merge_expected",
+    "reason": "Filesystem ownership audit has no code changes to merge.",
+}
+
+
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
@@ -161,9 +178,9 @@ def test_live_foreign_lock_defers_without_failure(worktree_board: Path):
     child = _live_child()
     try:
         with kb.connect() as conn:
-            tid = kb.create_task(conn, title="locked", assignee="alice", workspace_kind="worktree")
+            tid = kb.create_task(conn, title="locked", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
             target = repo / ".worktrees" / tid
-            kb._ensure_git_worktree(repo, target, f"wt/{tid}")
+            kb._ensure_git_worktree(repo, target, kb.default_task_branch_name(tid))
             _git("worktree", "lock", "--reason", f"hermes pid={child.pid}", str(target), cwd=repo)
 
             spawns: list = []
@@ -188,9 +205,9 @@ def test_dead_pid_lock_is_released_and_spawn_proceeds(worktree_board: Path):
     repo = worktree_board
     dead = _dead_pid()
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="stale lock", assignee="alice", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="stale lock", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
         target = repo / ".worktrees" / tid
-        kb._ensure_git_worktree(repo, target, f"wt/{tid}")
+        kb._ensure_git_worktree(repo, target, kb.default_task_branch_name(tid))
         _git("worktree", "lock", "--reason", f"hermes pid={dead}", str(target), cwd=repo)
 
         spawns: list = []
@@ -220,7 +237,7 @@ def test_unlock_worktree_if_ours_refuses_live_foreign_lock(repo: Path):
 def test_complete_task_releases_worker_lock(worktree_board: Path):
     repo = worktree_board
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="finish", assignee="alice", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="finish", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
         spawns: list = []
         kb.dispatch_once(conn, spawn_fn=_stub_spawn(spawns), max_spawn=1)
         target = repo / ".worktrees" / tid
@@ -228,7 +245,9 @@ def test_complete_task_releases_worker_lock(worktree_board: Path):
         # Simulate what _default_spawn does after Popen.
         assert kb._lock_worktree_for_pid(target, 4242) is True
         assert "hermes pid=4242" in (_lock_reason(repo, target) or "")
-        assert kb.complete_task(conn, tid, result="done") is True
+        assert kb.complete_task(
+            conn, tid, result="done", delivery=_NO_MERGE_EXPECTED,
+        ) is True
         assert _lock_reason(repo, target) is None
 
 
@@ -240,11 +259,11 @@ def test_complete_task_releases_worker_lock(worktree_board: Path):
 def test_same_branch_on_two_cards_defers_the_younger(worktree_board: Path):
     with kb.connect() as conn:
         first = kb.create_task(
-            conn, title="a", assignee="alice", workspace_kind="worktree",
+            conn, title="a", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree",
             branch_name="hermes/x/t_00000001",
         )
         second = kb.create_task(
-            conn, title="b", assignee="bob", workspace_kind="worktree",
+            conn, title="b", assignee="bob", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree",
             branch_name="hermes/x/t_00000001",
         )
         conn.execute("UPDATE tasks SET created_at = created_at + 1 WHERE id = ?", (second,))
@@ -315,7 +334,7 @@ def test_bad_branch_with_pattern_auto_blocks(kanban_home, all_assignees_spawnabl
     )
     with kb.connect() as conn:
         bad = kb.create_task(
-            conn, title="bad branch", assignee="alice", workspace_kind="worktree",
+            conn, title="bad branch", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree",
             branch_name="clauseye-production-readiness/thing",
         )
         assert kb.check_claim_guard(conn, bad) == "branch_policy"
@@ -336,7 +355,7 @@ def test_branch_pattern_unset_skips_policy(kanban_home, monkeypatch):
     monkeypatch.setattr(cfgmod, "load_config_readonly", lambda: {"kanban": {}})
     with kb.connect() as conn:
         tid = kb.create_task(
-            conn, title="legacy", assignee="alice", workspace_kind="worktree",
+            conn, title="legacy", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree",
             branch_name="anything/goes",
         )
         assert kb.check_claim_guard(conn, tid) is None
@@ -474,7 +493,7 @@ def test_dispatch_records_base_fallback_event(kanban_home, all_assignees_spawnab
     _git("commit", "-m", "init", cwd=project)
     kb.write_board_metadata(None, default_workdir=str(project))
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="solo", assignee="alice", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="solo", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
         spawns: list = []
         kb.dispatch_once(conn, spawn_fn=_stub_spawn(spawns), max_spawn=1)
         assert [s[0] for s in spawns] == [tid]
@@ -578,7 +597,7 @@ def test_glob_scope_blocks_instead_of_passing(kanban_home, all_assignees_spawnab
 def test_empty_branch_is_not_a_policy_violation(worktree_board: Path, monkeypatch):
     _set_pattern(monkeypatch)
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="plain", assignee="alice", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="plain", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
         assert kb.get_task(conn, tid).branch_name in (None, "")
         assert kb.check_claim_guard(conn, tid) is None
         spawns: list = []
@@ -607,7 +626,7 @@ def test_default_spawn_exports_branch_for_derived_name(kanban_home, monkeypatch,
     monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
     monkeypatch.setattr(kb, "_lock_worktree_for_pid", lambda *_a, **_k: True)
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="env", assignee="backend", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="env", assignee="backend", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
         task = kb.get_task(conn, tid)
         # What the dispatch lanes now do before handing the Task to spawn.
         kb._persist_resolved_branch(conn, task, None, board=None)
@@ -618,11 +637,11 @@ def test_default_spawn_exports_branch_for_derived_name(kanban_home, monkeypatch,
 def test_older_parked_card_does_not_defer_ready_card(worktree_board: Path):
     with kb.connect() as conn:
         older = kb.create_task(
-            conn, title="parked", assignee="alice", workspace_kind="worktree",
+            conn, title="parked", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree",
             branch_name="hermes/x/t_00000002", triage=True,
         )
         younger = kb.create_task(
-            conn, title="go", assignee="bob", workspace_kind="worktree",
+            conn, title="go", assignee="bob", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree",
             branch_name="hermes/x/t_00000002",
         )
         conn.execute("UPDATE tasks SET created_at = created_at - 10 WHERE id = ?", (older,))
@@ -645,19 +664,19 @@ def test_older_parked_card_does_not_defer_ready_card(worktree_board: Path):
 def test_redo_child_may_reuse_parent_branch(worktree_board: Path):
     with kb.connect() as conn:
         parent = kb.create_task(
-            conn, title="parent", assignee="alice", workspace_kind="worktree",
+            conn, title="parent", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree",
             branch_name="hermes/x/t_00000003",
         )
         conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (parent,))
         conn.commit()
         child = kb.create_task(
-            conn, title="REDO parent", assignee="alice", workspace_kind="worktree",
+            conn, title="REDO parent", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree",
             branch_name="hermes/x/t_00000003", parents=[parent],
         )
         assert kb.check_claim_guard(conn, child) is None
         # An unrelated review card on the same branch still conflicts.
         stranger = kb.create_task(
-            conn, title="stranger", assignee="bob", workspace_kind="worktree",
+            conn, title="stranger", assignee="bob", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree",
             branch_name="hermes/x/t_00000003",
         )
         assert kb.check_claim_guard(conn, stranger) == f"branch_conflict:{parent}"
@@ -666,7 +685,7 @@ def test_redo_child_may_reuse_parent_branch(worktree_board: Path):
 def test_foreign_lock_reason_counts_as_busy(worktree_board: Path):
     repo = worktree_board
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="human lock", assignee="alice", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="human lock", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
         target = repo / ".worktrees" / tid
         kb._ensure_git_worktree(repo, target, f"hermes/default/{tid}")
         _git("worktree", "lock", "--reason", "claude session editing", str(target), cwd=repo)
@@ -693,7 +712,7 @@ def test_foreign_lock_reason_counts_as_busy(worktree_board: Path):
 def test_recycled_pid_lock_is_treated_as_dead(worktree_board: Path):
     repo = worktree_board
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="recycled", assignee="alice", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="recycled", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
         target = repo / ".worktrees" / tid
         kb._ensure_git_worktree(repo, target, f"hermes/default/{tid}")
         # A live pid (ours) whose recorded start time belongs to an older,
@@ -739,7 +758,7 @@ def test_block_task_keeps_lock_while_worker_is_alive(worktree_board: Path):
     child = _live_child()
     try:
         with kb.connect() as conn:
-            tid = kb.create_task(conn, title="stuck", assignee="alice", workspace_kind="worktree")
+            tid = kb.create_task(conn, title="stuck", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
             spawns: list = []
             kb.dispatch_once(conn, spawn_fn=_branch_spawn(spawns, pid=child.pid), max_spawn=1)
             target = repo / ".worktrees" / tid
@@ -770,7 +789,7 @@ def test_block_task_releases_lock_of_dead_worker(worktree_board: Path):
     repo = worktree_board
     dead = _dead_pid()
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="dead", assignee="alice", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="dead", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
         spawns: list = []
         kb.dispatch_once(conn, spawn_fn=_branch_spawn(spawns, pid=dead), max_spawn=1)
         target = repo / ".worktrees" / tid
@@ -784,7 +803,7 @@ def test_review_lane_busy_worktree_defers_without_failure(worktree_board: Path):
     child = _live_child()
     try:
         with kb.connect() as conn:
-            tid = kb.create_task(conn, title="review me", assignee="alice", workspace_kind="worktree")
+            tid = kb.create_task(conn, title="review me", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
             spawns: list = []
             kb.dispatch_once(conn, spawn_fn=_branch_spawn(spawns, pid=child.pid), max_spawn=1)
             target = repo / ".worktrees" / tid
@@ -815,7 +834,7 @@ def test_d7_reboot_dead_pid_and_dead_lock_recover(worktree_board: Path):
     repo = worktree_board
     dead = _dead_pid()
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="rebooted", assignee="alice", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="rebooted", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree")
         spawns: list = []
         kb.dispatch_once(conn, spawn_fn=_branch_spawn(spawns, pid=dead), max_spawn=1)
         target = repo / ".worktrees" / tid
@@ -840,7 +859,7 @@ def test_d6_timeout_kills_real_child_and_unlocks(worktree_board: Path, monkeypat
     try:
         with kb.connect() as conn:
             tid = kb.create_task(
-                conn, title="sleeper", assignee="alice", workspace_kind="worktree",
+                conn, title="sleeper", assignee="alice", body=_WORKSPACE_AUDIT_CONTRACT, workspace_kind="worktree",
                 max_runtime_seconds=1,
             )
             spawns: list = []
@@ -863,14 +882,12 @@ def test_d6_timeout_kills_real_child_and_unlocks(worktree_board: Path, monkeypat
 
 def test_fetch_origin_main_is_cached_and_never_prompts(repo: Path, monkeypatch):
     calls: list = []
+    real_run = kb.subprocess.run
 
     def _run(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        class _R:
-            returncode = 0
-            stdout = ""
-            stderr = ""
-        return _R()
+        if "fetch" in cmd:
+            calls.append((cmd, kwargs))
+        return real_run(cmd, **kwargs)
 
     monkeypatch.setattr(kb.subprocess, "run", _run)
     kb._ORIGIN_MAIN_FETCHED_AT.clear()
@@ -878,6 +895,6 @@ def test_fetch_origin_main_is_cached_and_never_prompts(repo: Path, monkeypatch):
     kb._fetch_origin_main(repo)
     assert len(calls) == 1
     cmd, kwargs = calls[0]
-    assert cmd[-3:] == ["fetch", "origin", "main"]
+    assert cmd[-3:] == ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"]
     assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
     assert kwargs["timeout"] <= 15

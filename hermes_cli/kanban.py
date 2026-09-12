@@ -18,7 +18,10 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
+import sqlite3
+import stat
 import sys
 import time
 from pathlib import Path
@@ -68,6 +71,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
+        "worktree_base_sha": t.worktree_base_sha,
         "project_id": t.project_id,
         "created_by": t.created_by,
         "created_at": t.created_at,
@@ -131,6 +135,17 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     if any(ch.isspace() for ch in branch):
         raise argparse.ArgumentTypeError("--branch must not contain whitespace")
     return branch
+
+
+def _parse_base_sha_flag(value: Optional[str]) -> Optional[str]:
+    """Accept an immutable commit id from ``kanban create --base-sha``."""
+    if value is None:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+        raise argparse.ArgumentTypeError(
+            "--base-sha requires a full, nonzero, lowercase 40-character commit SHA"
+        )
+    return value
 
 
 def _check_dispatcher_presence(
@@ -338,6 +353,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument("--base-sha", default=None,
+                          help="Exact starting commit for a worktree (40 lowercase hex "
+                               "characters). Omit to start a new task branch from "
+                               "main when its workspace is prepared.")
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -604,6 +623,36 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--delivery", default=None,
+        help="JSON object with exact delivery evidence; independently verified before completion.",
+    )
+
+    p_submit_review = sub.add_parser(
+        "submit-for-review", help="Submit an exact code candidate to its configured reviewer",
+    )
+    p_submit_review.add_argument("task_id")
+    p_submit_review.add_argument("--pull-request", required=True, help="JSON object with canonical PR URL, number, head SHA, and candidate ref.")
+    p_submit_review.add_argument("--summary", default=None, help="Short implementation and verification handoff.")
+    p_submit_review.add_argument("--metadata", default=None, help="JSON object with structured reviewer handoff facts.")
+
+    p_reconcile = sub.add_parser(
+        "reconcile-delivery",
+        help="Preview historical delivery-record repairs, or apply an explicitly saved manifest",
+    )
+    p_reconcile.add_argument(
+        "--limit", type=int, default=None, metavar="1..1000",
+        help="Maximum preview candidates (default: 1000); preview only.",
+    )
+    reconcile_mode = p_reconcile.add_mutually_exclusive_group()
+    reconcile_mode.add_argument(
+        "--manifest-out", default=None, metavar="PATH",
+        help="Save the preview JSON to a new file; never overwrite an existing path.",
+    )
+    reconcile_mode.add_argument(
+        "--apply-manifest", default=None, metavar="PATH",
+        help="Apply this bounded, validated manifest to its original existing board.",
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -691,6 +740,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_request_changes.add_argument("task_id")
     p_request_changes.add_argument(
         "reason", nargs="+", help="Concrete changes required before re-review",
+    )
+    p_request_changes.add_argument(
+        "--reviewed-head-sha", default=None,
+        help="Required for code review: exact full submitted candidate SHA.",
     )
 
     p_reopen_review = sub.add_parser(
@@ -1054,6 +1107,49 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if action == "reconcile-delivery":
+        # Reject every worker capability before board resolution, manifest
+        # path handling, database access, or the normal schema initializer.
+        from hermes_cli.kanban_delivery_reconcile import require_operator
+
+        try:
+            require_operator()
+        except (PermissionError, RuntimeError) as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 1
+
+    if (
+        os.environ.get("HERMES_KANBAN_TERMINAL_SANDBOX") == "systemd-v1"
+        or os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") == "clauseye-v1"
+    ) and action in {"complete", "submit-for-review", "request-review", "request-changes"}:
+        print(
+            "kanban: sandbox workers must use their Kanban lifecycle tools; "
+            "terminal subprocesses cannot act as the trusted worker",
+            file=sys.stderr,
+        )
+        return 1
+
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        operator_actions = {
+            "init", "boards", "repair", "claim", "assign", "set-model", "reclaim",
+            "reassign", "edit", "unblock", "reopen-review", "promote",
+            "archive", "dispatch", "daemon", "gc", "specify", "decompose",
+            "reconcile-delivery",
+        }
+        if action in operator_actions:
+            print("kanban: this action requires an operator outside a worker run", file=sys.stderr)
+            return 1
+        board_override = getattr(args, "board", None)
+        if board_override:
+            try:
+                same_board = kb._normalize_board_slug(board_override) == kb.get_current_board()
+            except ValueError as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 1
+            if not same_board:
+                print("kanban: worker cannot switch its assigned board", file=sys.stderr)
+                return 1
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -1103,6 +1199,12 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
+        if action == "reconcile-delivery":
+            try:
+                return _cmd_reconcile_delivery(args)
+            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 1
         try:
             kb.init_db()
         except Exception as exc:
@@ -1130,6 +1232,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
+            "submit-for-review": _cmd_submit_for_review,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -1198,6 +1301,11 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach",
     "attach-rm",
     "complete",
+    "reconcile-delivery",
+    "submit-for-review",
+    "request-review",
+    "request-changes",
+    "reopen-review",
     "edit",
     "block",
     "schedule",
@@ -1511,11 +1619,12 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
+        run_id = _validated_worker_runs(conn, [args.task_id])[args.task_id]
         ok = kb.heartbeat_worker(
             conn,
             args.task_id,
             note=getattr(args, "note", None),
-            expected_run_id=_worker_run_id_for(args.task_id),
+            expected_run_id=run_id,
         )
     if not ok:
         print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)
@@ -1547,6 +1656,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
+        worktree_base_sha = _parse_base_sha_flag(getattr(args, "base_sha", None))
     except argparse.ArgumentTypeError as exc:
         print(f"kanban: {exc}", file=sys.stderr)
         return 2
@@ -1576,6 +1686,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
+            worktree_base_sha=worktree_base_sha,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
             priority=args.priority,
@@ -1765,6 +1876,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
+    if task.worktree_base_sha:
+        print(f"  worktree_base_sha: {task.worktree_base_sha}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:
@@ -2138,7 +2251,9 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             ) as request:
                 if request is None:
                     workspace = kb.resolve_workspace(task)
-                    kb.set_workspace_path(conn, task.id, str(workspace))
+                    kb.set_workspace_path(
+                        conn, task.id, str(workspace), worktree_base_sha=task.worktree_base_sha,
+                    )
                 else:
                     branch = None
                     if task.workspace_kind == "worktree":
@@ -2251,15 +2366,40 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    """Never downgrade an invalid task-bound identity to an operator call."""
+    worker_task = os.environ.get("HERMES_KANBAN_TASK")
+    if not worker_task:
         return None
-    raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
+    if worker_task != task_id:
+        raise ValueError("worker may only change its own task")
+    raw = os.environ.get("HERMES_KANBAN_RUN_ID", "")
+    if not raw.isascii() or not raw.isdecimal() or int(raw) <= 0:
+        raise ValueError("task-bound worker requires a positive HERMES_KANBAN_RUN_ID")
+    return int(raw)
+
+
+def _validated_worker_runs(conn, task_ids: list[str]) -> dict[str, Optional[int]]:
+    """Validate the whole request before any judge call or lifecycle write.
+
+    Database transitions still compare the captured run id under their write
+    lock, so a run replaced after this advisory check cannot be completed.
+    """
+    if os.environ.get("HERMES_KANBAN_TASK") and len(task_ids) != 1:
+        raise ValueError("task-bound worker must target exactly one task")
+    runs = {tid: _worker_run_id_for(tid) for tid in task_ids}
+    for tid, run_id in runs.items():
+        if run_id is None:
+            continue
+        row = conn.execute(
+            "SELECT 1 FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
+            "WHERE t.id=? AND t.status='running' AND t.current_run_id=? "
+            "AND r.task_id=t.id AND r.status='running' "
+            "AND r.ended_at IS NULL AND r.outcome IS NULL",
+            (tid, run_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("worker run is no longer the current open attempt")
+    return runs
 
 
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
@@ -2295,6 +2435,181 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
     return reason if verdict != "done" else None
 
 
+def _read_delivery_repair_manifest(path: str) -> dict:
+    from hermes_cli import kanban_delivery_reconcile as repair
+
+    from hermes_cli.sqlite_safe_read import offline_file_access
+
+    repair.require_operator()
+    # A mistyped manifest path must not cancel another tracked database's
+    # process locks by opening and closing its raw file.
+    with offline_file_access(path, what="read a delivery repair manifest from"):
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("delivery repair manifest must be a regular file")
+            if info.st_size > repair.MAX_MANIFEST_BYTES:
+                raise ValueError("delivery repair manifest is too large")
+            with os.fdopen(fd, "rb") as manifest_file:
+                fd = None
+                raw = manifest_file.read(repair.MAX_MANIFEST_BYTES + 1)
+            if len(raw) > repair.MAX_MANIFEST_BYTES:
+                raise ValueError("delivery repair manifest is too large")
+            manifest = json.loads(raw)
+            if not isinstance(manifest, dict):
+                raise ValueError("delivery repair manifest must be a JSON object")
+            return manifest
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def _write_delivery_repair_manifest(path: str, manifest: dict) -> None:
+    from hermes_cli import kanban_delivery_reconcile as repair
+
+    repair.require_operator()
+    data = (json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+    if len(data) > repair.MAX_MANIFEST_BYTES:
+        raise ValueError("delivery repair manifest is too large to save; select fewer tasks")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as manifest_file:
+        manifest_file.write(data)
+        manifest_file.flush()
+        os.fsync(manifest_file.fileno())
+
+
+def _open_delivery_repair_board(board: str, *, writable: bool = False):
+    """Open only an existing tracked database; never initialize or migrate."""
+    from hermes_cli.kanban_delivery_reconcile import require_operator
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    require_operator()
+    path = kb.kanban_db_path(board=board).expanduser().absolute()
+    mode = "rw" if writable else "ro"
+    conn = connect_tracked(
+        path.as_uri() + f"?mode={mode}",
+        uri=True,
+        isolation_level=None,
+        timeout=kb._resolve_busy_timeout_ms() / 1000.0,
+    )
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        if not writable:
+            conn.execute("PRAGMA query_only=ON")
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
+def _cmd_reconcile_delivery(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_delivery_reconcile as repair
+    from hermes_cli.kanban_board_identity import BoardIdentityError, read_board_identity
+
+    repair.require_operator()
+    board = kb._normalize_board_slug(getattr(args, "board", None)) or kb.get_current_board()
+    apply_path = getattr(args, "apply_manifest", None)
+    manifest_out = getattr(args, "manifest_out", None)
+    limit = getattr(args, "limit", None)
+    if limit is not None and (type(limit) is not int or not 1 <= limit <= repair.MAX_ENTRIES):
+        raise ValueError("--limit must be between 1 and 1000")
+    if apply_path is not None and (manifest_out is not None or limit is not None):
+        raise ValueError("--manifest-out and --limit are preview options; omit them when applying a manifest")
+
+    manifest = None
+    if apply_path is not None:
+        manifest = _read_delivery_repair_manifest(apply_path)
+        # Validate bounded structure, digest, and board before opening SQLite.
+        repair._validate_manifest(manifest, board=board)
+    try:
+        with contextlib.closing(_open_delivery_repair_board(board, writable=manifest is not None)) as conn:
+            if read_board_identity(conn) is None:
+                raise ValueError(
+                    "delivery repair requires an updated board schema; this command does not initialize or migrate it"
+                )
+            if manifest is not None:
+                result = repair.apply_delivery_repair(conn, manifest, board=board)
+            else:
+                result = repair.preview_delivery_repair(
+                    conn, board=board, limit=limit if limit is not None else repair.MAX_ENTRIES,
+                )
+    except BoardIdentityError as exc:
+        if "no persisted identity" in str(exc):
+            raise ValueError(
+                "delivery repair requires an updated board schema; this command does not initialize or migrate it"
+            ) from exc
+        raise
+    if manifest_out is not None:
+        _write_delivery_repair_manifest(manifest_out, result)
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    return 0
+
+
+def _delivery_json_argument(raw: Optional[str], flag: str) -> Optional[dict]:
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{flag}: must be a JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{flag}: must be a JSON object")
+    return kb.redact_review_value(value)
+
+
+def _shared_delivery_config() -> dict:
+    """Use root board policy rather than the active worker profile's defaults."""
+    from hermes_cli.config import load_config
+    from hermes_constants import (
+        get_default_hermes_root, reset_hermes_home_override, set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(get_default_hermes_root())
+    try:
+        config = load_config()
+    finally:
+        reset_hermes_home_override(token)
+    policy = config.get("kanban") if isinstance(config, dict) else None
+    return policy if isinstance(policy, dict) else {}
+
+
+def _cmd_submit_for_review(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    pull_request = _delivery_json_argument(args.pull_request, "--pull-request")
+    if pull_request is None:
+        raise ValueError("--pull-request is required")
+    metadata = _delivery_json_argument(getattr(args, "metadata", None), "--metadata")
+    summary = str(kb.redact_review_value(getattr(args, "summary", None) or "")).strip()
+    with kb.connect_closing() as conn:
+        run_id = _validated_worker_runs(conn, [tid])[tid]
+        rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), summary)
+        if rejection is not None:
+            print(f"kanban: review handoff rejected by judge: {rejection}", file=sys.stderr)
+            return 1
+        reviewer = str(_shared_delivery_config().get("reviewer_profile") or "").strip() or None
+        try:
+            submitted = kb.submit_task_for_review(
+                conn, tid,
+                pull_request=pull_request,
+                summary=summary,
+                metadata=metadata,
+                reviewer_assignee=reviewer,
+                expected_run_id=run_id,
+            )
+        except kb.DeliveryEvidenceError as exc:
+            print(f"review submission blocked [{exc.code}] for {tid}: {exc}", file=sys.stderr)
+            return 1
+        if not submitted:
+            print(f"cannot submit {tid} for review (stale run or invalid task state)", file=sys.stderr)
+            return 1
+    print(f"Submitted {tid} for review")
+    return 0
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -2303,12 +2618,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    raw_delivery = getattr(args, "delivery", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
-    if len(ids) > 1 and (summary or raw_meta):
+    if len(ids) > 1 and (summary or raw_meta or raw_delivery is not None):
         print(
-            "kanban: --summary / --metadata are per-task and can't be used "
+            "kanban: --summary / --metadata / --delivery are per-task and can't be used "
             "with multiple ids (would apply the same handoff to every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
             file=sys.stderr,
@@ -2323,8 +2639,14 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
+    try:
+        delivery = _delivery_json_argument(raw_delivery, "--delivery")
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        run_ids = _validated_worker_runs(conn, ids)
         for tid in ids:
             # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
             # to every terminal handoff so request-review cannot bypass the
@@ -2343,13 +2665,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    delivery=delivery,
+                    expected_run_id=run_ids[tid],
+                )
+            except kb.DeliveryEvidenceError as exc:
+                failed.append(tid)
+                print(f"completion blocked [{exc.code}] for {tid}: {exc}", file=sys.stderr)
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
@@ -2388,23 +2717,25 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
-    author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        run_ids = _validated_worker_runs(conn, ids)
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
             if not kb.block_task(
                 conn,
                 tid,
                 reason=reason,
                 kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=run_ids[tid],
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
+                # Worker reasons already belong to the exact-run event. Keep
+                # the operator's authored note only after a successful change.
+                if reason and run_ids[tid] is None:
+                    kb.add_comment(conn, tid, _profile_author(), f"BLOCKED: {reason}")
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
@@ -2424,22 +2755,24 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
-    author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
     with kb.connect_closing() as conn:
+        run_ids = _validated_worker_runs(conn, ids)
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"SCHEDULED: {reason}")
             if not kb.schedule_task(
                 conn,
                 tid,
                 reason=reason,
-                expected_run_id=_worker_run_id_for(tid),
+                expected_run_id=run_ids[tid],
             ):
                 failed.append(tid)
                 print(f"cannot schedule {tid}", file=sys.stderr)
             else:
+                # Worker reasons already belong to the exact-run event. Keep
+                # the operator's authored note only after a successful change.
+                if reason and run_ids[tid] is None:
+                    kb.add_comment(conn, tid, _profile_author(), f"SCHEDULED: {reason}")
                 print(f"Scheduled {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
@@ -2483,8 +2816,13 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return 2
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
+        run_id = _validated_worker_runs(conn, [tid])[tid]
+        task = kb.get_task(conn, tid)
+        if task and kb._completion_delivery_policy(task)["pr_gate"] != "none":
+            print("kanban: code delivery requires submit-for-review with an exact candidate", file=sys.stderr)
+            return 1
         rejection = _goal_mode_handoff_rejection(
-            kb.get_task(conn, tid),
+            task,
             summary or "",
         )
         if rejection is not None:
@@ -2500,7 +2838,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             summary=summary,
             metadata=metadata,
             reviewer=reviewer,
-            expected_run_id=_worker_run_id_for(tid),
+            expected_run_id=run_id,
             force=bool(getattr(args, "force", False)),
             with_reason=True,
         )
@@ -2524,11 +2862,33 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kb.connect_closing() as conn:
+        run_id = _validated_worker_runs(conn, [tid])[tid]
+        task = kb.get_task(conn, tid)
+        reviewed_head = getattr(args, "reviewed_head_sha", None)
+        if reviewed_head is not None or (
+            task and kb._completion_delivery_policy(task)["pr_gate"] != "none"
+        ):
+            try:
+                status = kb.request_task_changes(
+                    conn, tid,
+                    reason=reason,
+                    reviewed_head_sha=str(reviewed_head or "").strip(),
+                    max_review_rounds=_shared_delivery_config().get("max_review_rounds", 2),
+                    expected_run_id=run_id if run_id is not None else task.current_run_id if task else None,
+                )
+            except kb.DeliveryEvidenceError as exc:
+                print(f"changes request blocked [{exc.code}] for {tid}: {exc}", file=sys.stderr)
+                return 1
+            if status is None:
+                print(f"cannot request changes for {tid}: stale review attempt", file=sys.stderr)
+                return 1
+            print(f"Requested changes for {tid}; task is {status}")
+            return 0
         ok, detail = kb.request_changes(
             conn,
             tid,
             reason=reason,
-            expected_run_id=_worker_run_id_for(tid),
+            expected_run_id=run_id,
         )
         if not ok:
             print(

@@ -175,15 +175,38 @@ def test_max_in_progress_partial_budget_across_boards(
     assert len(res.spawned) == 1
 
 
-def test_count_running_tasks_other_boards_fails_open(
-    kanban_home, monkeypatch,
+def test_board_enumeration_failure_refuses_admission_then_recovers(
+    kanban_home, monkeypatch, all_assignees_spawnable,
 ):
-    """A broken board enumeration must not brick dispatch (returns 0)."""
-    monkeypatch.setattr(
-        kb, "list_boards",
-        lambda **k: (_ for _ in ()).throw(RuntimeError("boom")),
-    )
-    assert kb.count_running_tasks_other_boards() == 0
+    """Unknown shared capacity cannot be treated as zero running workers."""
+    spawns: list = []
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="wait for board accounting", assignee="alice")
+        kb.recompute_ready(conn)
+        with monkeypatch.context() as faults:
+            faults.setattr(
+                kb, "list_boards",
+                lambda **k: (_ for _ in ()).throw(RuntimeError("boom")),
+            )
+            with pytest.raises(RuntimeError, match="host_capacity_unavailable"):
+                kb.count_running_tasks_other_boards()
+            with pytest.raises(RuntimeError, match="host_capacity_unavailable"):
+                kb.dispatch_once(
+                    conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=1,
+                    reconcile_orphans=False, _emit_tick_hook=False,
+                )
+            assert spawns == []
+            assert kb.get_task(conn, task_id).status == "ready"
+            assert kb.count_running_tasks(conn) == 0
+
+        assert kb.count_running_tasks_other_boards() == 0
+        recovered = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=1,
+            reconcile_orphans=False, _emit_tick_hook=False,
+        )
+        assert spawns == [task_id]
+        assert len(recovered.spawned) == 1
+        assert kb.get_task(conn, task_id).status == "running"
 
 
 def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):

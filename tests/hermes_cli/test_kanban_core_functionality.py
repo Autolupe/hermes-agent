@@ -1288,7 +1288,7 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
     earlier tests in a full-suite run can reload the module, and recording
     the exit into one module object while reaping through another (stale)
     one makes ``_classify_worker_exit`` return ``unknown`` — silently turning
-    a clean-exit protocol violation into a plain crash.
+    a clean exit into a plain crash.
     """
     import hermes_cli.kanban_db as _kb
     host_prefix = _kb._claimer_id().split(":", 1)[0]
@@ -1304,8 +1304,8 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
         _kb._pid_alive = original_alive
 
 
-def _drive_protocol_violation(conn, tid, fake_pid):
-    """One clean-exit protocol violation reaper pass for ``tid``.
+def _drive_clean_exit(conn, tid, fake_pid):
+    """One clean-exit reconciliation pass for ``tid``.
 
     os.W_EXITCODE(status=0, signal=0) == 0 on POSIX.
     """
@@ -1320,61 +1320,42 @@ def _drive_nonzero_crash(conn, tid, fake_pid):
     return _drive_worker_exit(conn, tid, fake_pid, 256)
 
 
-def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
-    """Mixed failure kinds must not consume the violation retry budget.
+@pytest.mark.parametrize("prior_crash", [False, True])
+@pytest.mark.parametrize("max_retries", [2, 7])
+def test_clean_exit_blocks_without_consuming_or_reusing_crash_budget(
+    kanban_home, prior_crash, max_retries
+):
+    """Successful process exit needs an explicit handoff, regardless of budget.
 
-    Regression for the #61233 review finding: expressed as a plain
-    ``failure_limit`` over the unified ``consecutive_failures`` counter, the
-    violation budget was consumed by earlier timeouts / nonzero exits. As a
-    violation-only streak, a prior real crash must not eat violation
-    retries, and below-budget violations must leave the unified counter
-    untouched (so the two budgets stay independent).
+    A real crash still increments the existing failure counter and retries.
+    The next clean exit must retain that count and stop at a sticky capability
+    block, even when a task-specific retry budget has spare attempts.
     """
-    import hermes_cli.kanban_db as _kb
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="mixed", assignee="worker")
-
-        # One real crash: unified counter ticks to 1 (below
-        # DEFAULT_FAILURE_LIMIT=2 — task stays ready).
-        _drive_nonzero_crash(conn, tid, 991000)
-        task = kb.get_task(conn, tid)
-        assert task.status == "ready"
-        assert task.consecutive_failures == 1
-
-        # Two violations after it: streak 1 and 2 — both retry, unified
-        # counter untouched. (Pre-fix: the crash consumed the budget and the
-        # violations blocked well before three of them happened.)
-        for i, pid in enumerate((991001, 991002)):
-            _drive_protocol_violation(conn, tid, pid)
+        tid = kb.create_task(
+            conn, title="mixed", assignee="worker", max_retries=max_retries,
+        )
+        if prior_crash:
+            assert _drive_nonzero_crash(conn, tid, 991000) == [tid]
             task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"violation {i + 1} after a crash must still retry, "
-                f"got {task.status}"
-            )
-            assert task.consecutive_failures == 1, (
-                "below-budget violations must not tick the unified counter"
-            )
+            assert task.status == "ready"
+            assert task.consecutive_failures == 1
 
-        # Third consecutive violation: streak hits the bound — blocked.
-        _drive_protocol_violation(conn, tid, 991003)
+        assert _drive_clean_exit(conn, tid, 991001) == []
         task = kb.get_task(conn, tid)
-        assert task.status == "blocked"
-        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
-        assert len(gave_up) == 1
-        assert (gave_up[0].payload or {}).get("protocol_violations") == \
-            _kb._PROTOCOL_VIOLATION_FAILURE_LIMIT
+        assert task.status == "blocked" and task.block_kind == "capability"
+        assert task.consecutive_failures == int(prior_crash)
+        assert task.current_run_id is None and task.claim_lock is None
+        event, = [e for e in kb.list_events(conn, tid) if e.kind == "terminal_reconciled"]
+        assert event.payload["exit_code"] == 0
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        for _ in range(3):
+            assert kb.recompute_ready(conn) == 0
+            assert kb.get_task(conn, tid).status == "blocked"
+        assert kb.claim_task(conn, tid) is None
     finally:
         conn.close()
-
-
-
-
-
-
-
-
-
 
 
 

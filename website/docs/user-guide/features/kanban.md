@@ -69,6 +69,31 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+### Choosing a worktree's starting commit
+
+Use `hermes kanban create "Continue the parent change" --workspace worktree
+--base-sha <commit>` to start from a specific parent commit. Replace `<commit>`
+with its full, nonzero, 40-character lowercase Git commit identifier. Branch
+names, short identifiers, and surrounding whitespace are rejected. The option
+also works when a linked project selects the worktree workspace automatically;
+it is invalid for tasks that remain `scratch` or `dir` workspaces.
+
+Without `--base-sha`, Hermes fetches `main` from `origin` when creating a new
+task branch and records that exact commit as `worktree_base_sha`. A failed
+fetch stops workspace preparation. A repository without `origin` uses its
+local `main` commit; it does not inherit whichever feature branch happens to
+be checked out. Later retries keep the recorded commit. An existing task
+branch with a recorded or explicit base can be reused only if that commit
+is in its history. A legacy branch with no recorded base can still be reused,
+but its starting commit remains unknown; Hermes does not present today's
+`main` as proof of where that older branch began.
+
+`hermes kanban show <id>` displays the recorded starting commit. JSON output
+from `create`, `list`, and `show` includes `worktree_base_sha`; it is `null`
+until a default base has been selected. Choosing a starting commit does not
+approve its code or satisfy review or delivery checks. Existing dispatch
+controls still govern whether a worker can run.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,
@@ -756,7 +781,7 @@ hermes kanban init                                     # create kanban.db + prin
 hermes kanban create "<title>" [--body ...] [--assignee <profile>]
                                 [--parent <id>]... [--tenant <name>]
                                 [--workspace scratch|worktree|worktree:<path>|dir:<path>]
-                                [--branch <name>]
+                                [--branch <name>] [--base-sha <commit>]
                                 [--priority N] [--triage] [--idempotency-key KEY]
                                 [--max-runtime 30m|2h|1d|<seconds>]
                                 [--max-retries N]

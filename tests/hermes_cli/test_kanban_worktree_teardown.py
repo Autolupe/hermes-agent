@@ -19,6 +19,23 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+# These fixtures audit workspace lifecycle and ownership without delivering code.
+_WORKSPACE_AUDIT_CONTRACT = """```acceptance-contract
+domain: ops
+target: artifact-file
+tier1:
+  - cmd: "test -d ."
+    expect_exit: 0
+tier2:
+  - "The workspace audit preserves its base, ownership and lifecycle evidence."
+tier3: "Local filesystem audit complete; no repository change is delivered."
+```"""
+_NO_MERGE_EXPECTED = {
+    "classification": "no_merge_expected",
+    "reason": "Filesystem ownership audit has no code changes to merge.",
+}
+
+
 def _git(*args: str, cwd: str | None = None) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -52,7 +69,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def repo(tmp_path: Path) -> Path:
     """A project repo with a remote whose history is fully pushed."""
     origin = tmp_path / "origin.git"
-    _git("init", "--bare", str(origin))
+    _git("init", "--bare", "-b", "main", str(origin))
     project = tmp_path / "project"
     _git("clone", str(origin), str(project))
     _git("-C", str(project), "config", "user.email", "t@example.com")
@@ -156,7 +173,9 @@ def test_tree_dirtied_between_check_and_removal_preserved(
 
 
 def _worktree_task(conn, repo: Path, title: str = "wt-task") -> tuple[str, Path]:
-    tid = kb.create_task(conn, title=title, assignee="worker")
+    tid = kb.create_task(
+        conn, title=title, assignee="worker", body=_WORKSPACE_AUDIT_CONTRACT,
+    )
     wt = _make_worktree(repo, tid)
     with kb.write_txn(conn):
         conn.execute(
@@ -173,7 +192,9 @@ def test_complete_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> No
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         assert kb.claim_task(conn, tid, claimer="worker") is not None
-        assert kb.complete_task(conn, tid, summary="done")
+        assert kb.complete_task(
+            conn, tid, summary="done", delivery=_NO_MERGE_EXPECTED,
+        )
     assert not wt.exists()
     assert not _branch_exists(repo, f"wt/{tid}")
 
@@ -185,7 +206,9 @@ def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         assert kb.claim_task(conn, tid, claimer="worker") is not None
-        assert kb.complete_task(conn, tid, summary="done")
+        assert kb.complete_task(
+            conn, tid, summary="done", delivery=_NO_MERGE_EXPECTED,
+        )
     assert wt.is_dir()
     assert (wt / "wip.txt").exists()
 
@@ -208,7 +231,9 @@ def test_parent_worktree_deferred_until_children_done(
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
         assert kb.claim_task(conn, parent, claimer="worker") is not None
-        assert kb.complete_task(conn, parent, summary="parent done")
+        assert kb.complete_task(
+            conn, parent, summary="parent done", delivery=_NO_MERGE_EXPECTED,
+        )
         # child still active -> parent worktree must survive for handoff
         assert parent_wt.is_dir()
 

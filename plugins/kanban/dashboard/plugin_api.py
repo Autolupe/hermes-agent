@@ -148,7 +148,7 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "shipping", "blocked", "review", "done",
 ]
 
 
@@ -866,6 +866,26 @@ def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
     return None
 
 
+def _require_task_mutation_allowed(conn, task_id: str) -> None:
+    """Refuse a dashboard edit while trusted worker/delivery control owns it.
+
+    This is an early, user-facing refusal. Native writers repeat their guards
+    under the write lock; the direct-status writer does the same below.
+    """
+    if kanban_db._controlled_worker_pending(conn, task_id):
+        raise HTTPException(
+            status_code=409,
+            detail="task is waiting for trusted worker control; its current run was kept",
+        )
+    task = kanban_db.get_task(conn, task_id)
+    if task is not None and task.status == "shipping":
+        raise HTTPException(status_code=409, detail="trusted delivery is still in progress")
+    try:
+        kanban_db._refuse_active_delivery_operation(conn, task_id)
+    except kanban_db.DeliveryOperationInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -874,6 +894,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+        _require_task_mutation_allowed(conn, task_id)
 
         review_assignee_deferred = (
             payload.status == "review" and payload.assignee is not None
@@ -982,6 +1004,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     conn, task_id, new_model,
                     provider=payload.provider_override,
                 )
+            except kanban_db.DeliveryOperationInProgressError as e:
+                raise HTTPException(status_code=409, detail=str(e))
             except (ValueError, RuntimeError) as e:
                 raise HTTPException(status_code=400, detail=str(e))
             if not ok:
@@ -995,6 +1019,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             )
             try:
                 ok = kanban_db.set_reasoning_effort(conn, task_id, new_effort)
+            except kanban_db.DeliveryOperationInProgressError as e:
+                raise HTTPException(status_code=409, detail=str(e))
             except (ValueError, RuntimeError) as e:
                 raise HTTPException(status_code=400, detail=str(e))
             if not ok:
@@ -1002,45 +1028,19 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:
-            with kanban_db.write_txn(conn):
-                conn.execute(
-                    "UPDATE tasks SET priority = ? WHERE id = ?",
-                    (int(payload.priority), task_id),
-                )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'reprioritized', ?, ?)",
-                    (task_id, json.dumps({"priority": int(payload.priority)}),
-                     int(time.time())),
-                )
-            # Mutation-boundary observer (RFC #58548): this direct-SQL write
-            # bypasses every kanban_db mutator, so report it here — after
-            # the txn commits.
+            if not kanban_db.set_task_priority(conn, task_id, payload.priority):
+                raise HTTPException(status_code=409, detail="priority change refused")
+            # Preserve the existing post-commit mutation observer.
             kanban_db.notify_task_updated(
                 conn, task_id, ("priority",), board=board,
             )
 
         # --- title / body -------------------------------------------------
         if payload.title is not None or payload.body is not None:
-            with kanban_db.write_txn(conn):
-                sets, vals = [], []
-                if payload.title is not None:
-                    if not payload.title.strip():
-                        raise HTTPException(status_code=400, detail="title cannot be empty")
-                    sets.append("title = ?")
-                    vals.append(payload.title.strip())
-                if payload.body is not None:
-                    sets.append("body = ?")
-                    vals.append(payload.body)
-                vals.append(task_id)
-                conn.execute(
-                    f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", vals,
-                )
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, 'edited', NULL, ?)",
-                    (task_id, int(time.time())),
-                )
+            if not kanban_db.edit_task_fields(
+                conn, task_id, title=payload.title, body=payload.body,
+            ):
+                raise HTTPException(status_code=409, detail="task edit refused")
             # Mutation-boundary observer (RFC #58548), post-commit. Field
             # names only — values never leave the DB via this payload.
             kanban_db.notify_task_updated(
@@ -1051,6 +1051,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
+    except (kanban_db.DeliveryEvidenceError, kanban_db.DeliveryOperationInProgressError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
         conn.close()
 
@@ -1064,10 +1068,13 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_task_mutation_allowed(conn, task_id)
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         return {"deleted": True, "task_id": task_id}
+    except kanban_db.DeliveryOperationInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:
         conn.close()
 
@@ -1131,10 +1138,13 @@ def _set_status_direct(
     (user yanking a stuck worker back to the queue).
     """
     try:
+        if new_status == "done":
+            return kanban_db.complete_task(conn, task_id)
         if new_status in {"ready", "review"}:
             kanban_db._raise_if_dispatch_paused()
         return _set_status_direct_guarded(conn, task_id, new_status)
-    except kanban_db.DispatchPausedError:
+    except (kanban_db.DispatchPausedError, kanban_db.DeliveryEvidenceError,
+            kanban_db.DeliveryOperationInProgressError):
         # The dashboard already maps False to a conflict response. A brake
         # should refuse this status action without leaking an internal error.
         return False
@@ -1144,16 +1154,30 @@ def _set_status_direct_guarded(
     conn: sqlite3.Connection, task_id: str, new_status: str,
 ) -> bool:
     """Apply a direct status write with in-transaction brake checks."""
+    if new_status not in {"todo", "triage", "ready"}:
+        return False
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
+        if kanban_db._controlled_worker_pending(conn, task_id):
+            return False
+        try:
+            kanban_db._refuse_active_delivery_operation(conn, task_id)
+        except kanban_db.DeliveryOperationInProgressError:
+            return False
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
-            "SELECT status, current_run_id, worker_pid, claim_lock "
+            "SELECT id, status, current_run_id, worker_pid, claim_lock "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if prev["status"] == "shipping":
+            return False
+        if prev["status"] == "running" and not kanban_db._recovery_run_matches(
+            conn, prev, allow_untracked=True,
+        ):
             return False
 
         if prev["status"] == "running" and new_status == "ready":
@@ -1299,8 +1323,12 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_task_mutation_allowed(conn, payload.parent_id)
+        _require_task_mutation_allowed(conn, payload.child_id)
         kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
         return {"ok": True}
+    except kanban_db.DeliveryOperationInProgressError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
@@ -1316,8 +1344,12 @@ def delete_link(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_task_mutation_allowed(conn, parent_id)
+        _require_task_mutation_allowed(conn, child_id)
         ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
         return {"ok": bool(ok)}
+    except kanban_db.DeliveryOperationInProgressError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     finally:
         conn.close()
 
@@ -1367,6 +1399,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     entry.update(ok=False, error="not found")
                     results.append(entry)
                     continue
+                _require_task_mutation_allowed(conn, tid)
                 if payload.archive:
                     if not kanban_db.archive_task(conn, tid):
                         entry.update(ok=False, error="archive refused")
@@ -1436,20 +1469,11 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     except RuntimeError as e:
                         entry.update(ok=False, error=str(e))
                 if payload.priority is not None:
-                    with kanban_db.write_txn(conn):
-                        conn.execute(
-                            "UPDATE tasks SET priority = ? WHERE id = ?",
-                            (int(payload.priority), tid),
-                        )
-                        conn.execute(
-                            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                            "VALUES (?, 'reprioritized', ?, ?)",
-                            (tid, json.dumps({"priority": int(payload.priority)}),
-                             int(time.time())),
-                        )
-                    # Mutation-boundary observer (RFC #58548): the bulk
-                    # editor writes with direct SQL too — report each task's
-                    # committed write.
+                    if not kanban_db.set_task_priority(conn, tid, payload.priority):
+                        entry.update(ok=False, error="priority change refused")
+                        results.append(entry)
+                        continue
+                    # Preserve one notification for each committed edit.
                     kanban_db.notify_task_updated(
                         conn, tid, ("priority",), board=board,
                     )
@@ -1478,6 +1502,8 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             entry.update(ok=False, error="reasoning override refused")
                     except (ValueError, RuntimeError) as e:
                         entry.update(ok=False, error=str(e))
+            except HTTPException as e:
+                entry.update(ok=False, error=str(e.detail))
             except Exception as e:  # defensive — one bad id shouldn't kill the batch
                 entry.update(ok=False, error=str(e))
             results.append(entry)
@@ -1769,7 +1795,13 @@ def terminate_run_endpoint(
                 status_code=409,
                 detail=f"run {run_id} already ended",
             )
-        ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        _require_task_mutation_allowed(conn, r.task_id)
+        task = kanban_db.get_task(conn, r.task_id)
+        if task is None or task.current_run_id != run_id:
+            raise HTTPException(status_code=409, detail="run is no longer the task's current attempt")
+        ok = kanban_db.reclaim_task(
+            conn, r.task_id, reason=payload.reason, expected_run_id=run_id,
+        )
         if not ok:
             raise HTTPException(
                 status_code=409,
@@ -1779,6 +1811,8 @@ def terminate_run_endpoint(
                 ),
             )
         return {"ok": True, "run_id": run_id, "task_id": r.task_id}
+    except kanban_db.DeliveryOperationInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:
         conn.close()
 
@@ -1807,6 +1841,7 @@ def reclaim_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_task_mutation_allowed(conn, task_id)
         ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
         if not ok:
             raise HTTPException(
@@ -1817,6 +1852,8 @@ def reclaim_task_endpoint(
                 ),
             )
         return {"ok": True, "task_id": task_id}
+    except kanban_db.DeliveryOperationInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:
         conn.close()
 
@@ -1856,6 +1893,11 @@ def specify_task_endpoint(
     # threadpool, so two concurrent requests for different boards would
     # otherwise race on the shared env var and cross-write (issue #38323).
     with kanban_db.scoped_current_board(board or kanban_db.DEFAULT_BOARD):
+        conn = _conn(board=board)
+        try:
+            _require_task_mutation_allowed(conn, task_id)
+        finally:
+            conn.close()
         # Import lazily so a missing auxiliary client at import time
         # doesn't break plugin load.
         from hermes_cli import kanban_specify  # noqa: WPS433 (intentional)
@@ -1896,6 +1938,7 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _require_task_mutation_allowed(conn, task_id)
         ok = kanban_db.reassign_task(
             conn, task_id,
             payload.profile or None,
@@ -1911,6 +1954,8 @@ def reassign_task_endpoint(
                 ),
             )
         return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
+    except kanban_db.DeliveryOperationInProgressError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:
         conn.close()
 
@@ -2643,6 +2688,8 @@ def delete_board(slug: str, delete: bool = Query(False, description="Hard-delete
         res = kanban_db.remove_board(slug, archive=not delete)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     return {"result": res, "current": kanban_db.get_current_board()}
 
 
@@ -2808,6 +2855,11 @@ def decompose_task_endpoint(
     # HERMES_KANBAN_BOARD env var would let concurrent requests for
     # different boards race and cross-write (issue #38323).
     with kanban_db.scoped_current_board(board or kanban_db.DEFAULT_BOARD):
+        conn = _conn(board=board)
+        try:
+            _require_task_mutation_allowed(conn, task_id)
+        finally:
+            conn.close()
         from hermes_cli import kanban_decompose  # noqa: WPS433 (intentional)
         outcome = kanban_decompose.decompose_task(
             task_id,
