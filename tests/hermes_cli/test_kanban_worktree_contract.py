@@ -15,6 +15,19 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+# These fixtures audit workspace lifecycle and ownership without delivering code.
+_WORKSPACE_AUDIT_CONTRACT = """```acceptance-contract
+domain: ops
+target: artifact-file
+tier1:
+  - cmd: "test -d ."
+    expect_exit: 0
+tier2:
+  - "The workspace audit preserves its base, ownership and lifecycle evidence."
+tier3: "Local filesystem audit complete; no repository change is delivered."
+```"""
+
+
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -276,6 +289,7 @@ def test_dispatcher_passes_and_persists_actual_base_before_stub_spawn(
     with kb.connect() as conn:
         task_id = kb.create_task(
             conn, title="dispatch pinned task", assignee="test-worker",
+            body=_WORKSPACE_AUDIT_CONTRACT,
             workspace_kind="worktree", workspace_path=str(repo),
             **({"worktree_base_sha": base} if explicit_pin else {}),
         )

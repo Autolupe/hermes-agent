@@ -14,6 +14,19 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
 
 
+# These fixtures audit workspace lifecycle and ownership without delivering code.
+_WORKSPACE_AUDIT_CONTRACT = """```acceptance-contract
+domain: ops
+target: artifact-file
+tier1:
+  - cmd: "test -d ."
+    expect_exit: 0
+tier2:
+  - "The workspace audit preserves its base, ownership and lifecycle evidence."
+tier3: "Local filesystem audit complete; no repository change is delivered."
+```"""
+
+
 BASE_SHA = "a" * 40
 
 
@@ -170,6 +183,7 @@ def test_claim_persists_default_main_base_without_inheriting_feature_head(
 
     code, output, error = _command(
         capsys, "create", "claim base", "--workspace", f"worktree:{workspace}",
+        "--body", _WORKSPACE_AUDIT_CONTRACT,
         "--initial-status", "blocked", "--json",
     )
     assert code == 0, error

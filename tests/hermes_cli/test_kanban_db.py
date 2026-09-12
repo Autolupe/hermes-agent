@@ -18,6 +18,23 @@ import hermes_state
 from hermes_cli import kanban_db as kb
 
 
+# These fixtures audit workspace lifecycle and ownership without delivering code.
+_WORKSPACE_AUDIT_CONTRACT = """```acceptance-contract
+domain: ops
+target: artifact-file
+tier1:
+  - cmd: "test -d ."
+    expect_exit: 0
+tier2:
+  - "The workspace audit preserves its base, ownership and lifecycle evidence."
+tier3: "Local filesystem audit complete; no repository change is delivered."
+```"""
+_NO_MERGE_EXPECTED = {
+    "classification": "no_merge_expected",
+    "reason": "Filesystem ownership audit has no code changes to merge.",
+}
+
+
 @pytest.fixture
 def kanban_home(tmp_path, monkeypatch):
     """Isolated HERMES_HOME with an empty kanban DB."""
@@ -636,6 +653,7 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
         parent = kb.create_task(conn, title="scratch parent")
         child = kb.create_task(
             conn, title="dir child", workspace_kind="dir",
+            body=_WORKSPACE_AUDIT_CONTRACT,
             workspace_path=str(child_dir),
         )
         kb.link_tasks(conn, parent, child)
@@ -646,7 +664,9 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
         kb.complete_task(conn, parent, result="handoff")
         assert parent_ws.exists(), "deferred while dir child active"
 
-        kb.complete_task(conn, child, result="built")
+        assert kb.complete_task(
+            conn, child, result="built", delivery=_NO_MERGE_EXPECTED,
+        )
 
     assert not parent_ws.exists(), (
         "A 'dir' child completing must trigger the parent scratch sweep"

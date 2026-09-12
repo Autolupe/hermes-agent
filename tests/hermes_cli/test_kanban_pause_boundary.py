@@ -1,3 +1,5 @@
+from tests.hermes_cli.delivery_fixtures import ARTIFACT_CONTRACT
+
 import builtins
 import contextlib
 import inspect
@@ -2082,6 +2084,7 @@ def test_stop_after_claim_blocks_workspace_materialization(
         title=f"{lane} {workspace_kind}",
         assignee="default",
         workspace_kind=workspace_kind,
+        body=ARTIFACT_CONTRACT,
     )
     if lane == "review":
         conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
@@ -2172,6 +2175,7 @@ def test_stop_during_directory_resolution_rolls_back_new_workspace(
         assignee="default",
         workspace_kind=workspace_kind,
         workspace_path=str(explicit_path) if workspace_kind == "dir" else None,
+        body=ARTIFACT_CONTRACT,
     )
     if lane == "review":
         conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
@@ -2245,6 +2249,7 @@ def test_stop_during_worktree_resolution_removes_new_worktree_and_branch(
         title=f"{lane} worktree",
         assignee="default",
         workspace_kind="worktree",
+        body=ARTIFACT_CONTRACT,
     )
     original_workspace_path = kb.get_task(conn, task_id).workspace_path
     if lane == "review":
@@ -2343,6 +2348,7 @@ def test_halt_during_workspace_commit_rolls_back_persisted_materialization(
         title=f"{lane} commit-edge {workspace_kind}",
         assignee="default",
         workspace_kind=workspace_kind,
+        body=ARTIFACT_CONTRACT,
     )
     if lane == "review":
         conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
@@ -2450,6 +2456,7 @@ def test_halt_from_failing_checkout_hook_rolls_back_partial_worktree(
         title=f"{lane} failing hook",
         assignee="default",
         workspace_kind="worktree",
+        body=ARTIFACT_CONTRACT,
     )
     original_workspace_path = kb.get_task(conn, task_id).workspace_path
     if lane == "review":

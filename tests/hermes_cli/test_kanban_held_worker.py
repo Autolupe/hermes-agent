@@ -18,6 +18,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_held_worker as held
 from hermes_cli import kanban_policy as policy
 from hermes_cli import kanban_worker_supervisor as protocol
+from tests.hermes_cli.delivery_fixtures import ARTIFACT_CONTRACT
 
 
 pytestmark = pytest.mark.linux_only
@@ -78,7 +79,7 @@ def native(tmp_path, monkeypatch):
 def claim(native, lane="ready"):
     task_id = kb.create_task(
         native.conn, title="held fixture", assignee="default", workspace_kind="dir",
-        workspace_path=str(native.workspace),
+        workspace_path=str(native.workspace), body=ARTIFACT_CONTRACT,
     )
     if lane == "review":
         native.conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))

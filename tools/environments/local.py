@@ -23,6 +23,1774 @@ _IS_WINDOWS = platform.system() == "Windows"
 logger = logging.getLogger(__name__)
 
 
+import contextlib
+import hashlib
+import json
+import posixpath
+import stat
+from collections.abc import Iterator
+from dataclasses import dataclass
+
+
+# Protected delivery acceptance helpers ported from commit 339a5398.
+# These are explicit controller APIs; ordinary LocalEnvironment is unchanged.
+
+_KANBAN_TERMINAL_SANDBOX_VERSION = "systemd-v1"
+
+
+_SYSTEMD_RUN = "/usr/bin/systemd-run"
+
+
+_DELIVERY_ACCEPTANCE_ROOT = Path(
+    "/var/lib/hermes-delivery-control/acceptance"
+)
+
+
+_DELIVERY_MIRROR = Path(
+    "/var/lib/hermes-delivery-control/base/repository.git"
+)
+
+
+_MAX_ACCEPTANCE_TREE_ENTRIES = 100_000
+
+
+_MAX_ACCEPTANCE_TREE_BYTES = 2 * 1024 * 1024 * 1024
+
+
+_MAX_ACCEPTANCE_BLOB_BYTES = 128 * 1024 * 1024
+
+
+_MAX_ACCEPTANCE_SYMLINK_BYTES = 4096
+
+
+class WorkerTerminalSandboxError(RuntimeError):
+    """A code/review worker's mandatory terminal sandbox is unavailable."""
+
+
+def _systemd_mount_path(path: Path, *, label: str) -> str:
+    """Return a path safe for systemd's BindPaths=/path-list grammar.
+
+    Generated Kanban worktrees use simple absolute paths. Reject separators
+    and escapes that systemd would parse as another source/destination instead
+    of letting a user-supplied repository path widen the mount boundary.
+    """
+    value = str(path)
+    if (
+        not path.is_absolute()
+        or ":" in value
+        or "\\" in value
+        or any(character.isspace() or ord(character) < 32 for character in value)
+    ):
+        raise WorkerTerminalSandboxError(
+            f"{label} cannot be represented safely as a systemd sandbox mount: {value!r}"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class _LinkedWorktreeGit:
+    """Host/private Git paths for one sandboxed linked worktree."""
+
+    host_gitdir: Path
+    common_dir: Path
+    common_objects: Path
+    branch: str
+    host_head: str
+    private_gitdir: Path
+    pointer_file: Path
+
+
+@dataclass(frozen=True)
+class _DependencyProjection:
+    """One root-owned dependency snapshot projected read-only into a worktree."""
+
+    label: str
+    source: Path
+    destination: Path
+    source_device: int
+    source_inode: int
+    source_mode: int
+    tree_sha256: str
+    tree_entries: int
+    tree_bytes: int
+    attestation_path: Path
+    attestation_sha256: str
+    manifest_hashes: tuple[tuple[Path, str], ...]
+
+
+_NODE_LOCKFILES = (
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
+    "bun.lockb",
+)
+
+
+_MAX_DEPENDENCY_MANIFEST_BYTES = 32 * 1024 * 1024
+
+
+_MAX_DEPENDENCY_TREE_ENTRIES = 500_000
+
+
+_MAX_DEPENDENCY_TREE_BYTES = 16 * 1024 * 1024 * 1024
+
+
+_PRODUCTION_DEPENDENCY_SNAPSHOT_ROOT = Path(
+    "/var/lib/hermes-delivery-control/dependencies"
+)
+
+
+_DEPENDENCY_SNAPSHOT_ROOT = _PRODUCTION_DEPENDENCY_SNAPSHOT_ROOT
+
+
+_DEPENDENCY_SNAPSHOT_OWNER_UID = 0
+
+
+def _dependency_provisioning_error(detail: str) -> WorkerTerminalSandboxError:
+    return WorkerTerminalSandboxError(
+        "dependency provisioning required: "
+        f"{detail}. The trusted control plane must provision a canonical "
+        "dependency tree for these exact manifests before retrying"
+    )
+
+
+def _path_lexists(path: Path) -> bool:
+    """Return true for existing paths including broken symlinks."""
+    return os.path.lexists(path)
+
+
+def _validate_owned_real_path(
+    root: Path,
+    relative: str,
+    *,
+    label: str,
+    kind: str,
+) -> tuple[Path, os.stat_result]:
+    """Validate an owned, no-symlink file or directory below ``root``."""
+    try:
+        root_stat = root.lstat()
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            raise _dependency_provisioning_error(
+                f"{label} root is not a real directory"
+            )
+        if root_stat.st_uid != os.getuid() or root.resolve(strict=True) != root:
+            raise _dependency_provisioning_error(
+                f"{label} root is not owned by the worker service UID or is symlinked"
+            )
+
+        parts = Path(relative).parts
+        if not parts or Path(relative).is_absolute() or ".." in parts:
+            raise _dependency_provisioning_error(
+                f"{label} uses an unsafe relative path"
+            )
+        current = root
+        current_stat = root_stat
+        for index, part in enumerate(parts):
+            current = current / part
+            current_stat = current.lstat()
+            if stat.S_ISLNK(current_stat.st_mode):
+                raise _dependency_provisioning_error(
+                    f"{label} contains a symlink at {current}"
+                )
+            is_final = index == len(parts) - 1
+            if not is_final and not stat.S_ISDIR(current_stat.st_mode):
+                raise _dependency_provisioning_error(
+                    f"{label} parent is not a directory at {current}"
+                )
+            if current_stat.st_uid != os.getuid():
+                raise _dependency_provisioning_error(
+                    f"{label} is not owned by the worker service UID at {current}"
+                )
+        if kind == "file" and not stat.S_ISREG(current_stat.st_mode):
+            raise _dependency_provisioning_error(
+                f"{label} is not a regular file"
+            )
+        if kind == "directory" and not stat.S_ISDIR(current_stat.st_mode):
+            raise _dependency_provisioning_error(
+                f"{label} is not a directory"
+            )
+        current.resolve(strict=True).relative_to(root)
+        return current, current_stat
+    except WorkerTerminalSandboxError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _dependency_provisioning_error(
+            f"{label} is unavailable or escapes its repository root ({exc})"
+        ) from exc
+
+
+def _hash_owned_manifest(root: Path, relative: str, *, label: str) -> tuple[Path, str]:
+    """Hash one validated manifest without following its final path."""
+    path, before = _validate_owned_real_path(
+        root,
+        relative,
+        label=label,
+        kind="file",
+    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    digest = hashlib.sha256()
+    try:
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_dev != before.st_dev
+                or opened.st_ino != before.st_ino
+                or opened.st_uid != os.getuid()
+                or opened.st_size > _MAX_DEPENDENCY_MANIFEST_BYTES
+            ):
+                raise _dependency_provisioning_error(
+                    f"{label} changed during validation or exceeds the size limit"
+                )
+            remaining = _MAX_DEPENDENCY_MANIFEST_BYTES + 1
+            while remaining > 0:
+                chunk = os.read(fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if remaining <= 0 and os.read(fd, 1):
+                raise _dependency_provisioning_error(
+                    f"{label} exceeds the size limit"
+                )
+        finally:
+            os.close(fd)
+    except WorkerTerminalSandboxError:
+        raise
+    except OSError as exc:
+        raise _dependency_provisioning_error(
+            f"{label} cannot be read without following symlinks ({exc})"
+        ) from exc
+    return path, digest.hexdigest()
+
+
+def _validate_python_dependency_metadata(path: Path, source: Path) -> None:
+    """Reject editable/out-of-tree Python path injection metadata."""
+    if path.suffix == ".egg-link" or path.name.startswith("__editable__"):
+        raise _dependency_provisioning_error(
+            f"backend Python dependency tree contains editable metadata at {path}"
+        )
+    if path.suffix == ".pth":
+        try:
+            text = path.read_text(encoding="utf-8", errors="strict")
+        except (OSError, UnicodeError) as exc:
+            raise _dependency_provisioning_error(
+                f"backend Python .pth metadata cannot be validated at {path} ({exc})"
+            ) from exc
+        for raw_line in text.splitlines():
+            # Match CPython site.py so leading-space path lines cannot be
+            # reinterpreted here as executable import statements.
+            line = raw_line.rstrip()
+            if not line or line.startswith("#") or line.startswith(("import ", "import\t")):
+                # Executable .pth statements are dependency code and are
+                # content-attested with the rest of the read-only tree. Only
+                # path additions can create another startup import root.
+                continue
+            raise _dependency_provisioning_error(
+                f"backend Python .pth metadata contains a path addition at {path}"
+            )
+    if path.name == "direct_url.json":
+        try:
+            metadata = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise _dependency_provisioning_error(
+                f"backend Python direct_url metadata is invalid at {path} ({exc})"
+            ) from exc
+        if not isinstance(metadata, dict):
+            raise _dependency_provisioning_error(
+                f"backend Python direct_url metadata has an invalid shape at {path}"
+            )
+        url = str(metadata.get("url") or "")
+        dir_info = metadata.get("dir_info")
+        if url.startswith("file:") or (
+            isinstance(dir_info, dict) and dir_info.get("editable") is True
+        ):
+            raise _dependency_provisioning_error(
+                "backend Python dependency tree contains a local/editable "
+                f"install at {path}"
+            )
+
+
+def _dependency_symlink_allowed(
+    path: Path,
+    source: Path,
+    *,
+    label: str,
+) -> bool:
+    """Allow only confined relative links, plus the venv system interpreter."""
+    target_text = os.readlink(path)
+    target = Path(target_text)
+    resolved = (path.parent / target).resolve(strict=True)
+    try:
+        resolved.relative_to(source)
+        return not target.is_absolute()
+    except ValueError:
+        pass
+    if label == "backend Python":
+        try:
+            from hermes_cli.dependency_provisioner import (
+                TRUSTED_PYTHON_BASE_EXECUTABLE,
+            )
+
+            relative = path.relative_to(source)
+            resolved_stat = resolved.stat()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return (
+            relative.parent == Path("bin")
+            and relative.name.startswith("python")
+            and resolved == TRUSTED_PYTHON_BASE_EXECUTABLE.resolve(strict=True)
+            and stat.S_ISREG(resolved_stat.st_mode)
+            and resolved_stat.st_uid == _DEPENDENCY_SNAPSHOT_OWNER_UID
+            and not stat.S_IMODE(resolved_stat.st_mode) & 0o022
+        )
+    return False
+
+
+def _validate_dependency_snapshot_tree(
+    source: Path,
+    *,
+    label: str,
+) -> tuple[int, int]:
+    """Validate root-owned immutable snapshot metadata without hashing 7+ GiB."""
+    entries_seen = 0
+    bytes_seen = 0
+    startup_customization = None
+    if label == "backend Python":
+        from hermes_cli.dependency_provisioner import (
+            _is_python_startup_customization,
+            _python_import_root_layout_is_safe,
+        )
+
+        startup_customization = _is_python_startup_customization
+        if not _python_import_root_layout_is_safe(source):
+            raise _dependency_provisioning_error(
+                "backend Python dependency tree has an unsafe import-root layout"
+            )
+    try:
+        for current_root, directory_names, file_names in os.walk(
+            source,
+            topdown=True,
+            followlinks=False,
+        ):
+            directory_names.sort()
+            file_names.sort()
+            for name in [*directory_names, *file_names]:
+                path = Path(current_root) / name
+                relative = path.relative_to(source).as_posix()
+                entry_stat = path.lstat()
+                entries_seen += 1
+                if entries_seen > _MAX_DEPENDENCY_TREE_ENTRIES:
+                    raise _dependency_provisioning_error(
+                        f"canonical {label} dependency tree exceeds the entry limit"
+                    )
+                if (
+                    entry_stat.st_uid != _DEPENDENCY_SNAPSHOT_OWNER_UID
+                    or (
+                        not stat.S_ISLNK(entry_stat.st_mode)
+                        and stat.S_IMODE(entry_stat.st_mode) & 0o022
+                    )
+                ):
+                    raise _dependency_provisioning_error(
+                        f"trusted {label} snapshot entry is not root-owned/read-only at {path}"
+                    )
+                if startup_customization is not None and startup_customization(
+                    path,
+                    source,
+                ):
+                    raise _dependency_provisioning_error(
+                        "backend Python dependency tree contains startup "
+                        f"customization at {path}"
+                    )
+                if stat.S_ISLNK(entry_stat.st_mode):
+                    try:
+                        if not _dependency_symlink_allowed(
+                            path,
+                            source,
+                            label=label,
+                        ):
+                            raise _dependency_provisioning_error(
+                                f"trusted {label} snapshot symlink escapes or is absolute at {path}"
+                            )
+                        target_text = os.readlink(path)
+                    except WorkerTerminalSandboxError:
+                        raise
+                    except (OSError, RuntimeError) as exc:
+                        raise _dependency_provisioning_error(
+                            f"trusted {label} snapshot symlink cannot be validated at {path} ({exc})"
+                        ) from exc
+                    if label == "backend Python":
+                        _validate_python_dependency_metadata(path, source)
+                    if name in directory_names:
+                        directory_names.remove(name)
+                    continue
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    if stat.S_IMODE(entry_stat.st_mode) != 0o755:
+                        raise _dependency_provisioning_error(
+                            f"trusted {label} snapshot directory does not have "
+                            f"the reviewed cross-UID mode at {path}"
+                        )
+                    continue
+                if not stat.S_ISREG(entry_stat.st_mode) or entry_stat.st_nlink != 1:
+                    raise _dependency_provisioning_error(
+                        f"trusted {label} snapshot contains a special or hard-linked file at {path}"
+                    )
+                if stat.S_IMODE(entry_stat.st_mode) not in {0o644, 0o755}:
+                    raise _dependency_provisioning_error(
+                        f"trusted {label} snapshot file does not have the "
+                        f"reviewed cross-UID mode at {path}"
+                    )
+                if label == "backend Python":
+                    _validate_python_dependency_metadata(path, source)
+                bytes_seen += entry_stat.st_size
+                if bytes_seen > _MAX_DEPENDENCY_TREE_BYTES:
+                    raise _dependency_provisioning_error(
+                        f"trusted {label} snapshot exceeds the byte limit"
+                    )
+    except WorkerTerminalSandboxError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _dependency_provisioning_error(
+            f"trusted {label} snapshot cannot be validated ({exc})"
+        ) from exc
+    return entries_seen, bytes_seen
+
+
+def _validate_projection_destination(
+    workspace: Path,
+    relative: str,
+    *,
+    label: str,
+) -> Path:
+    """Require a missing or empty real destination below the worktree."""
+    destination = workspace / relative
+    parent_relative = str(Path(relative).parent)
+    if parent_relative != ".":
+        _validate_owned_real_path(
+            workspace,
+            parent_relative,
+            label=f"{label} destination parent",
+            kind="directory",
+        )
+    if not _path_lexists(destination):
+        return destination
+    try:
+        destination_stat = destination.lstat()
+        if (
+            stat.S_ISLNK(destination_stat.st_mode)
+            or not stat.S_ISDIR(destination_stat.st_mode)
+            or destination_stat.st_uid != os.getuid()
+            or destination.resolve(strict=True).parent
+            != (workspace / relative).parent.resolve(strict=True)
+        ):
+            raise _dependency_provisioning_error(
+                f"{label} destination is symlinked, unowned, or outside the worktree"
+            )
+        with os.scandir(destination) as entries:
+            if next(entries, None) is not None:
+                raise _dependency_provisioning_error(
+                    f"{label} destination is already populated"
+                )
+    except WorkerTerminalSandboxError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise _dependency_provisioning_error(
+            f"{label} destination cannot be validated ({exc})"
+        ) from exc
+    return destination
+
+
+def _candidate_manifest_hashes(
+    workspace: Path,
+    relatives: tuple[str, ...],
+    *,
+    label: str,
+) -> tuple[tuple[Path, str], ...]:
+    """Hash exact candidate manifests without trusting a mutable checkout."""
+    retained: list[tuple[Path, str]] = []
+    for relative in relatives:
+        candidate_path, candidate_hash = _hash_owned_manifest(
+            workspace,
+            relative,
+            label=f"task {label} manifest {relative}",
+        )
+        retained.append((candidate_path, candidate_hash))
+    return tuple(retained)
+
+
+def _dependency_manifest_digest(
+    workspace: Path,
+    manifest_hashes: tuple[tuple[Path, str], ...],
+) -> str:
+    """Return the stable snapshot key for the candidate manifest set."""
+    items: dict[str, str] = {}
+    for path, digest in manifest_hashes:
+        try:
+            relative = path.relative_to(workspace).as_posix()
+        except ValueError:
+            continue
+        items[relative] = digest
+    # Import lazily: the root provisioner uses Linux-only modules, while this
+    # terminal backend is imported on every platform. The production delivery
+    # path is Linux-only and must share the provisioner's policy-versioned
+    # identity exactly so an older default-only Python tree cannot be reused.
+    from hermes_cli.dependency_provisioner import _manifest_digest
+
+    return _manifest_digest(items)
+
+
+def _validate_snapshot_path(
+    root: Path,
+    relative: str,
+    *,
+    label: str,
+    kind: str,
+) -> tuple[Path, os.stat_result]:
+    """Validate a root-owned, non-writable, no-symlink snapshot path."""
+    try:
+        root_stat = root.lstat()
+        if (
+            stat.S_ISLNK(root_stat.st_mode)
+            or not stat.S_ISDIR(root_stat.st_mode)
+            or root_stat.st_uid != _DEPENDENCY_SNAPSHOT_OWNER_UID
+            or stat.S_IMODE(root_stat.st_mode) != 0o755
+            or root.resolve(strict=True) != root
+        ):
+            raise _dependency_provisioning_error(
+                f"{label} snapshot root is not trusted and immutable"
+            )
+        current = root
+        current_stat = root_stat
+        parts = Path(relative).parts
+        if not parts or Path(relative).is_absolute() or ".." in parts:
+            raise _dependency_provisioning_error(
+                f"{label} snapshot path is unsafe"
+            )
+        for index, part in enumerate(parts):
+            current = current / part
+            current_stat = current.lstat()
+            if (
+                stat.S_ISLNK(current_stat.st_mode)
+                or current_stat.st_uid != _DEPENDENCY_SNAPSHOT_OWNER_UID
+                or stat.S_IMODE(current_stat.st_mode) & 0o022
+            ):
+                raise _dependency_provisioning_error(
+                    f"{label} snapshot path is symlinked, unowned, or writable at {current}"
+                )
+            if index < len(parts) - 1 and not stat.S_ISDIR(current_stat.st_mode):
+                raise _dependency_provisioning_error(
+                    f"{label} snapshot parent is not a directory at {current}"
+                )
+            if (
+                stat.S_ISDIR(current_stat.st_mode)
+                and stat.S_IMODE(current_stat.st_mode) != 0o755
+            ):
+                raise _dependency_provisioning_error(
+                    f"{label} snapshot directory is not worker-traversable at {current}"
+                )
+        if kind == "file" and not stat.S_ISREG(current_stat.st_mode):
+            raise _dependency_provisioning_error(
+                f"{label} snapshot path is not a regular file"
+            )
+        if kind == "file" and stat.S_IMODE(current_stat.st_mode) != 0o644:
+            raise _dependency_provisioning_error(
+                f"{label} snapshot file is not worker-readable"
+            )
+        if kind == "directory" and not stat.S_ISDIR(current_stat.st_mode):
+            raise _dependency_provisioning_error(
+                f"{label} snapshot path is not a directory"
+            )
+        current.resolve(strict=True).relative_to(root)
+        return current, current_stat
+    except WorkerTerminalSandboxError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _dependency_provisioning_error(
+            f"{label} snapshot path cannot be validated ({exc})"
+        ) from exc
+
+
+def _read_dependency_snapshot_attestation(
+    snapshot: Path,
+    manifest_digest: str,
+    expected_manifests: Mapping[str, str],
+) -> tuple[dict, Path, str]:
+    """Load the small root-owned attestation anchoring immutable tree contents."""
+    try:
+        base_stat = _DEPENDENCY_SNAPSHOT_ROOT.lstat()
+        if (
+            snapshot.parent != _DEPENDENCY_SNAPSHOT_ROOT
+            or snapshot.name != manifest_digest
+            or not re.fullmatch(r"[0-9a-f]{64}", manifest_digest)
+            or stat.S_ISLNK(base_stat.st_mode)
+            or not stat.S_ISDIR(base_stat.st_mode)
+            or base_stat.st_uid != _DEPENDENCY_SNAPSHOT_OWNER_UID
+            or stat.S_IMODE(base_stat.st_mode) != 0o755
+            or _DEPENDENCY_SNAPSHOT_ROOT.resolve(strict=True)
+            != _DEPENDENCY_SNAPSHOT_ROOT
+        ):
+            raise _dependency_provisioning_error(
+                "trusted dependency snapshot root is missing, writable, or symlinked"
+            )
+    except WorkerTerminalSandboxError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise _dependency_provisioning_error(
+            f"trusted dependency snapshot root is unavailable ({exc})"
+        ) from exc
+    attestation_path, before = _validate_snapshot_path(
+        snapshot,
+        "attestation.json",
+        label="dependency",
+        kind="file",
+    )
+    if before.st_size > 1024 * 1024:
+        raise _dependency_provisioning_error("dependency attestation exceeds 1 MiB")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(attestation_path, flags)
+        try:
+            opened = os.fstat(fd)
+            if (
+                opened.st_dev != before.st_dev
+                or opened.st_ino != before.st_ino
+                or opened.st_uid != _DEPENDENCY_SNAPSHOT_OWNER_UID
+            ):
+                raise _dependency_provisioning_error(
+                    "dependency attestation changed during validation"
+                )
+            payload = os.read(fd, before.st_size + 1)
+        finally:
+            os.close(fd)
+        data = json.loads(payload.decode("utf-8"))
+        from hermes_cli.dependency_provisioner import (
+            DEPENDENCY_BUILD_POLICY,
+            SNAPSHOT_ATTESTATION_VERSION,
+        )
+    except WorkerTerminalSandboxError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _dependency_provisioning_error(
+            f"dependency attestation is unreadable or invalid ({exc})"
+        ) from exc
+    if (
+        not isinstance(data, dict)
+        or data.get("version") != SNAPSHOT_ATTESTATION_VERSION
+        or data.get("build_policy") != DEPENDENCY_BUILD_POLICY
+        or data.get("manifest_sha256") != manifest_digest
+        or data.get("manifests") != dict(expected_manifests)
+        or not isinstance(data.get("trees"), dict)
+    ):
+        raise _dependency_provisioning_error(
+            "dependency attestation does not match the exact manifest digest"
+        )
+    return data, attestation_path, hashlib.sha256(payload).hexdigest()
+
+
+def _attested_tree_record(attestation: dict, key: str, *, label: str) -> dict:
+    record = attestation["trees"].get(key)
+    if not isinstance(record, dict):
+        raise _dependency_provisioning_error(
+            f"dependency attestation has no {label} tree"
+        )
+    sha256 = record.get("sha256")
+    entries = record.get("entries")
+    byte_count = record.get("bytes")
+    if (
+        not isinstance(sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", sha256)
+        or not isinstance(entries, int)
+        or entries < 0
+        or not isinstance(byte_count, int)
+        or byte_count < 0
+    ):
+        raise _dependency_provisioning_error(
+            f"dependency attestation has invalid {label} tree metadata"
+        )
+    return record
+
+
+def _resolve_trusted_dependency_projections_once(
+    workspace: str | Path,
+) -> tuple[_DependencyProjection, ...]:
+    """Resolve exact manifests to immutable root-owned dependency snapshots."""
+    workspace = Path(workspace).expanduser()
+    try:
+        workspace_stat = workspace.lstat()
+        if (
+            not workspace.is_absolute()
+            or stat.S_ISLNK(workspace_stat.st_mode)
+            or not stat.S_ISDIR(workspace_stat.st_mode)
+            or workspace_stat.st_uid != os.getuid()
+            or workspace.resolve(strict=True) != workspace
+        ):
+            raise _dependency_provisioning_error(
+                "candidate workspace is symlinked, unowned, or not an absolute real directory"
+            )
+    except WorkerTerminalSandboxError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise _dependency_provisioning_error(
+            f"candidate workspace cannot be validated ({exc})"
+        ) from exc
+    node_declared = _path_lexists(workspace / "package.json") or any(
+        _path_lexists(workspace / lockfile) for lockfile in _NODE_LOCKFILES
+    )
+    python_declared = _path_lexists(workspace / "backend" / "pyproject.toml") or _path_lexists(
+        workspace / "backend" / "uv.lock"
+    )
+    if not node_declared and not python_declared:
+        return ()
+    node_manifest_hashes: tuple[tuple[Path, str], ...] = ()
+    python_manifest_hashes: tuple[tuple[Path, str], ...] = ()
+
+    if node_declared:
+        candidate_locks = tuple(
+            lockfile
+            for lockfile in _NODE_LOCKFILES
+            if _path_lexists(workspace / lockfile)
+        )
+        if not _path_lexists(workspace / "package.json") or not candidate_locks:
+            raise _dependency_provisioning_error(
+                "Node dependencies require package.json and a supported lockfile"
+            )
+        node_manifest_hashes = _candidate_manifest_hashes(
+            workspace,
+            ("package.json", *candidate_locks),
+            label="Node",
+        )
+
+    if python_declared:
+        python_manifests = ("backend/pyproject.toml", "backend/uv.lock")
+        if not all(_path_lexists(workspace / path) for path in python_manifests):
+            raise _dependency_provisioning_error(
+                "backend Python dependencies require pyproject.toml and uv.lock"
+            )
+        python_manifest_hashes = _candidate_manifest_hashes(
+            workspace,
+            python_manifests,
+            label="backend Python",
+        )
+
+    all_manifest_hashes = node_manifest_hashes + python_manifest_hashes
+    manifest_digest = _dependency_manifest_digest(workspace, all_manifest_hashes)
+    expected_manifests = {
+        path.relative_to(workspace).as_posix(): digest
+        for path, digest in all_manifest_hashes
+    }
+    snapshot = _DEPENDENCY_SNAPSHOT_ROOT / manifest_digest
+    attestation, attestation_path, attestation_sha256 = (
+        _read_dependency_snapshot_attestation(
+            snapshot,
+            manifest_digest,
+            expected_manifests,
+        )
+    )
+    from hermes_cli.dependency_provisioner import (
+        _canonical_json,
+        _expected_python_runtime_binding,
+    )
+
+    expected_python_runtime = _expected_python_runtime_binding()
+    expected_python_runtime_sha256 = hashlib.sha256(
+        _canonical_json(expected_python_runtime) + b"\n"
+    ).hexdigest()
+    if python_declared:
+        if (
+            attestation.get("python_runtime") != expected_python_runtime
+            or attestation.get("python_runtime_sha256")
+            != expected_python_runtime_sha256
+        ):
+            raise _dependency_provisioning_error(
+                "backend Python snapshot does not match the reviewed "
+                "interpreter and SQLite runtime policy"
+            )
+    elif (
+        "python_runtime" in attestation
+        or "python_runtime_sha256" in attestation
+    ):
+        raise _dependency_provisioning_error(
+            "dependency attestation has unexpected Python runtime metadata"
+        )
+    projections: list[_DependencyProjection] = []
+
+    def add_projection(
+        *,
+        label: str,
+        snapshot_relative: str,
+        destination_relative: str,
+        manifest_hashes: tuple[tuple[Path, str], ...],
+    ) -> None:
+        record = _attested_tree_record(
+            attestation,
+            snapshot_relative,
+            label=label,
+        )
+        if label == "backend Python":
+            from hermes_cli.dependency_provisioner import PYTHON_INSTALL_MODE
+
+            if record.get("install_mode") != PYTHON_INSTALL_MODE:
+                raise _dependency_provisioning_error(
+                    "backend Python snapshot does not match the reviewed "
+                    "locked dev-extra install policy"
+                )
+        source, source_stat = _validate_snapshot_path(
+            snapshot,
+            snapshot_relative,
+            label=label,
+            kind="directory",
+        )
+        observed_entries, observed_bytes = _validate_dependency_snapshot_tree(
+            source,
+            label=label,
+        )
+        if (
+            observed_entries != record["entries"]
+            or observed_bytes != record["bytes"]
+        ):
+            raise _dependency_provisioning_error(
+                f"trusted {label} snapshot metadata differs from its root-owned attestation"
+            )
+        destination = _validate_projection_destination(
+            workspace,
+            destination_relative,
+            label=f"{label} dependency projection",
+        )
+        projections.append(
+            _DependencyProjection(
+                label=label,
+                source=source,
+                destination=destination,
+                source_device=source_stat.st_dev,
+                source_inode=source_stat.st_ino,
+                source_mode=stat.S_IMODE(source_stat.st_mode),
+                tree_sha256=record["sha256"],
+                tree_entries=record["entries"],
+                tree_bytes=record["bytes"],
+                attestation_path=attestation_path,
+                attestation_sha256=attestation_sha256,
+                manifest_hashes=manifest_hashes,
+            )
+        )
+
+    if node_declared:
+        add_projection(
+            label="Node",
+            snapshot_relative="node_modules",
+            destination_relative="node_modules",
+            manifest_hashes=node_manifest_hashes,
+        )
+    if python_declared:
+        add_projection(
+            label="backend Python",
+            snapshot_relative="backend/.venv",
+            destination_relative="backend/.venv",
+            manifest_hashes=python_manifest_hashes,
+        )
+    return tuple(projections)
+
+
+def resolve_trusted_dependency_projections(
+    workspace: str | Path,
+) -> tuple[_DependencyProjection, ...]:
+    """Resolve snapshots, asking the root provisioner once when missing.
+
+    Fixture/custom roots stay purely local. Production worktrees use the
+    socket-activated trusted provisioner, then re-run every consumer-side
+    validation from scratch. If the socket or immutable toolchain has not
+    been activated, the worker remains fail-closed with an actionable error.
+    """
+    try:
+        return _resolve_trusted_dependency_projections_once(workspace)
+    except WorkerTerminalSandboxError as original:
+        if _DEPENDENCY_SNAPSHOT_ROOT != _PRODUCTION_DEPENDENCY_SNAPSHOT_ROOT:
+            raise
+        try:
+            from hermes_cli.dependency_provisioner import (
+                DependencyProvisionError,
+                request_dependency_snapshot,
+            )
+
+            request_dependency_snapshot(Path(workspace))
+        except (DependencyProvisionError, OSError, RuntimeError, ImportError) as exc:
+            raise _dependency_provisioning_error(
+                f"automatic trusted provisioning failed ({exc})"
+            ) from original
+        return _resolve_trusted_dependency_projections_once(workspace)
+
+
+def _git_output(args: list[str], *, cwd: Path | None = None) -> str:
+    """Run trusted Git plumbing without consulting host user configuration."""
+    env = {
+        "PATH": _WORKER_SAFE_PATH,
+        "HOME": "/nonexistent-hermes-worker-home",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+        "SSH_ASKPASS": "/bin/false",
+        "LANG": "C.UTF-8",
+    }
+    proc = subprocess.run(
+        ["/usr/bin/git", *args],
+        cwd=str(cwd) if cwd is not None else None,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "git command failed").strip()
+        raise WorkerTerminalSandboxError(detail[:1000])
+    return proc.stdout.strip()
+
+
+def _trusted_git_environment() -> dict[str, str]:
+    """Minimal Git plumbing environment with no host/profile configuration."""
+    return {
+        "PATH": _WORKER_SAFE_PATH,
+        "HOME": "/nonexistent-hermes-worker-home",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+        "SSH_ASKPASS": "/bin/false",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+
+
+def _git_bytes(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    input_bytes: bytes | None = None,
+    timeout: int = 60,
+) -> bytes:
+    """Run fixed Git plumbing and return bytes without lossy path decoding."""
+    proc = subprocess.run(
+        ["/usr/bin/git", *args],
+        cwd=str(cwd) if cwd is not None else None,
+        env=_trusted_git_environment(),
+        input=input_bytes,
+        stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise WorkerTerminalSandboxError(
+            (detail or "trusted Git plumbing failed")[:1000]
+        )
+    return proc.stdout
+
+
+def _validate_delivery_mirror_objects(
+    mirror: Path,
+    *,
+    owner_uid: int,
+    owner_gid: int,
+) -> Path:
+    """Require a real, private, immutable-content Git object store.
+
+    The controller mirror may be group-writable because its fixed UID and GID
+    are the same trusted service identity.  No component may be accessible to
+    ``other`` users, symlinked, hard-linked, or redirect object lookup through
+    an alternates file.
+    """
+    try:
+        mirror = Path(mirror)
+        if not mirror.is_absolute() or mirror.resolve(strict=True) != mirror:
+            raise WorkerTerminalSandboxError(
+                "trusted delivery mirror is not an exact real path"
+            )
+        objects = mirror / "objects"
+        for path in (mirror, objects):
+            metadata = path.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != owner_uid
+                or metadata.st_gid != owner_gid
+                or stat.S_IMODE(metadata.st_mode) & 0o007
+            ):
+                raise WorkerTerminalSandboxError(
+                    "trusted delivery mirror ownership or mode is unsafe"
+                )
+        for redirect in (
+            objects / "info" / "alternates",
+            objects / "info" / "http-alternates",
+        ):
+            if os.path.lexists(redirect):
+                raise WorkerTerminalSandboxError(
+                    "trusted delivery mirror object redirects are forbidden"
+                )
+        for path in objects.rglob("*"):
+            metadata = path.lstat()
+            if (
+                stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != owner_uid
+                or metadata.st_gid != owner_gid
+                or stat.S_IMODE(metadata.st_mode) & 0o007
+                or not (
+                    stat.S_ISDIR(metadata.st_mode)
+                    or stat.S_ISREG(metadata.st_mode)
+                )
+                or (
+                    stat.S_ISREG(metadata.st_mode)
+                    and metadata.st_nlink != 1
+                )
+            ):
+                raise WorkerTerminalSandboxError(
+                    "trusted delivery mirror object tree is unsafe"
+                )
+        return objects
+    except WorkerTerminalSandboxError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise WorkerTerminalSandboxError(
+            f"trusted delivery mirror is unavailable: {exc}"
+        ) from exc
+
+
+def _validate_acceptance_revision_inputs(
+    candidate_sha: str,
+    base_sha: str,
+    base_ref: str,
+) -> None:
+    if (
+        not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", candidate_sha)
+        or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base_sha)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", base_ref)
+        or ".." in Path(base_ref).parts
+        or base_ref.startswith(("/", "-"))
+        or base_ref.endswith("/")
+    ):
+        raise WorkerTerminalSandboxError(
+            "acceptance Git overlay requires exact candidate/base object IDs "
+            "and a safe base ref"
+        )
+
+
+def _prepare_acceptance_overlay_from_mirror(
+    workspace: Path,
+    sandbox_home: Path,
+    mirror: Path,
+    *,
+    candidate_sha: str,
+    base_sha: str,
+    base_ref: str,
+    owner_uid: int,
+    owner_gid: int,
+) -> _LinkedWorktreeGit:
+    """Build private refs/index using only a validated mirror object store."""
+    _validate_acceptance_revision_inputs(candidate_sha, base_sha, base_ref)
+    common_objects = _validate_delivery_mirror_objects(
+        mirror,
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
+    private_gitdir = sandbox_home / "acceptance-git"
+    pointer_file = sandbox_home / "acceptance-worktree.git"
+    empty_template = sandbox_home / "empty-git-template"
+    if any(
+        _path_lexists(path)
+        for path in (private_gitdir, pointer_file, empty_template)
+    ):
+        raise WorkerTerminalSandboxError("acceptance Git HOME is not fresh")
+    empty_template.mkdir(mode=0o700)
+    object_format = "sha256" if len(candidate_sha) == 64 else "sha1"
+    init_args = [
+        "init", "--bare", "--quiet", f"--template={empty_template}",
+    ]
+    if object_format != "sha1":
+        init_args.append(f"--object-format={object_format}")
+    init_args.append(str(private_gitdir))
+    _git_output(init_args)
+    for key, value in (
+        ("core.bare", "false"),
+        ("core.worktree", str(workspace)),
+        ("core.hooksPath", "/dev/null"),
+        ("core.fsmonitor", "false"),
+        ("credential.helper", ""),
+        ("credential.interactive", "false"),
+        ("gc.auto", "0"),
+    ):
+        _git_output([f"--git-dir={private_gitdir}", "config", key, value])
+    alternates = private_gitdir / "objects" / "info" / "alternates"
+    alternates.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    alternates.write_text(str(common_objects) + "\n", encoding="utf-8")
+    os.chmod(alternates, 0o600)
+    for label, object_id in (("candidate", candidate_sha), ("base", base_sha)):
+        if _git_output([
+            f"--git-dir={private_gitdir}", "cat-file", "-t", object_id,
+        ]) != "commit":
+            raise WorkerTerminalSandboxError(
+                f"acceptance {label} object is not a commit"
+            )
+    _git_output([
+        f"--git-dir={private_gitdir}", "update-ref",
+        f"refs/remotes/origin/{base_ref}", base_sha,
+    ])
+    (private_gitdir / "HEAD").write_text(candidate_sha + "\n", encoding="ascii")
+    os.chmod(private_gitdir / "HEAD", 0o600)
+    _git_output([f"--git-dir={private_gitdir}", "read-tree", candidate_sha])
+    return _LinkedWorktreeGit(
+        host_gitdir=mirror,
+        common_dir=mirror,
+        common_objects=common_objects,
+        branch=f"refs/remotes/origin/{base_ref}",
+        host_head=candidate_sha,
+        private_gitdir=private_gitdir,
+        pointer_file=pointer_file,
+    )
+
+
+def _acceptance_tree_entries(
+    git_overlay: _LinkedWorktreeGit,
+    candidate_sha: str,
+) -> list[tuple[str, str, str]]:
+    raw = _git_bytes([
+        f"--git-dir={git_overlay.private_gitdir}",
+        "ls-tree", "-r", "-z", "--full-tree", candidate_sha,
+    ])
+    entries: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        try:
+            header, raw_path = record.split(b"\t", 1)
+            mode_bytes, object_type, object_id = header.split(b" ", 2)
+            relative = raw_path.decode("utf-8", errors="strict")
+            mode = mode_bytes.decode("ascii")
+            object_id_text = object_id.decode("ascii")
+        except (ValueError, UnicodeError) as exc:
+            raise WorkerTerminalSandboxError(
+                "candidate Git tree contains an unsupported path or record"
+            ) from exc
+        parts = Path(relative).parts
+        if (
+            object_type != b"blob"
+            or mode not in {"100644", "100755", "120000"}
+            or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id_text)
+            or not relative
+            or relative.startswith("/")
+            or any(part in {"", ".", "..", ".git"} for part in parts)
+            or relative in seen
+            or len(relative.encode("utf-8")) > 4096
+        ):
+            raise WorkerTerminalSandboxError(
+                "candidate Git tree contains an unsafe entry"
+            )
+        seen.add(relative)
+        entries.append((relative, mode, object_id_text))
+        if len(entries) > _MAX_ACCEPTANCE_TREE_ENTRIES:
+            raise WorkerTerminalSandboxError(
+                "candidate Git tree exceeds the acceptance entry limit"
+            )
+    return entries
+
+
+def _read_exact_stream(stream: object, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)  # type: ignore[attr-defined]
+        if not chunk:
+            raise WorkerTerminalSandboxError(
+                "candidate Git blob stream ended unexpectedly"
+            )
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _materialize_acceptance_tree(
+    workspace: Path,
+    git_overlay: _LinkedWorktreeGit,
+    candidate_sha: str,
+) -> None:
+    """Write exact candidate blobs; never invoke checkout filters or hooks."""
+    entries = _acceptance_tree_entries(git_overlay, candidate_sha)
+    argv = [
+        "/usr/bin/git", f"--git-dir={git_overlay.private_gitdir}",
+        "cat-file", "--batch",
+    ]
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(workspace),
+        env=_trusted_git_environment(),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.stdin is None or proc.stdout is None or proc.stderr is None:
+        proc.kill()
+        raise WorkerTerminalSandboxError("candidate Git blob reader is unavailable")
+    total_bytes = 0
+    try:
+        for relative, mode, object_id in entries:
+            proc.stdin.write(object_id.encode("ascii") + b"\n")
+            proc.stdin.flush()
+            header = proc.stdout.readline()
+            try:
+                observed_id, object_type, raw_size = header.rstrip(b"\n").split(b" ")
+                size = int(raw_size)
+            except (TypeError, ValueError) as exc:
+                raise WorkerTerminalSandboxError(
+                    "candidate Git blob response is invalid"
+                ) from exc
+            if (
+                observed_id.decode("ascii", errors="ignore") != object_id
+                or object_type != b"blob"
+                or size < 0
+            ):
+                raise WorkerTerminalSandboxError(
+                    "candidate Git blob identity is inconsistent"
+                )
+            total_bytes += size
+            if total_bytes > _MAX_ACCEPTANCE_TREE_BYTES:
+                raise WorkerTerminalSandboxError(
+                    "candidate Git tree exceeds the acceptance byte limit"
+                )
+            if size > _MAX_ACCEPTANCE_BLOB_BYTES:
+                raise WorkerTerminalSandboxError(
+                    "candidate Git blob exceeds the acceptance byte limit"
+                )
+            destination = workspace / relative
+            destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+            if destination.parent.resolve(strict=True) != destination.parent:
+                raise WorkerTerminalSandboxError(
+                    "candidate Git tree parent became symlinked"
+                )
+            if mode == "120000":
+                if size > _MAX_ACCEPTANCE_SYMLINK_BYTES:
+                    raise WorkerTerminalSandboxError(
+                        "candidate Git symlink target is oversized"
+                    )
+                payload = _read_exact_stream(proc.stdout, size)
+                try:
+                    target = payload.decode("utf-8", errors="strict")
+                except UnicodeError as exc:
+                    raise WorkerTerminalSandboxError(
+                        "candidate Git symlink target is not UTF-8"
+                    ) from exc
+                combined = posixpath.normpath(
+                    posixpath.join(posixpath.dirname(relative), target)
+                )
+                if (
+                    not target
+                    or posixpath.isabs(target)
+                    or combined == ".."
+                    or combined.startswith("../")
+                ):
+                    raise WorkerTerminalSandboxError(
+                        "candidate Git symlink escapes the acceptance workspace"
+                    )
+                os.symlink(target, destination)
+            else:
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(
+                    os, "O_CLOEXEC", 0
+                )
+                if hasattr(os, "O_NOFOLLOW"):
+                    flags |= os.O_NOFOLLOW
+                descriptor = os.open(
+                    destination,
+                    flags,
+                    0o755 if mode == "100755" else 0o644,
+                )
+                try:
+                    remaining = size
+                    while remaining:
+                        chunk = proc.stdout.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise WorkerTerminalSandboxError(
+                                "candidate Git blob stream ended unexpectedly"
+                            )
+                        view = memoryview(chunk)
+                        while view:
+                            written = os.write(descriptor, view)
+                            if written <= 0:
+                                raise OSError("short candidate blob write")
+                            view = view[written:]
+                        remaining -= len(chunk)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            if proc.stdout.read(1) != b"\n":
+                raise WorkerTerminalSandboxError(
+                    "candidate Git blob framing is invalid"
+                )
+        proc.stdin.close()
+        returncode = proc.wait(timeout=60)
+        if returncode != 0:
+            detail = proc.stderr.read().decode("utf-8", errors="replace")
+            raise WorkerTerminalSandboxError(
+                (detail.strip() or "candidate Git blob reader failed")[:1000]
+            )
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        proc.wait(timeout=10)
+        raise
+
+
+@contextlib.contextmanager
+def delivery_acceptance_candidate(
+    *,
+    task_id: str,
+    candidate_sha: str,
+    base_sha: str,
+    base_ref: str = "main",
+    mirror: str | Path | None = None,
+    acceptance_root: str | Path | None = None,
+) -> Iterator[tuple[Path, Path, _LinkedWorktreeGit]]:
+    """Project an exact candidate from the controller mirror and clean it up.
+
+    The projection is entirely below the fixed controller state directory and
+    never invokes ``git checkout``/``worktree``, repository filters, hooks, or
+    shared ref/index mutation.  The yielded workspace is intended for
+    ``build_delivery_sandbox_argv(..., workspace_writable=False)``.
+    """
+    if not re.fullmatch(r"t_[0-9a-f]{8}", task_id):
+        raise WorkerTerminalSandboxError("acceptance task identity is invalid")
+    _validate_acceptance_revision_inputs(candidate_sha, base_sha, base_ref)
+    mirror_path = Path(mirror) if mirror is not None else _DELIVERY_MIRROR
+    root = (
+        Path(acceptance_root)
+        if acceptance_root is not None
+        else _DELIVERY_ACCEPTANCE_ROOT
+    )
+    owner_uid = os.getuid()
+    owner_gid = os.getgid()
+    try:
+        metadata = root.lstat()
+        if (
+            not root.is_absolute()
+            or root.resolve(strict=True) != root
+            or stat.S_ISLNK(metadata.st_mode)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != owner_uid
+            or metadata.st_gid != owner_gid
+            or stat.S_IMODE(metadata.st_mode) & 0o007
+        ):
+            raise WorkerTerminalSandboxError(
+                "acceptance projection root ownership or mode is unsafe"
+            )
+    except WorkerTerminalSandboxError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise WorkerTerminalSandboxError(
+            f"acceptance projection root is unavailable: {exc}"
+        ) from exc
+    session_root = Path(tempfile.mkdtemp(
+        prefix=f"acceptance-{task_id}-", dir=root,
+    ))
+    workspace = session_root / "candidate"
+    sandbox_home = session_root / "home"
+    workspace.mkdir(mode=0o700)
+    sandbox_home.mkdir(mode=0o700)
+    try:
+        overlay = _prepare_acceptance_overlay_from_mirror(
+            workspace,
+            sandbox_home,
+            mirror_path,
+            candidate_sha=candidate_sha,
+            base_sha=base_sha,
+            base_ref=base_ref,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+        _materialize_acceptance_tree(workspace, overlay, candidate_sha)
+        overlay.pointer_file.write_text(
+            f"gitdir: {overlay.private_gitdir}\n", encoding="utf-8",
+        )
+        os.chmod(overlay.pointer_file, 0o600)
+        (workspace / ".git").write_text(
+            f"gitdir: {overlay.private_gitdir}\n", encoding="utf-8",
+        )
+        os.chmod(workspace / ".git", 0o600)
+        if (
+            _git_output(["-C", str(workspace), "rev-parse", "HEAD"]).lower()
+            != candidate_sha
+            or _git_output([
+                "-C", str(workspace), "status", "--porcelain=v1",
+                "--untracked-files=no",
+            ])
+        ):
+            raise WorkerTerminalSandboxError(
+                "acceptance candidate projection is not the exact clean revision"
+            )
+        yield workspace, sandbox_home, overlay
+    finally:
+        if (
+            session_root.parent == root
+            and session_root.name.startswith(f"acceptance-{task_id}-")
+            and session_root.resolve(strict=False).parent == root
+        ):
+            shutil.rmtree(session_root, ignore_errors=True)
+
+
+_WORKER_SAFE_ENV_NAMES = frozenset({
+    "CI",
+    "CLICOLOR",
+    "CLICOLOR_FORCE",
+    "COLORTERM",
+    "FORCE_COLOR",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "NO_COLOR",
+    "TERM",
+    "TZ",
+})
+
+
+_WORKER_SAFE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def _worker_terminal_env(
+    run_env: Mapping[str, str],
+    sandbox_home: Path,
+    dependency_projections: tuple[_DependencyProjection, ...] = (),
+) -> dict[str, str]:
+    """Return a clean environment for a sandboxed worker shell.
+
+    The agent process may hold provider, GitHub, cloud, SSH, or desktop-session
+    credentials. The terminal gets a fixed non-secret baseline. Credentials
+    must arrive later through a separately isolated short-lived broker; no
+    profile/env setting can widen this allowlist from inside a worker.
+    """
+    allowed = set(_WORKER_SAFE_ENV_NAMES)
+    clean = {
+        key: str(value)
+        for key, value in run_env.items()
+        if key in allowed and value is not None
+    }
+    clean.update({
+        "PATH": _WORKER_SAFE_PATH,
+        "HOME": str(sandbox_home),
+        "SHELL": "/bin/bash",
+        "TMPDIR": str(sandbox_home / "tmp"),
+        "TMP": str(sandbox_home / "tmp"),
+        "TEMP": str(sandbox_home / "tmp"),
+        "XDG_CACHE_HOME": str(sandbox_home / ".cache"),
+        "XDG_CONFIG_HOME": str(sandbox_home / ".config"),
+        "XDG_DATA_HOME": str(sandbox_home / ".local" / "share"),
+        "XDG_RUNTIME_DIR": str(sandbox_home / "run"),
+        "GNUPGHOME": str(sandbox_home / ".gnupg"),
+        "DOCKER_CONFIG": str(sandbox_home / ".docker"),
+        "KUBECONFIG": str(sandbox_home / ".kube" / "config"),
+        "GH_CONFIG_DIR": str(sandbox_home / ".config" / "gh"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        # /etc is inaccessible in the terminal unit. Tell Git not to probe
+        # the host-wide attributes file, avoiding both information-bearing
+        # warnings and a false nonzero `git diff --check` result.
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+        "SSH_ASKPASS": "/bin/false",
+        # Language/package-manager caches must never write through a shared
+        # dependency projection or back into project source.
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPYCACHEPREFIX": str(sandbox_home / ".cache" / "python" / "pycache"),
+        "PIP_CACHE_DIR": str(sandbox_home / ".cache" / "pip"),
+        "UV_CACHE_DIR": str(sandbox_home / ".cache" / "uv"),
+        "RUFF_CACHE_DIR": str(sandbox_home / ".cache" / "ruff"),
+        "MYPY_CACHE_DIR": str(sandbox_home / ".cache" / "mypy"),
+        "PRE_COMMIT_HOME": str(sandbox_home / ".cache" / "pre-commit"),
+        "NPM_CONFIG_CACHE": str(sandbox_home / ".cache" / "npm"),
+        "npm_config_cache": str(sandbox_home / ".cache" / "npm"),
+        "YARN_CACHE_FOLDER": str(sandbox_home / ".cache" / "yarn"),
+        "COREPACK_HOME": str(sandbox_home / ".cache" / "corepack"),
+        "PNPM_HOME": str(sandbox_home / ".local" / "share" / "pnpm"),
+        # /etc is intentionally absent. Node's OpenSSL bootstrap otherwise
+        # treats the inaccessible host config as fatal even for local,
+        # no-network test execution. An empty trusted config preserves crypto
+        # primitives without re-exposing host-wide /etc.
+        "OPENSSL_CONF": "/dev/null",
+        "HERMES_WORKER_SANDBOX": _KANBAN_TERMINAL_SANDBOX_VERSION,
+        # Delivery workers receive an isolated network namespace. Publishing,
+        # deployment, and dependency provisioning belong to the trusted control
+        # plane; a worker shell must not reach host-local or metadata services.
+        "HERMES_WORKER_NETWORK_POLICY": "isolated-no-network",
+    })
+    clean.setdefault("GIT_AUTHOR_NAME", "Hermes Kanban Worker")
+    clean.setdefault("GIT_AUTHOR_EMAIL", "hermes-kanban@localhost")
+    clean.setdefault("GIT_COMMITTER_NAME", clean["GIT_AUTHOR_NAME"])
+    clean.setdefault("GIT_COMMITTER_EMAIL", clean["GIT_AUTHOR_EMAIL"])
+    for projection in dependency_projections:
+        if projection.label == "backend Python":
+            clean["VIRTUAL_ENV"] = str(projection.destination)
+            workspace = projection.destination.parent.parent
+            clean["PYTHONPATH"] = (
+                f"{workspace / 'backend'}{os.pathsep}{workspace}"
+            )
+            break
+    clean["LANG"] = "C.UTF-8"
+    clean["TZ"] = "UTC"
+    for directory in (
+        sandbox_home / "tmp",
+        sandbox_home / ".cache",
+        sandbox_home / ".config",
+        sandbox_home / ".local" / "share",
+        sandbox_home / "run",
+        sandbox_home / ".gnupg",
+        sandbox_home / ".docker",
+        sandbox_home / ".kube",
+        sandbox_home / ".cache" / "python" / "pycache",
+    ):
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return clean
+
+
+def _systemd_user_client_env() -> dict[str, str]:
+    """Return the minimal environment needed to reach this UID's user manager."""
+    runtime_dir = f"/run/user/{os.getuid()}"
+    return {
+        "PATH": _WORKER_SAFE_PATH,
+        "HOME": os.environ.get("HOME", "/nonexistent-hermes-worker-home"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "XDG_RUNTIME_DIR": runtime_dir,
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_dir}/bus",
+    }
+
+
+def _worker_systemd_argv(
+    *,
+    command: list[str],
+    workspace: Path,
+    sandbox_home: Path,
+    run_env: Mapping[str, str],
+    timeout: int,
+    unit_name: str,
+    linked_git: _LinkedWorktreeGit | None,
+    dependency_projections: tuple[_DependencyProjection, ...] = (),
+    workspace_writable: bool = True,
+) -> list[str]:
+    """Build the fail-closed systemd transient-unit argv for one command."""
+    runtime_limit = max(30, int(timeout) + 15)
+    workspace_mount = _systemd_mount_path(workspace, label="worker workspace")
+    home_mount = _systemd_mount_path(sandbox_home, label="worker HOME")
+    argv = [
+        _SYSTEMD_RUN,
+        "--user",
+        f"--unit={unit_name}",
+        "--pipe",
+        "--wait",
+        "--collect",
+        "--quiet",
+        f"--working-directory={workspace_mount}",
+        # Give each command a private namespace with only its own loopback.
+        # This blocks host-local services, cloud metadata, DNS, and internet
+        # egress. Publishing and package provisioning happen outside the worker.
+        "-p", "PrivateNetwork=yes",
+        "-p", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        # Host processes, IPC, devices, keyrings, and namespaces are private.
+        "-p", "PrivatePIDs=yes",
+        "-p", "ProtectProc=invisible",
+        "-p", "ProcSubset=pid",
+        "-p", "PrivateIPC=yes",
+        "-p", "PrivateDevices=yes",
+        "-p", "PrivateTmp=yes",
+        "-p", "PrivateMounts=yes",
+        "-p", "KeyringMode=private",
+        # Host filesystem is immutable and user homes are replaced by tmpfs;
+        # the two exact writable bind mounts below are the only durable writes.
+        "-p", "ProtectHome=tmpfs",
+        "-p", "ProtectSystem=strict",
+        "-p", f"BindPaths={home_mount}",
+        "-p", f"ReadWritePaths={home_mount}",
+        # Hide every host /var entry behind an empty read-only tmpfs. Unlike
+        # InaccessiblePaths=/var, this deliberately permits the exact
+        # candidate, HOME, Git, and root-owned dependency binds nested below
+        # /var for authoritative acceptance.
+        "-p", "TemporaryFileSystem=/var:ro,nodev,nosuid,noexec,mode=0755",
+        # Block the user manager plus the common host-control sockets even if
+        # a distribution exposes one outside ProtectHome's usual paths.
+        "-p", (
+            "InaccessiblePaths="
+            # The terminal needs no host runtime socket or mutable host state.
+            # Hiding the whole trees closes less-obvious same-UID controls
+            # (Tailscale, PostgreSQL, agents) rather than chasing socket names.
+            "-/run -/etc -/sys/fs/cgroup"
+        ),
+        # Privilege and kernel attack-surface reduction.
+        "-p", "NoNewPrivileges=yes",
+        "-p", "CapabilityBoundingSet=",
+        "-p", "AmbientCapabilities=",
+        "-p", "RestrictSUIDSGID=yes",
+        "-p", "RestrictNamespaces=yes",
+        "-p", "LockPersonality=yes",
+        "-p", "RestrictRealtime=yes",
+        "-p", "ProtectClock=yes",
+        "-p", "ProtectHostname=yes",
+        "-p", "ProtectKernelTunables=yes",
+        "-p", "ProtectKernelModules=yes",
+        "-p", "ProtectKernelLogs=yes",
+        "-p", "ProtectControlGroups=yes",
+        "-p", "SystemCallArchitectures=native",
+        # Bound runaway builds and guarantee descendants die with the unit.
+        "-p", f"RuntimeMaxSec={runtime_limit}s",
+        "-p", "TimeoutStopSec=10s",
+        "-p", "KillMode=control-group",
+        "-p", "MemoryMax=8G",
+        "-p", "TasksMax=2048",
+        "-p", "CPUQuota=800%",
+        "-p", "LimitCORE=0",
+        "-p", "UMask=0077",
+    ]
+    if workspace_writable:
+        argv.extend([
+            "-p", f"BindPaths={workspace_mount}",
+            "-p", f"ReadWritePaths={workspace_mount}",
+        ])
+    else:
+        # Authoritative acceptance executes candidate-provided commands. Its
+        # exact detached source must never be writable, including briefly for
+        # a modify/test/revert sequence that a post-run Git check could miss.
+        argv.extend(["-p", f"BindReadOnlyPaths={workspace_mount}"])
+    if linked_git is not None:
+        # Only the immutable/content-addressed object database is visible from
+        # the shared repository. The worktree's .git pointer is overlaid with
+        # private metadata in HOME, so shared refs/config/hooks remain hidden.
+        common_objects_mount = _systemd_mount_path(
+            linked_git.common_objects,
+            label="shared Git objects",
+        )
+        pointer_mount = _systemd_mount_path(
+            linked_git.pointer_file,
+            label="private linked-worktree pointer",
+        )
+        config_mount = _systemd_mount_path(
+            linked_git.private_gitdir / "config",
+            label="private Git config",
+        )
+        head_mount = _systemd_mount_path(
+            linked_git.private_gitdir / "HEAD",
+            label="private Git HEAD",
+        )
+        alternates_mount = _systemd_mount_path(
+            linked_git.private_gitdir / "objects" / "info" / "alternates",
+            label="private Git alternates",
+        )
+        dotgit_mount = _systemd_mount_path(
+            workspace / ".git",
+            label="worktree Git pointer target",
+        )
+        argv.extend([
+            "-p", f"BindReadOnlyPaths={common_objects_mount}",
+            # These parent-created control files cannot be redirected toward
+            # host paths or command-bearing Git configuration by the worker.
+            "-p", f"BindReadOnlyPaths={config_mount}",
+            "-p", f"BindReadOnlyPaths={head_mount}",
+            "-p", f"BindReadOnlyPaths={alternates_mount}",
+            "-p", f"BindReadOnlyPaths={pointer_mount}",
+            "-p", (
+                f"BindReadOnlyPaths={pointer_mount}:{dotgit_mount}"
+            ),
+        ])
+        if not workspace_writable:
+            private_gitdir_mount = _systemd_mount_path(
+                linked_git.private_gitdir,
+                label="private acceptance Git directory",
+            )
+            # HOME stays writable for test caches, but the exact acceptance
+            # HEAD/base/index/config/alternates are a nested read-only bind.
+            argv.extend([
+                "-p", f"BindReadOnlyPaths={private_gitdir_mount}",
+            ])
+    for projection in dependency_projections:
+        source_mount = _systemd_mount_path(
+            projection.source,
+            label=f"trusted {projection.label} dependency source",
+        )
+        destination_mount = _systemd_mount_path(
+            projection.destination,
+            label=f"worktree {projection.label} dependency destination",
+        )
+        argv.extend([
+            "-p",
+            f"BindReadOnlyPaths={source_mount}:{destination_mount}",
+        ])
+    argv.extend(["/usr/bin/env", "-i"])
+    argv.extend(f"{key}={value}" for key, value in sorted(run_env.items()))
+    argv.extend(command)
+    return argv
+
+
+def build_delivery_sandbox_environment(
+    run_env: Mapping[str, str],
+    sandbox_home: str | Path,
+    dependency_projections: tuple[_DependencyProjection, ...] = (),
+) -> dict[str, str]:
+    """Public trusted-control helper for the exact worker/acceptance env."""
+    return _worker_terminal_env(
+        run_env,
+        Path(sandbox_home),
+        dependency_projections,
+    )
+
+
+def build_delivery_sandbox_argv(
+    *,
+    command: list[str],
+    workspace: str | Path,
+    sandbox_home: str | Path,
+    run_env: Mapping[str, str],
+    timeout: int,
+    unit_name: str,
+    dependency_projections: tuple[_DependencyProjection, ...] = (),
+    workspace_writable: bool = True,
+    git_overlay: _LinkedWorktreeGit | None = None,
+) -> list[str]:
+    """Build the shared fail-closed boundary for detached acceptance.
+
+    Trusted callers must pass ``workspace_writable=False`` for authoritative
+    acceptance and supply a private overlay from
+    :func:`delivery_acceptance_candidate`. Worker build mode keeps
+    the backwards-compatible writable default.
+    """
+    return _worker_systemd_argv(
+        command=command,
+        workspace=Path(workspace),
+        sandbox_home=Path(sandbox_home),
+        run_env=run_env,
+        timeout=timeout,
+        unit_name=unit_name,
+        linked_git=git_overlay,
+        dependency_projections=dependency_projections,
+        workspace_writable=workspace_writable,
+    )
+
+
+def delivery_systemd_client_environment() -> dict[str, str]:
+    """Return the minimal host env used to contact the user manager."""
+    return _systemd_user_client_env()
+
+
 def _msys_to_windows_path(cwd: str) -> str:
     """Translate a Git Bash / MSYS-style POSIX path (``/c/Users/x``) to the
     native Windows form (``C:\\Users\\x``) so ``os.path.isdir`` and

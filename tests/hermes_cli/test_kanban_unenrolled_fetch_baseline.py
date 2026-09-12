@@ -5,6 +5,8 @@ tests replace the historical fail-soft observations with the immutable-base
 contract. They neither provide nor simulate required-policy approval.
 """
 
+from tests.hermes_cli.delivery_fixtures import ARTIFACT_CONTRACT
+
 import contextlib
 import importlib
 import json
@@ -92,7 +94,7 @@ def test_failed_fetch_refuses_stale_base_without_materialization_or_spawn(
     attempts = intercept_fetch(kb, monkeypatch, timeout=failure == "actual_timeout")
     stale_base = run_git("-C", str(repo), "rev-parse", "origin/main").stdout.strip()
     with contextlib.closing(kb.connect(db_path=tmp_path / "board.db")) as conn:
-        tid = kb.create_task(conn, title="fixture only", assignee="default", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="fixture only", assignee="default", workspace_kind="worktree", body=ARTIFACT_CONTRACT)
         if lane == "review":
             conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
             conn.commit()
@@ -166,7 +168,7 @@ def test_successful_refresh_persists_exact_base_before_callback(
     attempts = intercept_fetch(kb, monkeypatch, succeed=True)
     base = run_git("-C", str(repo), "rev-parse", "HEAD").stdout.strip()
     with contextlib.closing(kb.connect(db_path=tmp_path / "board.db")) as conn:
-        tid = kb.create_task(conn, title="fixture pinned base", assignee="default", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="fixture pinned base", assignee="default", workspace_kind="worktree", body=ARTIFACT_CONTRACT)
         if lane == "review":
             conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
             conn.commit()
@@ -189,7 +191,7 @@ def test_existing_worktree_dispatch_never_reaches_fetch(native, repo, tmp_path, 
     kb = native
     monkeypatch.setattr(kb, "read_board_metadata", lambda _board: {"default_workdir": str(repo)})
     with contextlib.closing(kb.connect(db_path=tmp_path / "board.db")) as conn:
-        tid = kb.create_task(conn, title="fixture reuse", assignee="default", workspace_kind="worktree")
+        tid = kb.create_task(conn, title="fixture reuse", assignee="default", workspace_kind="worktree", body=ARTIFACT_CONTRACT)
         target = repo / ".worktrees" / tid
         branch = kb.default_task_branch_name(tid)
         run_git("-C", str(repo), "worktree", "add", "-b", branch, str(target), "origin/main")

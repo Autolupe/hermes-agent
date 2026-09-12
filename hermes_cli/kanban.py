@@ -621,6 +621,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--delivery", default=None,
+        help="JSON object with exact delivery evidence; independently verified before completion.",
+    )
+
+    p_submit_review = sub.add_parser(
+        "submit-for-review", help="Submit an exact code candidate to its configured reviewer",
+    )
+    p_submit_review.add_argument("task_id")
+    p_submit_review.add_argument("--pull-request", required=True, help="JSON object with canonical PR URL, number, head SHA, and candidate ref.")
+    p_submit_review.add_argument("--summary", default=None, help="Short implementation and verification handoff.")
+    p_submit_review.add_argument("--metadata", default=None, help="JSON object with structured reviewer handoff facts.")
 
     p_edit = sub.add_parser(
         "edit",
@@ -708,6 +720,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_request_changes.add_argument("task_id")
     p_request_changes.add_argument(
         "reason", nargs="+", help="Concrete changes required before re-review",
+    )
+    p_request_changes.add_argument(
+        "--reviewed-head-sha", default=None,
+        help="Required for code review: exact full submitted candidate SHA.",
     )
 
     p_reopen_review = sub.add_parser(
@@ -1071,6 +1087,17 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if (
+        os.environ.get("HERMES_KANBAN_TERMINAL_SANDBOX") == "systemd-v1"
+        or os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") == "clauseye-v1"
+    ) and action in {"complete", "submit-for-review", "request-review", "request-changes"}:
+        print(
+            "kanban: sandbox workers must use their Kanban lifecycle tools; "
+            "terminal subprocesses cannot act as the trusted worker",
+            file=sys.stderr,
+        )
+        return 1
+
     if os.environ.get("HERMES_KANBAN_TASK"):
         operator_actions = {
             "init", "boards", "repair", "claim", "assign", "set-model", "reclaim",
@@ -1167,6 +1194,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
+            "submit-for-review": _cmd_submit_for_review,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -1235,6 +1263,10 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach",
     "attach-rm",
     "complete",
+    "submit-for-review",
+    "request-review",
+    "request-changes",
+    "reopen-review",
     "edit",
     "block",
     "schedule",
@@ -2322,7 +2354,8 @@ def _validated_worker_runs(conn, task_ids: list[str]) -> dict[str, Optional[int]
         row = conn.execute(
             "SELECT 1 FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
             "WHERE t.id=? AND t.status='running' AND t.current_run_id=? "
-            "AND r.task_id=t.id AND r.ended_at IS NULL",
+            "AND r.task_id=t.id AND r.status='running' "
+            "AND r.ended_at IS NULL AND r.outcome IS NULL",
             (tid, run_id),
         ).fetchone()
         if row is None:
@@ -2363,6 +2396,67 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
     return reason if verdict != "done" else None
 
 
+def _delivery_json_argument(raw: Optional[str], flag: str) -> Optional[dict]:
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{flag}: must be a JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{flag}: must be a JSON object")
+    return kb.redact_review_value(value)
+
+
+def _shared_delivery_config() -> dict:
+    """Use root board policy rather than the active worker profile's defaults."""
+    from hermes_cli.config import load_config
+    from hermes_constants import (
+        get_default_hermes_root, reset_hermes_home_override, set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(get_default_hermes_root())
+    try:
+        config = load_config()
+    finally:
+        reset_hermes_home_override(token)
+    policy = config.get("kanban") if isinstance(config, dict) else None
+    return policy if isinstance(policy, dict) else {}
+
+
+def _cmd_submit_for_review(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    pull_request = _delivery_json_argument(args.pull_request, "--pull-request")
+    if pull_request is None:
+        raise ValueError("--pull-request is required")
+    metadata = _delivery_json_argument(getattr(args, "metadata", None), "--metadata")
+    summary = str(kb.redact_review_value(getattr(args, "summary", None) or "")).strip()
+    with kb.connect_closing() as conn:
+        run_id = _validated_worker_runs(conn, [tid])[tid]
+        rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), summary)
+        if rejection is not None:
+            print(f"kanban: review handoff rejected by judge: {rejection}", file=sys.stderr)
+            return 1
+        reviewer = str(_shared_delivery_config().get("reviewer_profile") or "").strip() or None
+        try:
+            submitted = kb.submit_task_for_review(
+                conn, tid,
+                pull_request=pull_request,
+                summary=summary,
+                metadata=metadata,
+                reviewer_assignee=reviewer,
+                expected_run_id=run_id,
+            )
+        except kb.DeliveryEvidenceError as exc:
+            print(f"review submission blocked [{exc.code}] for {tid}: {exc}", file=sys.stderr)
+            return 1
+        if not submitted:
+            print(f"cannot submit {tid} for review (stale run or invalid task state)", file=sys.stderr)
+            return 1
+    print(f"Submitted {tid} for review")
+    return 0
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -2371,12 +2465,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         return 1
     summary = getattr(args, "summary", None)
     raw_meta = getattr(args, "metadata", None)
+    raw_delivery = getattr(args, "delivery", None)
     # Guard: structured handoff fields are per-run, so they'd be
     # copy-pasted identically across N runs — almost always a footgun.
     # Refuse instead of silently doing the wrong thing.
-    if len(ids) > 1 and (summary or raw_meta):
+    if len(ids) > 1 and (summary or raw_meta or raw_delivery is not None):
         print(
-            "kanban: --summary / --metadata are per-task and can't be used "
+            "kanban: --summary / --metadata / --delivery are per-task and can't be used "
             "with multiple ids (would apply the same handoff to every task). "
             "Complete tasks one at a time, or drop the flags for the bulk close.",
             file=sys.stderr,
@@ -2391,6 +2486,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
+    try:
+        delivery = _delivery_json_argument(raw_delivery, "--delivery")
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     failed: list[str] = []
     with kb.connect_closing() as conn:
         run_ids = _validated_worker_runs(conn, ids)
@@ -2412,13 +2512,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 continue
 
-            if not kb.complete_task(
-                conn, tid,
-                result=args.result,
-                summary=summary,
-                metadata=metadata,
-                expected_run_id=run_ids[tid],
-            ):
+            try:
+                completed = kb.complete_task(
+                    conn, tid,
+                    result=args.result,
+                    summary=summary,
+                    metadata=metadata,
+                    delivery=delivery,
+                    expected_run_id=run_ids[tid],
+                )
+            except kb.DeliveryEvidenceError as exc:
+                failed.append(tid)
+                print(f"completion blocked [{exc.code}] for {tid}: {exc}", file=sys.stderr)
+                continue
+            if not completed:
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
@@ -2557,8 +2664,12 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
     reviewer = getattr(args, "reviewer", None)
     with kb.connect_closing() as conn:
         run_id = _validated_worker_runs(conn, [tid])[tid]
+        task = kb.get_task(conn, tid)
+        if task and kb._completion_delivery_policy(task)["pr_gate"] != "none":
+            print("kanban: code delivery requires submit-for-review with an exact candidate", file=sys.stderr)
+            return 1
         rejection = _goal_mode_handoff_rejection(
-            kb.get_task(conn, tid),
+            task,
             summary or "",
         )
         if rejection is not None:
@@ -2599,6 +2710,27 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip()
     with kb.connect_closing() as conn:
         run_id = _validated_worker_runs(conn, [tid])[tid]
+        task = kb.get_task(conn, tid)
+        reviewed_head = getattr(args, "reviewed_head_sha", None)
+        if reviewed_head is not None or (
+            task and kb._completion_delivery_policy(task)["pr_gate"] != "none"
+        ):
+            try:
+                status = kb.request_task_changes(
+                    conn, tid,
+                    reason=reason,
+                    reviewed_head_sha=str(reviewed_head or "").strip(),
+                    max_review_rounds=_shared_delivery_config().get("max_review_rounds", 2),
+                    expected_run_id=run_id if run_id is not None else task.current_run_id if task else None,
+                )
+            except kb.DeliveryEvidenceError as exc:
+                print(f"changes request blocked [{exc.code}] for {tid}: {exc}", file=sys.stderr)
+                return 1
+            if status is None:
+                print(f"cannot request changes for {tid}: stale review attempt", file=sys.stderr)
+                return 1
+            print(f"Requested changes for {tid}; task is {status}")
+            return 0
         ok, detail = kb.request_changes(
             conn,
             tid,

@@ -1,4 +1,6 @@
 """Workspace failures retain ownership evidence without removing another task."""
+from tests.hermes_cli.delivery_fixtures import ARTIFACT_CONTRACT
+
 from pathlib import Path
 import json
 import subprocess
@@ -52,7 +54,7 @@ def test_branch_owner_survives_short_failure_excerpt(tmp_path, failure_limit):
     assert len(str(error.value)) <= 500
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="conflict", workspace_kind="worktree",
-                                 workspace_path=str(target), branch_name=branch)
+                                 workspace_path=str(target), branch_name=branch, body=ARTIFACT_CONTRACT)
         assert kb.claim_task(conn, task_id) is not None
         kb._record_spawn_failure(conn, task_id, str(error.value),
                                  failure_limit=failure_limit, workspace_error=error.value)
@@ -73,7 +75,7 @@ def test_resolution_failure_does_not_attempt_implicit_cleanup(tmp_path, monkeypa
     git(repo, "worktree", "add", "-b", "hermes/other", str(owner), base)
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="stale pointer", workspace_kind="worktree",
-                                 workspace_path=str(owner), branch_name="hermes/requested")
+                                 workspace_path=str(owner), branch_name="hermes/requested", body=ARTIFACT_CONTRACT)
         assert kb.claim_task(conn, task_id) is not None
         error = kb.WorktreeContractError("branch_conflict", owner, "hermes/requested", actual_branch="hermes/other")
         def forbidden(*args, **kwargs):
@@ -97,7 +99,7 @@ def test_cleanup_preserves_clean_foreign_branch(tmp_path):
 def test_workspace_setter_cannot_replace_recorded_base(tmp_path):
     repo, base = repository(tmp_path)
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="pinned", workspace_kind="worktree", worktree_base_sha=base)
+        task_id = kb.create_task(conn, title="pinned", workspace_kind="worktree", worktree_base_sha=base, body=ARTIFACT_CONTRACT)
         with pytest.raises(ValueError, match="cannot be changed"):
             kb.set_workspace_path(conn, task_id, repo, worktree_base_sha="a" * 40)
         task = kb.get_task(conn, task_id)
@@ -109,10 +111,10 @@ def test_idempotent_create_cannot_silently_ignore_different_base(tmp_path):
     _, base = repository(tmp_path)
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="pinned", workspace_kind="worktree",
-                                 worktree_base_sha=base, idempotency_key="same-work")
+                                 worktree_base_sha=base, idempotency_key="same-work", body=ARTIFACT_CONTRACT)
         assert kb.create_task(conn, title="retry", workspace_kind="worktree",
-                              worktree_base_sha=base, idempotency_key="same-work") == task_id
+                              worktree_base_sha=base, idempotency_key="same-work", body=ARTIFACT_CONTRACT) == task_id
         with pytest.raises(ValueError, match="different worktree base"):
             kb.create_task(conn, title="wrong retry", workspace_kind="worktree",
-                           worktree_base_sha="a" * 40, idempotency_key="same-work")
+                           worktree_base_sha="a" * 40, idempotency_key="same-work", body=ARTIFACT_CONTRACT)
         assert kb.get_task(conn, task_id).worktree_base_sha == base
