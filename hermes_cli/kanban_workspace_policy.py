@@ -18,9 +18,13 @@ import sqlite3
 import threading
 import time
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 import uuid
 
 from hermes_cli import kanban_policy as policy
+
+if TYPE_CHECKING:
+    from hermes_cli.kanban_db import TaskShowSnapshot, WorkerContextInputs
 
 
 _CURRENT: ContextVar[WorkspaceRequest | None] = ContextVar(
@@ -57,6 +61,24 @@ class WorkspaceClaim:
     original_base_sha: str | None = None
 
 
+def effective_worker_skills(skills, lane: str) -> tuple:
+    """Derive lane additions without changing the task's stored skill selection."""
+    selected = tuple(skills or ())
+    if lane == "review":
+        return tuple(dict.fromkeys((*selected, "sdlc-review")))
+    return selected
+
+
+@dataclass(frozen=True)
+class WorkerDatabaseContext:
+    """Request-local database display only; never complete worker instructions."""
+
+    inputs: WorkerContextInputs = field(repr=False)
+    text: str = field(repr=False)
+    effective_skills: tuple
+    initial_show: TaskShowSnapshot = field(repr=False)
+
+
 class WorkspaceRequest:
     """One immutable claim binding and irreversible native cancellation state."""
 
@@ -72,6 +94,9 @@ class WorkspaceRequest:
         self.pending_base_sha = claim.original_base_sha
         self._repository = None
         self._held_worker = None
+        self._workspace_was_persisted = False
+        self._context_capture_started = False
+        self._database_context = None
 
     @property
     def claim(self) -> WorkspaceClaim:
@@ -92,6 +117,11 @@ class WorkspaceRequest:
     @property
     def stored_base_sha(self) -> str | None:
         return self._stored_base_sha
+
+    @property
+    def database_context(self) -> WorkerDatabaseContext | None:
+        """Captured display data, including after cancellation; not admission."""
+        return self._database_context
 
     def cancel(self, reason: str) -> None:
         # Native cancellation precedes cleanup, including cleanup which fails,
@@ -201,6 +231,54 @@ class WorkspaceRequest:
                         branch=workspace[1], base_oid=base_sha)
         self._stored_workspace = workspace
         self._stored_base_sha = base_sha
+        self._workspace_was_persisted = True
+
+    def capture_database_context(self) -> WorkerDatabaseContext:
+        """Capture once on the original connection after checked persistence.
+
+        The native transaction's default rejects a caller-owned transaction;
+        this method must not commit provisional caller changes. Neither this
+        data nor the surrounding checks approve launch or capture external
+        skill/configuration/attachment contents.
+        """
+        from hermes_cli import kanban_db as kb
+
+        try:
+            if self._context_capture_started:
+                raise policy.RequiredPolicyError("Required workspace database context capture already started.")
+            # Set before any provider callback, including the unlocked final
+            # checkpoint: re-entry must not publish then replace a capture.
+            self._context_capture_started = True
+            self.checkpoint("before_context_capture")
+            if not self._workspace_was_persisted:
+                raise policy.RequiredPolicyError("Required workspace context needs persisted workspace.")
+            with kb.write_txn(self.connection):
+                kb._raise_if_dispatch_paused()
+                self.checkpoint("context_capture_locked")
+                inputs = kb.collect_worker_context(self.connection, self.claim.task_id)
+                text = kb.render_worker_context(inputs)
+                initial_show = kb.collect_task_show(
+                    self.connection, self.claim.task_id, worker_context=text,
+                )
+                if initial_show is None:
+                    raise policy.RequiredPolicyError("Required worker initial task view is missing.")
+                skills = json.loads(dict(zip(_LAUNCH_FIELDS, self.claim.launch_fields))["skills"] or "[]")
+                if type(skills) is not list or any(type(skill) is not str for skill in skills):
+                    raise policy.RequiredPolicyError("Required worker skill names are not immutable strings.")
+                captured = WorkerDatabaseContext(
+                    inputs, text, effective_worker_skills(skills, self.claim.lane), initial_show,
+                )
+                self.checkpoint("before_context_capture_commit")
+                kb._raise_if_dispatch_paused()
+            kb._raise_if_dispatch_paused()
+            self.checkpoint("after_context_capture")
+            self._database_context = captured
+            return captured
+        except BaseException as exc:
+            self.cancel("database_context_capture_failed")
+            if isinstance(exc, (policy.RequiredPolicyError, KeyboardInterrupt, SystemExit)):
+                raise
+            raise policy.RequiredPolicyError("Required workspace database context capture failed.") from exc
 
 
 @contextlib.contextmanager

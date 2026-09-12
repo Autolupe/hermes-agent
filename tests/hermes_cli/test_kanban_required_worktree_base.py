@@ -69,8 +69,41 @@ def test_required_request_persists_selected_base_with_workspace(native, repo, lo
         assert request.stored_base_sha == task.worktree_base_sha == local_remote
         assert request.claim.original_base_sha is None
         request.checkpoint("fixture persisted base remains bound")
+        captured = request.capture_database_context()
+        assert request.database_context is captured
+        assert captured.inputs.task.workspace_path == str(workspace)
+        assert request.stored_base_sha == local_remote
+        assert pointers(native, task.id) == (str(workspace), branch, local_remote)
     assert pointers(native, task.id) == (str(workspace), branch, local_remote)
     assert not request.cancelled
+
+
+@pytest.mark.parametrize("boundary", [
+    "before_context_capture", "context_capture_locked",
+    "before_context_capture_commit", "after_context_capture",
+])
+def test_context_capture_refuses_changed_persisted_base(
+    native, repo, local_remote, monkeypatch, boundary,
+):
+    task = required_fixture.claim(native, workspace_kind="worktree", workspace_path=str(repo))
+
+    def change_base(request, actual, _observation):
+        if actual == boundary:
+            native.execute("UPDATE tasks SET worktree_base_sha = ? WHERE id = ?",
+                           ("f" * 40, task.id))
+
+    required_fixture.enroll(monkeypatch, required_fixture.FixtureProvider(change_base))
+    with pytest.raises(policy.RequiredPolicyError):
+        with required_fixture.request_for(native, task) as request:
+            workspace, branch = kb._resolve_worktree_workspace(
+                task, conn=native, materialization=request.materialization,
+            )
+            kb._persist_dispatch_workspace(native, task, workspace, branch,
+                                           request.materialization, board=None)
+            request.capture_database_context()
+    assert request.cancelled
+    assert request.database_context is None
+    assert not native.in_transaction
 
 
 @pytest.mark.parametrize("lane", ["ready", "review"])
