@@ -32,6 +32,7 @@ from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import quote
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.sqlite_safe_read import connect_tracked
 from hermes_cli.trusted_delivery_runtime import (
     TRUSTED_GH_PATH,
     TRUSTED_GCLOUD_PATH,
@@ -204,7 +205,9 @@ def _controller_connect_closing(db_path: Path):
     durability pragmas as Kanban, and fails closed on a missing/partial schema.
     Keeping this connector local prevents the immutable controller runtime from
     importing ``hermes_state`` and the general agent/provider stack merely to
-    execute fixed native transitions.
+    execute fixed native transitions. The existing-file URI prevents accidental
+    creation if the path disappears; tracking protects SQLite's held locks from
+    raw byte readers for the full connection lifetime.
     """
 
     path = Path(db_path)
@@ -222,8 +225,9 @@ def _controller_connect_closing(db_path: Path):
         raise DeliveryControlError(
             "database_untrusted", "trusted Kanban database metadata is invalid"
         )
-    connection = sqlite3.connect(
-        str(path), isolation_level=None, timeout=120.0,
+    connection = connect_tracked(
+        path.absolute().as_uri() + "?mode=rw", uri=True,
+        isolation_level=None, timeout=120.0,
     )
     try:
         connection.row_factory = sqlite3.Row
@@ -831,8 +835,12 @@ class DeliveryControl:
             ).fetchall()
         self._recoverable_operations = {str(row["op_id"]) for row in rows}
 
-    def _quarantine_operation(self, op_id: str) -> None:
-        with _controller_connect_closing(self.db_path) as conn, kb.write_txn(conn):
+    def _quarantine_operation(
+        self, op_id: str, *, connection: sqlite3.Connection | None = None,
+    ) -> None:
+        opened = (contextlib.nullcontext(connection) if connection is not None
+                  else _controller_connect_closing(self.db_path))
+        with opened as conn, kb.write_txn(conn):
             conn.execute(
                 "UPDATE delivery_control_operations SET state = 'quarantined', "
                 "stage = 'identity_unproven', updated_at = ? WHERE op_id = ? "
@@ -1482,6 +1490,7 @@ class DeliveryControl:
 
     def _acquire_operation(
         self,
+        conn: sqlite3.Connection,
         request: ControlRequest,
         *,
         peer_pid: int,
@@ -1491,26 +1500,25 @@ class DeliveryControl:
         # Candidate inspection intentionally happens before BEGIN IMMEDIATE.
         # The transaction re-authorizes the task, then the first pre-mutation
         # guard re-inspects HEAD against the durable binding.
-        with _controller_connect_closing(self.db_path) as conn:
-            task = kb.get_task(conn, request.task_id)
-            if task is not None:
-                previous = self._idempotent_response(conn, task, request)
-                if previous is not None:
-                    return previous
-            task, _policy, _fingerprint = self._authorize(
-                conn,
-                request,
-                peer_pid=peer_pid,
-                peer_uid=peer_uid,
-                privileged=privileged,
-                allow_shipping=True,
-            )
+        task = kb.get_task(conn, request.task_id)
+        if task is not None:
+            previous = self._idempotent_response(conn, task, request)
+            if previous is not None:
+                return previous
+        task, _policy, _fingerprint = self._authorize(
+            conn,
+            request,
+            peer_pid=peer_pid,
+            peer_uid=peer_uid,
+            privileged=privileged,
+            allow_shipping=True,
+        )
         candidate_head = self._candidate_head(task)
         now = int(time.time())
         request_sha = _request_sha256(request)
         claim_sha = _claim_sha256(request.claim_lock)
 
-        with _controller_connect_closing(self.db_path) as conn, kb.write_txn(conn):
+        with kb.write_txn(conn):
             task, policy, _fingerprint = self._authorize(
                 conn,
                 request,
@@ -1622,6 +1630,7 @@ class DeliveryControl:
 
     def _guard(
         self,
+        conn: sqlite3.Connection,
         request: ControlRequest,
         snapshot: OperationSnapshot,
         *,
@@ -1632,7 +1641,7 @@ class DeliveryControl:
         receipt: Mapping[str, Any] | None = None,
     ) -> None:
         candidate_head = self._candidate_head(snapshot.task)
-        with _controller_connect_closing(self.db_path) as conn, kb.write_txn(conn):
+        with kb.write_txn(conn):
             task, _policy, current = self._authorize(
                 conn,
                 request,
@@ -1697,8 +1706,28 @@ class DeliveryControl:
     ) -> dict[str, Any]:
         if not privileged and peer_uid != self.allowed_worker_uid:
             raise _protocol_error("peer_unauthorized", "socket peer is not authorized")
+        # Retain the broker's original opened connection through authorization,
+        # remote guards and the terminal transaction. Reopening by pathname at
+        # each stage loses that request-local database binding. This does not
+        # supply the separate protected worker's launch/bootstrap authority.
+        with _controller_connect_closing(self.db_path) as conn:
+            return self._handle_request(
+                conn, request, peer_pid=peer_pid, peer_uid=peer_uid,
+                privileged=privileged,
+            )
+
+    def _handle_request(
+        self,
+        conn: sqlite3.Connection,
+        request: ControlRequest,
+        *,
+        peer_pid: int,
+        peer_uid: int,
+        privileged: bool,
+    ) -> dict[str, Any]:
         with self._operation_lock:
             acquired = self._acquire_operation(
+                conn,
                 request,
                 peer_pid=peer_pid,
                 peer_uid=peer_uid,
@@ -1720,6 +1749,7 @@ class DeliveryControl:
             receipt: Mapping[str, Any] | None = None,
         ) -> None:
             self._guard(
+                conn,
                 request,
                 snapshot,
                 peer_pid=peer_pid,
@@ -1737,21 +1767,20 @@ class DeliveryControl:
                     task, policy, run_id=request.run_id, guard=guard,
                 )
                 guard("pull_request", {"pull_request": published.pull_request})
-                with _controller_connect_closing(self.db_path) as conn:
-                    ok = kb.submit_task_for_review(
-                        conn,
-                        task.id,
-                        pull_request=published.pull_request,
-                        summary=request.summary,
-                        metadata=_request_audit_identity(request, peer_pid, peer_uid),
-                        reviewer_assignee=self.reviewer_profile,
-                        reviewer_validator=lambda profile: (
-                            profile == self.reviewer_profile == FIXED_REVIEWER_PROFILE
-                        ),
-                        expected_run_id=request.run_id,
-                        delivery_operation_id=snapshot.op_id,
-                        submission_verifier=self.backend.verify_submission,
-                    )
+                ok = kb.submit_task_for_review(
+                    conn,
+                    task.id,
+                    pull_request=published.pull_request,
+                    summary=request.summary,
+                    metadata=_request_audit_identity(request, peer_pid, peer_uid),
+                    reviewer_assignee=self.reviewer_profile,
+                    reviewer_validator=lambda profile: (
+                        profile == self.reviewer_profile == FIXED_REVIEWER_PROFILE
+                    ),
+                    expected_run_id=request.run_id,
+                    delivery_operation_id=snapshot.op_id,
+                    submission_verifier=self.backend.verify_submission,
+                )
                 if not ok:
                     raise _protocol_error("task_drifted", "task changed before native submit")
                 return {
@@ -1785,16 +1814,15 @@ class DeliveryControl:
                     or not isinstance(exc.evidence, Mapping)
                 ):
                     raise
-                with _controller_connect_closing(self.db_path) as conn:
-                    rejected = kb._reject_delivery_acceptance_for_rework(
-                        conn,
-                        task_snapshot=task,
-                        operation_id=snapshot.op_id,
-                        expected_submission_id=snapshot.submission_event_id,
-                        expected_submission_sha256=str(snapshot.submission_sha256 or ""),
-                        expected_candidate_head=snapshot.candidate_head,
-                        evidence=exc.evidence,
-                    )
+                rejected = kb._reject_delivery_acceptance_for_rework(
+                    conn,
+                    task_snapshot=task,
+                    operation_id=snapshot.op_id,
+                    expected_submission_id=snapshot.submission_event_id,
+                    expected_submission_sha256=str(snapshot.submission_sha256 or ""),
+                    expected_candidate_head=snapshot.candidate_head,
+                    evidence=exc.evidence,
+                )
                 if not rejected:
                     raise _protocol_error(
                         "task_drifted",
@@ -1811,18 +1839,17 @@ class DeliveryControl:
                     "idempotent": False,
                 }
             guard("merge", {"delivery": reviewed.delivery})
-            with _controller_connect_closing(self.db_path) as conn:
-                ok = kb.complete_task(
-                    conn,
-                    task.id,
-                    summary=request.summary,
-                    metadata=_request_audit_identity(request, peer_pid, peer_uid),
-                    delivery=reviewed.delivery,
-                    expected_run_id=request.run_id,
-                    expected_submission_id=snapshot.submission_event_id,
-                    delivery_operation_id=snapshot.op_id,
-                    terminal_verifier=self.backend.verify_terminal,
-                )
+            ok = kb.complete_task(
+                conn,
+                task.id,
+                summary=request.summary,
+                metadata=_request_audit_identity(request, peer_pid, peer_uid),
+                delivery=reviewed.delivery,
+                expected_run_id=request.run_id,
+                expected_submission_id=snapshot.submission_event_id,
+                delivery_operation_id=snapshot.op_id,
+                terminal_verifier=self.backend.verify_terminal,
+            )
             if not ok:
                 raise _protocol_error("task_drifted", "task changed before native completion")
             return {
@@ -1835,7 +1862,7 @@ class DeliveryControl:
             }
         except DeliveryControlError as exc:
             if exc.code == "premerge_receipt_missing":
-                self._quarantine_operation(snapshot.op_id)
+                self._quarantine_operation(snapshot.op_id, connection=conn)
             raise
         finally:
             with self._operation_lock:

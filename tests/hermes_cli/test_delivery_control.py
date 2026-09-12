@@ -1234,6 +1234,118 @@ def test_controller_refuses_sqlite_trigger_side_effects(board):
     assert raised.value.code == "database_schema_unsupported"
 
 
+def test_request_retains_one_tracked_connection_through_native_delivery(board, monkeypatch):
+    from hermes_cli import delivery_control as dc
+    from hermes_cli.sqlite_safe_read import has_live_connection
+
+    db_path, root = board
+    backend = FakeGitHub()
+    control = DeliveryControl(db_path, backend, allowed_worker_uid=UID)
+    task_id, request = _claimed_builder(db_path, root)
+    original_open = dc._controller_connect_closing
+    original_authorize = control._authorize
+    opened = []
+    authorized = []
+    terminal = []
+
+    @contextlib.contextmanager
+    def recorded_open(path):
+        with original_open(path) as conn:
+            opened.append(conn)
+            assert has_live_connection(path)
+            yield conn
+
+    def authorize(conn, *args, **kwargs):
+        assert conn is opened[-1]
+        authorized.append(conn)
+        return original_authorize(conn, *args, **kwargs)
+
+    def terminal_call(original):
+        def run(conn, *args, **kwargs):
+            assert conn is opened[-1]
+            assert all(item is conn for item in authorized)
+            assert has_live_connection(db_path)
+            terminal.append(conn)
+            return original(conn, *args, **kwargs)
+        return run
+
+    monkeypatch.setattr(dc, "_controller_connect_closing", recorded_open)
+    monkeypatch.setattr(control, "_authorize", authorize)
+    monkeypatch.setattr(kb, "submit_task_for_review", terminal_call(kb.submit_task_for_review))
+    monkeypatch.setattr(kb, "complete_task", terminal_call(kb.complete_task))
+
+    for expected in ("submitted", "completed"):
+        before = len(opened)
+        authorized.clear()
+        response = control.handle(request, peer_pid=PID, peer_uid=UID)
+        assert response["state"] == expected
+        assert len(opened) == before + 1
+        assert terminal[-1] is opened[-1]
+        assert not has_live_connection(db_path)
+        with pytest.raises(sqlite3.ProgrammingError):
+            opened[-1].execute("SELECT 1")
+        assert control.handle(request, peer_pid=PID, peer_uid=UID)["idempotent"]
+        assert len(opened) == before + 2
+        assert not has_live_connection(db_path)
+        if expected == "submitted":
+            request = _claim_review(db_path, task_id)
+    assert backend.publish_calls == backend.review_calls == 1
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])
+def test_request_connection_closes_on_interrupted_delivery_and_retry_keeps_fence(
+    board, failure,
+):
+    from hermes_cli.sqlite_safe_read import has_live_connection
+
+    db_path, root = board
+    backend = FakeGitHub()
+    control = DeliveryControl(db_path, backend, allowed_worker_uid=UID)
+    task_id, request = _claimed_builder(db_path, root)
+
+    def interrupted():
+        assert has_live_connection(db_path)
+        raise failure("fixture interruption")
+
+    backend.mutate_on_publish = interrupted
+    with pytest.raises(failure):
+        control.handle(request, peer_pid=PID, peer_uid=UID)
+    assert not has_live_connection(db_path)
+    assert not control._active_calls
+    with kb.connect_closing(db_path) as conn:
+        assert kb.get_task(conn, task_id).status == "shipping"
+        original_id = conn.execute(
+            "SELECT op_id FROM delivery_control_operations WHERE task_id=?", (task_id,),
+        ).fetchone()[0]
+    backend.mutate_on_publish = None
+    assert control.handle(request, peer_pid=PID, peer_uid=UID)["state"] == "submitted"
+    assert not has_live_connection(db_path)
+    with kb.connect_closing(db_path) as conn:
+        assert [row[0] for row in conn.execute(
+            "SELECT op_id FROM delivery_control_operations WHERE task_id=?", (task_id,),
+        )] == [original_id]
+
+
+def test_controller_open_never_creates_database_after_preopen_removal(board, monkeypatch):
+    from hermes_cli import delivery_control as dc
+    from hermes_cli.sqlite_safe_read import has_live_connection
+
+    db_path, _root = board
+    original_connect = dc.connect_tracked
+
+    def remove_before_connect(*args, **kwargs):
+        assert not has_live_connection(db_path)
+        db_path.unlink()
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(dc, "connect_tracked", remove_before_connect)
+    with pytest.raises(sqlite3.OperationalError):
+        with dc._controller_connect_closing(db_path):
+            pytest.fail("missing database must not be opened")
+    assert not db_path.exists()
+    assert not has_live_connection(db_path)
+
+
 def test_socket_protocol_uses_real_peer_credentials_and_no_cloud_claims(
     board, caplog,
 ):
