@@ -52,9 +52,9 @@ The request freezes task instruction/routing values including title, body,
 project, creator, workflow/step, assignee, tenant, workspace kind, skills,
 model/provider/reasoning overrides and goal/runtime limits. These values remain
 private in-process data. Workspace path and branch advance only through checked
-persistence. This is not a complete worker-prompt snapshot: comments, parent
-results and live profile configuration are additional dependencies of a future
-controlled-launch contract. They cannot be treated as approved by this slice.
+persistence. After dispatch persists the workspace, the same request captures
+the database-derived context described below. This remains short of a complete
+worker-prompt snapshot or approval to start work.
 
 Cancellation is native-owned and irreversible. Native state becomes cancelled
 before provider cleanup runs. Cleanup failure, a copied context, request B or
@@ -122,6 +122,49 @@ This immediate preservation is not a durable worker/cancellation receipt and
 does not prove safety against later lease expiry or reclaim. The reclaimer is
 unchanged. Actual required controlled launch remains unsupported.
 
+## Captured database context, not complete worker instructions
+
+`kanban_db.collect_worker_context(connection, task_id)` copies the data used by
+the existing task display into frozen records. It includes the task's displayed
+fields, attachment names and paths, closed attempts, completed parent results,
+recent work by the assignee, and comments. Nested run metadata becomes the same
+sorted JSON text the display already uses. It captures one clock reading,
+formatted local timestamps, the terminal-timeout input and display limits.
+`render_worker_context(inputs)` then builds the same text without reading the
+database, clock, timezone or environment again. The existing public
+`build_worker_context` immediately uses these two functions.
+
+Ordinary display collection does not begin or end transactions. It still works
+inside a caller's transaction, including when that caller later rolls back.
+Such a display is data, not approval to use uncommitted changes for execution.
+
+Both required dispatch lanes call `request.capture_database_context()` after
+checked workspace persistence, including when reusing a workspace. The method
+uses only the request's original connection and the existing native write
+transaction. Checks run before locking, inside the transaction, before commit
+and after commit. A competing SQLite writer cannot change the board between
+these reads. The request retains the frozen inputs and exact rendered text only
+after the final check succeeds. Review skill names include `sdlc-review` without
+changing the immutable claim or the stored task skills.
+
+Capture follows the transaction helper's existing default: it refuses when a
+caller already owns an open transaction. It cancels the request without
+committing or rolling back that caller's writes. The ordinary ready and review
+dispatch paths reach this boundary outside a transaction. Collection, rendering,
+commit, interruption and final-check failures cancel the request and do not
+publish a partial capture. Capture starts only once; a provider callback cannot
+start a recursive capture, and a successful capture cannot be replaced by a
+second one. Retained data may be inspected after cancellation or scope close,
+but is never a live admission or a recovery record.
+
+This is one database display at one time, not an ongoing claim that the board
+never changed. Comments added later remain future steering inputs. Attachment
+bytes and images, expanded skill instructions, supporting files, profile and
+tool configuration, executable and environment selection, system prompts,
+memory, and subsequent comment/event steering are not captured here. The held
+child does not yet consume this display. Complete instruction transport,
+protected runtime startup and trusted completion remain separate work.
+
 ## Worker launch remains unsupported
 
 The native launch check always refuses enrolled work. A preparation provider,
@@ -155,7 +198,9 @@ live worker, service change or installation is part of these tests.
 Run through the canonical test wrapper, for example:
 
 ```sh
-scripts/run_tests.sh -j 3 \
+scripts/run_tests.sh -j 3 --file-retries 0 \
+  tests/hermes_cli/test_kanban_worker_context_capture.py \
+  tests/hermes_cli/test_kanban_worker_context_render.py \
   tests/hermes_cli/test_kanban_required_policy.py \
   tests/hermes_cli/test_kanban_required_workspace.py \
   tests/hermes_cli/test_kanban_unenrolled_fetch_baseline.py \

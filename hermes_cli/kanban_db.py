@@ -10827,6 +10827,7 @@ def _required_dispatch_workspace(conn, claimed, *, board, lane, result) -> bool:
             else:
                 workspace = resolve_workspace(claimed, board=board, materialization=materialization)
             _persist_dispatch_workspace(conn, claimed, workspace, branch, materialization, board=board)
+            request.capture_database_context()
             request.checkpoint("before_spawn", workspace=str(workspace), branch=branch)
             # No callback-name, signature, JSON or provider return can replace
             # the missing controlled-launch contract. Do not call spawn_fn.
@@ -14349,9 +14350,7 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = list(
-            dict.fromkeys([*(claimed.skills or []), "sdlc-review"])
-        )
+        claimed.skills = list(_workspace_policy.effective_worker_skills(claimed.skills, "review"))
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         spawn_attempt = _SpawnAttempt()
         try:
@@ -15024,8 +15023,184 @@ def run_daemon(
 # Worker context builder (what a spawned worker sees)
 # ---------------------------------------------------------------------------
 
-def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
-    """Return the full text a worker should read to understand its task.
+@dataclass(frozen=True)
+class _ContextTask:
+    id: str
+    title: str
+    body: Optional[str]
+    assignee: Optional[str]
+    status: str
+    tenant: Optional[str]
+    workspace_kind: str
+    workspace_path: Optional[str]
+    max_runtime_seconds: Optional[int]
+    branch_name: Optional[str]
+
+
+@dataclass(frozen=True)
+class _ContextAttachment:
+    filename: str
+    stored_path: str
+    content_type: Optional[str]
+    size: int
+
+
+@dataclass(frozen=True)
+class _ContextRun:
+    started_at: int
+    ended_at: Optional[int]
+    profile: Optional[str]
+    outcome: Optional[str]
+    status: str
+    summary: Optional[str]
+    error: Optional[str]
+    metadata: Optional[str]
+    local_timestamp: str
+
+
+@dataclass(frozen=True)
+class _ContextParent:
+    id: str
+    result: Optional[str]
+    completed_at: Optional[int]
+    run: Optional[_ContextRun]
+
+
+@dataclass(frozen=True)
+class _ContextRole:
+    id: str
+    title: str
+    summary: Optional[str]
+    ended_at: int
+    local_timestamp: str
+
+
+@dataclass(frozen=True)
+class _ContextComment:
+    author: str
+    body: str
+    created_at: int
+    local_timestamp: str
+
+
+@dataclass(frozen=True)
+class WorkerContextInputs:
+    """Private database-derived display inputs, not complete worker instructions.
+
+    No mutable Task, Run, metadata dictionary, database handle, file contents or
+    configuration object is retained. Local timestamp strings freeze the
+    collection-time timezone; ``now`` freezes relative ages. Database reads are
+    coherent only when the caller supplies a transaction (as required capture
+    does). Ordinary readers retain their existing transaction ownership.
+    """
+
+    task: _ContextTask
+    now: int
+    terminal_timeout: Optional[str]
+    attachments: tuple[_ContextAttachment, ...]
+    prior_attempts: tuple[_ContextRun, ...]
+    parents: tuple[_ContextParent, ...]
+    role_history: tuple[_ContextRole, ...]
+    comments: tuple[_ContextComment, ...]
+    max_prior_attempts: int
+    max_comments: int
+    max_field_chars: int
+    max_body_chars: int
+    max_comment_chars: int
+
+
+def _context_run(run: Run, *, timestamp: bool = False) -> _ContextRun:
+    metadata = None
+    if run.metadata:
+        try:
+            metadata = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            # Keep the existing display fallback for unusable metadata.
+            pass
+    return _ContextRun(
+        run.started_at, run.ended_at, run.profile, run.outcome, run.status,
+        run.summary, run.error, metadata,
+        time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at)) if timestamp else "",
+    )
+
+
+def collect_worker_context(conn: sqlite3.Connection, task_id: str) -> WorkerContextInputs:
+    """Copy the existing database context without taking transaction ownership.
+
+    This helper reads only the supplied connection. Attachment paths are display
+    metadata, never a capture of the referenced files. A caller may collect
+    uncommitted display data; that does not approve it for worker execution.
+    """
+    task = get_task(conn, task_id)
+    if not task:
+        raise ValueError(f"unknown task {task_id}")
+    now = int(time.time())
+    terminal_timeout = os.environ.get("TERMINAL_TIMEOUT")
+    context_task = _ContextTask(
+        task.id, task.title, task.body, task.assignee, task.status, task.tenant,
+        task.workspace_kind, task.workspace_path, task.max_runtime_seconds,
+        task.branch_name,
+    )
+    attachments = tuple(
+        _ContextAttachment(att.filename, att.stored_path, att.content_type, att.size)
+        for att in list_attachments(conn, task_id)
+    )
+    prior = [run for run in list_runs(conn, task_id) if run.ended_at is not None]
+    first_shown = max(0, len(prior) - _CTX_MAX_PRIOR_ATTEMPTS)
+    prior_attempts = tuple(
+        _context_run(run, timestamp=index >= first_shown)
+        for index, run in enumerate(prior)
+    )
+    parent_rows = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        (task_id,),
+    ).fetchall()
+    parents = []
+    for row in parent_rows:
+        parent = get_task(conn, row["parent_id"])
+        if not parent or parent.status != "done":
+            continue
+        runs = [run for run in list_runs(conn, parent.id) if run.outcome == "completed"]
+        runs.sort(key=lambda run: run.started_at, reverse=True)
+        parents.append(_ContextParent(
+            parent.id, parent.result, parent.completed_at,
+            _context_run(runs[0]) if runs else None,
+        ))
+    role_history = ()
+    if task.assignee:
+        role_rows = conn.execute(
+            "SELECT t.id, t.title, r.summary, r.ended_at "
+            "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+            "WHERE r.profile = ? AND r.task_id != ? "
+            "  AND r.outcome = 'completed' "
+            "ORDER BY r.ended_at DESC LIMIT 5",
+            (task.assignee, task_id),
+        ).fetchall()
+        role_history = tuple(
+            _ContextRole(
+                row["id"], row["title"], row["summary"], row["ended_at"],
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"]))),
+            ) for row in role_rows
+        )
+    all_comments = list_comments(conn, task_id)
+    first_comment = max(0, len(all_comments) - _CTX_MAX_COMMENTS)
+    comments = tuple(
+        _ContextComment(
+            comment.author, comment.body, comment.created_at,
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(comment.created_at))
+            if index >= first_comment else "",
+        ) for index, comment in enumerate(all_comments)
+    )
+    return WorkerContextInputs(
+        context_task, now, terminal_timeout, attachments, prior_attempts,
+        tuple(parents), role_history, comments, _CTX_MAX_PRIOR_ATTEMPTS,
+        _CTX_MAX_COMMENTS, _CTX_MAX_FIELD_BYTES, _CTX_MAX_BODY_BYTES,
+        _CTX_MAX_COMMENT_BYTES,
+    )
+
+
+def render_worker_context(inputs: WorkerContextInputs) -> str:
+    """Render captured data without consulting the database, clock or environment.
 
     Order:
       1. Task title (mandatory).
@@ -15047,16 +15222,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     boards (retry-heavy tasks, comment storms). The per-field char cap
     prevents a single 1 MB summary from dominating context.
     """
-    task = get_task(conn, task_id)
-    if not task:
-        raise ValueError(f"unknown task {task_id}")
+    task = inputs.task
+    _now = inputs.now
 
-    # Single clock reading shared by every relative-age stamp below, so all
-    # ages in one rendering are consistent ("3h ago" / "3h ago", not drifting
-    # by the seconds it takes to build the block).
-    _now = int(time.time())
-
-    def _cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
+    def _cap(s: Optional[str], limit: int = inputs.max_field_chars) -> str:
         """Truncate a string to `limit` chars with a visible ellipsis."""
         if not s:
             return ""
@@ -15076,9 +15245,9 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.max_runtime_seconds is not None:
         terminal_timeout = _worker_terminal_timeout_env(
             task.max_runtime_seconds,
-            os.environ.get("TERMINAL_TIMEOUT"),
+            inputs.terminal_timeout,
         )
-        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
+        effective_terminal_timeout = terminal_timeout or inputs.terminal_timeout
         lines.append(f"Max runtime: {task.max_runtime_seconds}s")
         if effective_terminal_timeout:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
@@ -15088,7 +15257,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
     if task.body and task.body.strip():
         lines.append("## Body")
-        lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append(_cap(task.body, inputs.max_body_chars))
         lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
@@ -15096,7 +15265,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # full file-tool access, can read them directly (read_file, terminal
     # `pdftotext`, etc.). On the local terminal backend the path resolves
     # as-is; remote backends need the kanban attachments dir mounted.
-    attachments = list_attachments(conn, task_id)
+    attachments = inputs.attachments
     if attachments:
         lines.append("## Attachments")
         lines.append(
@@ -15115,11 +15284,11 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # Cap at _CTX_MAX_PRIOR_ATTEMPTS most-recent closed runs; older
     # attempts get collapsed into a one-line marker so the worker knows
     # more exist without bloating the prompt.
-    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    all_prior = inputs.prior_attempts
     # list_runs returns ascending by started_at; "most recent" = last N
-    if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
-        omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS
-        shown = all_prior[-_CTX_MAX_PRIOR_ATTEMPTS:]
+    if len(all_prior) > inputs.max_prior_attempts:
+        omitted = len(all_prior) - inputs.max_prior_attempts
+        shown = all_prior[-inputs.max_prior_attempts:]
         first_shown_idx = omitted + 1
     else:
         omitted = 0
@@ -15134,7 +15303,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             )
         for offset, run in enumerate(shown):
             idx = first_shown_idx + offset
-            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(run.started_at))
+            ts = run.local_timestamp
             age = _relative_age(run.started_at, _now)
             ts_disp = f"{ts}, {age}" if age else ts
             profile = run.profile or "(unknown)"
@@ -15145,31 +15314,17 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             if run.error and run.error.strip():
                 lines.append(f"_error_: {_cap(run.error)}")
             if run.metadata:
-                try:
-                    meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
-                    lines.append(f"_metadata_: `{_cap(meta_str)}`")
-                except Exception:
-                    pass
+                lines.append(f"_metadata_: `{_cap(run.metadata)}`")
             lines.append("")
 
     # Parents: prefer the most-recent 'completed' run's summary + metadata,
     # fall back to ``task.result`` when no run rows exist (legacy DBs,
     # or tasks completed before the runs table landed).
-    parent_rows = conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
-        (task_id,),
-    ).fetchall()
-    parent_ids = [r["parent_id"] for r in parent_rows]
-
-    if parent_ids:
+    if inputs.parents:
         wrote_header = False
-        for pid in parent_ids:
-            pt = get_task(conn, pid)
-            if not pt or pt.status != "done":
-                continue
-            runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
-            runs.sort(key=lambda r: r.started_at, reverse=True)
-            run = runs[0] if runs else None
+        for pt in inputs.parents:
+            pid = pt.id
+            run = pt.run
 
             if not wrote_header:
                 lines.append("## Parent task results")
@@ -15201,11 +15356,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 body_lines.append("(no result recorded)")
 
             if run is not None and run.metadata:
-                try:
-                    meta_str = json.dumps(run.metadata, ensure_ascii=False, sort_keys=True)
-                    body_lines.append(f"_metadata_: `{_cap(meta_str)}`")
-                except Exception:
-                    pass
+                body_lines.append(f"_metadata_: `{_cap(run.metadata)}`")
             lines.extend(body_lines)
             lines.append("")
 
@@ -15216,34 +15367,25 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # most recent 5 completed runs, excluding this task so the retry
     # section above isn't duplicated. Safe on assignee=None (skipped).
     if task.assignee:
-        role_rows = conn.execute(
-            "SELECT t.id, t.title, r.summary, r.ended_at "
-            "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
-            "WHERE r.profile = ? AND r.task_id != ? "
-            "  AND r.outcome = 'completed' "
-            "ORDER BY r.ended_at DESC LIMIT 5",
-            (task.assignee, task_id),
-        ).fetchall()
+        role_rows = inputs.role_history
         if role_rows:
             lines.append(f"## Recent work by @{task.assignee}")
             for row in role_rows:
-                ts = time.strftime(
-                    "%Y-%m-%d %H:%M", time.localtime(int(row["ended_at"]))
-                )
-                age = _relative_age(row["ended_at"], _now)
+                ts = row.local_timestamp
+                age = _relative_age(row.ended_at, _now)
                 ts_disp = f"{ts}, {age}" if age else ts
-                s = (row["summary"] or "").strip().splitlines()
+                s = (row.summary or "").strip().splitlines()
                 first = s[0][:200] if s else "(no summary)"
-                lines.append(f"- {row['id']} — {row['title']} ({ts_disp}): {first}")
+                lines.append(f"- {row.id} — {row.title} ({ts_disp}): {first}")
             lines.append("")
 
     # Comments: cap at the most-recent _CTX_MAX_COMMENTS so
     # comment-storm tasks don't blow out the worker's prompt. Older
     # comments summarised in a one-line marker like prior attempts.
-    all_comments = list_comments(conn, task_id)
-    if len(all_comments) > _CTX_MAX_COMMENTS:
-        omitted_c = len(all_comments) - _CTX_MAX_COMMENTS
-        shown_c = all_comments[-_CTX_MAX_COMMENTS:]
+    all_comments = inputs.comments
+    if len(all_comments) > inputs.max_comments:
+        omitted_c = len(all_comments) - inputs.max_comments
+        shown_c = all_comments[-inputs.max_comments:]
     else:
         omitted_c = 0
         shown_c = all_comments
@@ -15255,7 +15397,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
                 f"omitted; showing most recent {len(shown_c)})_"
             )
         for c in shown_c:
-            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(c.created_at))
+            ts = c.local_timestamp
             age = _relative_age(c.created_at, _now)
             ts_disp = f"{ts}, {age}" if age else ts
             # Render author with explicit "comment from worker" framing so
@@ -15266,10 +15408,15 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             # was already closed in #22435. See #22452.
             safe_author = (c.author or "").replace("`", "")
             lines.append(f"comment from worker `{safe_author}` at {ts_disp}:")
-            lines.append(_cap(c.body, _CTX_MAX_COMMENT_BYTES))
+            lines.append(_cap(c.body, inputs.max_comment_chars))
             lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
+
+
+def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return the existing database-derived worker display, not a launch permit."""
+    return render_worker_context(collect_worker_context(conn, task_id))
 
 
 # ---------------------------------------------------------------------------
