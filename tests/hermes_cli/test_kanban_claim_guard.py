@@ -163,7 +163,7 @@ def test_live_foreign_lock_defers_without_failure(worktree_board: Path):
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="locked", assignee="alice", workspace_kind="worktree")
             target = repo / ".worktrees" / tid
-            kb._ensure_git_worktree(repo, target, f"wt/{tid}")
+            kb._ensure_git_worktree(repo, target, kb.default_task_branch_name(tid))
             _git("worktree", "lock", "--reason", f"hermes pid={child.pid}", str(target), cwd=repo)
 
             spawns: list = []
@@ -190,7 +190,7 @@ def test_dead_pid_lock_is_released_and_spawn_proceeds(worktree_board: Path):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="stale lock", assignee="alice", workspace_kind="worktree")
         target = repo / ".worktrees" / tid
-        kb._ensure_git_worktree(repo, target, f"wt/{tid}")
+        kb._ensure_git_worktree(repo, target, kb.default_task_branch_name(tid))
         _git("worktree", "lock", "--reason", f"hermes pid={dead}", str(target), cwd=repo)
 
         spawns: list = []
@@ -863,14 +863,12 @@ def test_d6_timeout_kills_real_child_and_unlocks(worktree_board: Path, monkeypat
 
 def test_fetch_origin_main_is_cached_and_never_prompts(repo: Path, monkeypatch):
     calls: list = []
+    real_run = kb.subprocess.run
 
     def _run(cmd, **kwargs):
-        calls.append((cmd, kwargs))
-        class _R:
-            returncode = 0
-            stdout = ""
-            stderr = ""
-        return _R()
+        if "fetch" in cmd:
+            calls.append((cmd, kwargs))
+        return real_run(cmd, **kwargs)
 
     monkeypatch.setattr(kb.subprocess, "run", _run)
     kb._ORIGIN_MAIN_FETCHED_AT.clear()
@@ -878,6 +876,6 @@ def test_fetch_origin_main_is_cached_and_never_prompts(repo: Path, monkeypatch):
     kb._fetch_origin_main(repo)
     assert len(calls) == 1
     cmd, kwargs = calls[0]
-    assert cmd[-3:] == ["fetch", "origin", "main"]
+    assert cmd[-3:] == ["fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"]
     assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
     assert kwargs["timeout"] <= 15

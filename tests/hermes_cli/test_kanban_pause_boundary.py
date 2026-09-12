@@ -53,7 +53,7 @@ def _latest_event_payload(conn, task_id, kind):
 
 def _init_git_repo(path):
     path.mkdir()
-    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(path), "init", "-q", "-b", "main"], check=True)
     subprocess.run(
         ["git", "-C", str(path), "config", "user.email", "test@example.com"],
         check=True,
@@ -2390,6 +2390,7 @@ def test_halt_during_workspace_commit_rolls_back_persisted_materialization(
     assert task is not None and task.status == "todo"
     assert task.workspace_path == original_workspace_path
     assert task.branch_name == original_branch_name
+    assert task.worktree_base_sha == original_task.worktree_base_sha
     payload = _latest_event_payload(conn, task_id, "dispatch_paused")
     assert payload["resume_status"] == expected_status
     assert conn.execute(

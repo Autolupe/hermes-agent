@@ -52,7 +52,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def repo(tmp_path: Path) -> Path:
     """A project repo with a remote whose history is fully pushed."""
     origin = tmp_path / "origin.git"
-    _git("init", "--bare", str(origin))
+    _git("init", "--bare", "-b", "main", str(origin))
     project = tmp_path / "project"
     _git("clone", str(origin), str(project))
     _git("-C", str(project), "config", "user.email", "t@example.com")

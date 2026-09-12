@@ -196,7 +196,8 @@ def test_required_fetch_failure_is_sticky_without_materialization_or_cache(
     fetches = []
 
     def run(command, **kwargs):
-        if command[:2] == ["git", "-C"] and command[3:] == ["fetch", "origin", "main"]:
+        if command[:2] == ["git", "-C"] and command[3:5] == ["fetch", "origin"]:
+            assert command[5:] == ["+refs/heads/main:refs/remotes/origin/main"]
             fetches.append(command)
             if failure == "timeout":
                 raise subprocess.TimeoutExpired(command, kwargs["timeout"])

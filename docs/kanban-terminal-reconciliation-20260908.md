@@ -20,6 +20,8 @@ The combined source received an independent review. Exact commands, per-file res
 
 The coding charter and task protocol already state the exact terminal-call and structured delivery-proof requirements prominently. They require no duplicate instruction edits.
 
+The later September 12 worktree integration combines published repair `e20108f2e0e1aa7b9f0ffbf69c5481fe7501f386` with the tested `486e900019` worker-control/terminal source. It preserves the selected base in required workspace requests and retains host admission and checkout ownership controls. Current combined validation is 1,047 passing tests and three Windows-only skips across 40 files; see `kanban-worktree-repair-20260907.md` and the `worktree-integration-evidence` receipts for the exact runs and superseded test-simulation failure.
+
 ## Delivery boundary
 
 This source slice is not full completion of the card. The canonical interactive source used here does not contain the separate sealed runtime's trusted delivery contract. The installed sealed runtime has `_completion_delivery_policy`, `_normalize_terminal_delivery`, and protected delivery-control machinery; this repair does not replace them with a weaker metadata check. The older candidate also contains delivery-gap reconciliation work that remains separately preserved.

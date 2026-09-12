@@ -2956,6 +2956,8 @@ class Task:
     claim_expires: Optional[int]
     tenant: Optional[str]
     branch_name: Optional[str] = None
+    # Requested or durably selected creation base; never a delivery approval.
+    worktree_base_sha: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -3055,6 +3057,7 @@ class Task:
             workspace_kind=row["workspace_kind"],
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
+            worktree_base_sha=row["worktree_base_sha"] if "worktree_base_sha" in keys else None,
             project_id=row["project_id"] if "project_id" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
@@ -3231,6 +3234,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
     branch_name          TEXT,
+    worktree_base_sha    TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
@@ -3592,11 +3596,9 @@ def _dispatch_tick_lock(db_path: Path):
     tick (the winner is making progress on the same board), and tries
     again next interval.
 
-    Board-scoped: the lock file is a ``.dispatch.lock`` sibling of the
-    board's ``kanban.db``, so unrelated boards tick independently. On
-    platforms without ``fcntl``/``msvcrt`` the guard degrades to a no-op
-    (yields ``True``) — single-writer enforcement is best-effort and the
-    orphan-dispatcher scenario is specific to POSIX service managers.
+    The lock file is a ``.dispatch.lock`` sibling of the supplied path.
+    Dispatch uses both a shared-home admission path and the board DB path.
+    Failure to open or acquire a lock refuses admission.
     """
     lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
     handle = None
@@ -3625,9 +3627,8 @@ def _dispatch_tick_lock(db_path: Path):
             except (BlockingIOError, OSError):
                 acquired = False
     except OSError:
-        # Could not even open the lock file (permissions, read-only FS).
-        # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        # A missing lock cannot protect either the board or shared host budget.
+        acquired = False
         handle = None
     try:
         yield acquired
@@ -4427,6 +4428,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
+    if "worktree_base_sha" not in cols:
+        _add_column_if_missing(conn, "tasks", "worktree_base_sha", "worktree_base_sha TEXT")
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
     if "idempotency_key" not in cols:
@@ -5050,6 +5053,7 @@ def create_task(
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
+    worktree_base_sha: Optional[str] = None,
     tenant: Optional[str] = None,
     priority: int = 0,
     parents: Iterable[str] = (),
@@ -5129,6 +5133,8 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if worktree_base_sha is not None:
+        _validate_worktree_base_sha(worktree_base_sha)
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -5285,12 +5291,14 @@ def create_task(
     # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "SELECT id, worktree_base_sha FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
         if row:
+            if worktree_base_sha is not None and row["worktree_base_sha"] != worktree_base_sha:
+                raise ValueError("idempotency key belongs to a different worktree base")
             return row["id"]
 
     now = int(time.time())
@@ -5378,17 +5386,19 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                if worktree_base_sha is not None and workspace_kind != "worktree":
+                    raise ValueError("worktree_base_sha is only valid for worktree workspaces")
                 conn.execute(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, worktree_base_sha, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -5402,6 +5412,7 @@ def create_task(
                         workspace_kind,
                         workspace_path,
                         branch_name,
+                        worktree_base_sha,
                         project_id,
                         tenant,
                         idempotency_key,
@@ -5437,6 +5448,7 @@ def create_task(
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
+                        "worktree_base_sha": worktree_base_sha,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
@@ -8126,6 +8138,11 @@ def _cleanup_worktree_workspace(
         repo_root = common.parent
         if wp.resolve(strict=False) == repo_root.resolve(strict=False):
             return  # never remove the main checkout
+        expected_branches = {branch_name} if branch_name else {
+            f"wt/{task_id}", default_task_branch_name(task_id),
+        }
+        if _git_current_branch(wp) not in expected_branches:
+            return  # a stale task pointer never authorizes another branch's cleanup
         if _worktree_is_dirty(str(wp)) or _worktree_has_unpushed_commits(str(wp)):
             _log.info(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
@@ -9873,6 +9890,7 @@ class _WorkspaceMaterialization:
     branch_oid: Optional[str] = None
     created_branch: bool = False
     base_fell_back: bool = False
+    selected_base_sha: Optional[str] = None
 
 
 def _directory_identity(path: Path) -> Optional[tuple[int, int]]:
@@ -10284,95 +10302,160 @@ def _assert_worktree_not_busy(repo_root: Path | str, worktree_path: Path | str) 
     _unlock_worktree_if_ours(repo_root, worktree_path, lock_pid)
 
 
-# repo root -> monotonic time of the last ``git fetch origin main`` attempt.
+# Cache the immutable result of a successful, explicitly mapped main refresh.
 _ORIGIN_MAIN_FETCHED_AT: dict[str, float] = {}
+_ORIGIN_MAIN_FETCHED_SHA: dict[str, str] = {}
+_ORIGIN_MAIN_FETCH_FAILED_AT: dict[str, float] = {}
 _ORIGIN_MAIN_FETCH_INTERVAL_SECONDS = 60.0
 _ORIGIN_MAIN_FETCH_TIMEOUT_SECONDS = 15
 
 
-def _fetch_origin_main(repo_root: Path) -> None:
-    """Best-effort ``git fetch origin main``, at most once a minute per repo.
-
-    Protects the dispatch tick (which runs under the board lock) from
-    stalling on the network: no terminal prompt for credentials, a short
-    timeout, and one fetch per repo per interval instead of one per new
-    worktree. Any failure is logged and ignored — the caller falls back to
-    the local ``origin/main`` ref.
-    """
+def _fetch_origin_main(repo_root: Path) -> str:
+    """Refresh main once per minute; a failed refresh never admits stale refs."""
     request = _workspace_policy.current_request(boundary="before_fetch")
     if request is not None:
         request.bind_repository(str(_git_common_dir(repo_root)))
         try:
             fetched = subprocess.run(
-                ["git", "-C", str(repo_root), "fetch", "origin", "main"],
+                ["git", "-C", str(repo_root), "fetch", "origin",
+                 "+refs/heads/main:refs/remotes/origin/main"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=_ORIGIN_MAIN_FETCH_TIMEOUT_SECONDS, check=False,
                 env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
             )
             if fetched.returncode != 0:
                 raise _required_policy.RequiredPolicyError("Required workspace fetch failed.")
-            request.checkpoint("after_fetch", repository=str(repo_root.resolve()))
+            selected = _resolve_worktree_commit(repo_root, "refs/remotes/origin/main")
+            request.checkpoint("after_fetch", repository=str(repo_root.resolve()), base_oid=selected)
+            return selected  # Never read or populate ordinary attempt caches.
         except BaseException as exc:
             request.cancel("fetch_failed")
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
             raise _required_policy.RequiredPolicyError("Required workspace fetch failed.") from exc
-        return  # Do not read or populate the ordinary attempt cache.
     key = str(repo_root)
     now = time.monotonic()
     last = _ORIGIN_MAIN_FETCHED_AT.get(key)
-    if last is not None and now - last < _ORIGIN_MAIN_FETCH_INTERVAL_SECONDS:
-        return
-    _ORIGIN_MAIN_FETCHED_AT[key] = now
+    if last is not None and now - last < _ORIGIN_MAIN_FETCH_INTERVAL_SECONDS and key in _ORIGIN_MAIN_FETCHED_SHA:
+        _workspace_policy.current_request(boundary="after_fetch")
+        return _ORIGIN_MAIN_FETCHED_SHA[key]
+    failed = _ORIGIN_MAIN_FETCH_FAILED_AT.get(key)
+    if failed is not None and now - failed < _ORIGIN_MAIN_FETCH_INTERVAL_SECONDS:
+        raise RuntimeError("worktree_base_refresh_failed: refresh is cooling down; retry later or supply --base-sha")
     try:
-        subprocess.run(
-            ["git", "-C", key, "fetch", "origin", "main"],
+        result = subprocess.run(
+            ["git", "-C", key, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=_ORIGIN_MAIN_FETCH_TIMEOUT_SECONDS,
             check=False,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
         )
+    except Exception as exc:
+        _ORIGIN_MAIN_FETCH_FAILED_AT[key] = now
+        raise RuntimeError("worktree_base_refresh_failed: cannot refresh origin/main; supply an available --base-sha") from exc
+    if result.returncode != 0:
+        _ORIGIN_MAIN_FETCH_FAILED_AT[key] = now
+        raise RuntimeError("worktree_base_refresh_failed: cannot refresh origin/main; supply an available --base-sha")
+    try:
+        selected = _resolve_worktree_commit(repo_root, "refs/remotes/origin/main")
     except Exception:
-        _log.debug("git fetch origin main failed in %s", repo_root, exc_info=True)
+        _ORIGIN_MAIN_FETCH_FAILED_AT[key] = now
+        raise
     _workspace_policy.current_request(boundary="after_fetch")
+    _ORIGIN_MAIN_FETCHED_AT[key] = now
+    _ORIGIN_MAIN_FETCHED_SHA[key] = selected
+    _ORIGIN_MAIN_FETCH_FAILED_AT.pop(key, None)
+    return selected
+
+
+def _validate_worktree_base_sha(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value) or value == "0" * 40:
+        raise ValueError("worktree_base_sha must be a full lowercase, nonzero 40-character commit SHA")
+    return value
+
+
+def _resolve_worktree_commit(repo_root: Path, ref: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    value = (result.stdout or "").strip()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise RuntimeError(f"worktree_base_unavailable: commit {ref!r} is unavailable; supply an available --base-sha")
+    return value
 
 
 def _worktree_base_ref(repo_root: Path) -> tuple[str, bool]:
-    """Pick the start point for a new task branch: ``origin/main`` or ``HEAD``.
+    """Freeze refreshed origin/main, or local main for a repo without origin.
 
-    Protects new task branches from being cut from whatever branch the
-    primary checkout happens to be on. Fetches ``origin main`` best-effort
-    (no token → fail-soft), then verifies the local ``origin/main`` ref.
-    Returns ``(ref, fell_back)``.
+    The second result retains the legacy local-base event indicator. Neither
+    path consults the primary checkout's feature-branch HEAD.
     """
     request = _workspace_policy.current_request(boundary="before_base_selection")
-    _fetch_origin_main(repo_root)
     try:
-        verify = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
-             "refs/remotes/origin/main"],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=30,
-            check=False,
-        )
-    except Exception:
-        _workspace_policy.current_request(boundary="base_failed")
+        if request is not None:
+            # An enrolled request still requires its own fresh origin refresh.
+            selected, local_base = _fetch_origin_main(repo_root), False
+        else:
+            remote = subprocess.run(
+                ["git", "-C", str(repo_root), "remote"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=30, check=False,
+            )
+            if remote.returncode != 0:
+                raise RuntimeError("worktree_base_unavailable: cannot inspect repository remotes")
+            if "origin" in (remote.stdout or "").splitlines():
+                selected, local_base = _fetch_origin_main(repo_root), False
+            else:
+                selected, local_base = _resolve_worktree_commit(repo_root, "refs/heads/main"), True
+        _workspace_policy.current_request(boundary="after_base_selection")
+        if request is not None:
+            request.checkpoint("base_ready", repository=str(repo_root.resolve()), base_oid=selected)
+        return selected, local_base
+    except BaseException as exc:
         if request is not None:
             request.cancel("base_ref_unavailable")
-            raise _required_policy.RequiredPolicyError("Required workspace base is unavailable.") from None
-        return "HEAD", True
-    _workspace_policy.current_request(boundary="after_base_selection")
-    if verify.returncode == 0 and (verify.stdout or "").strip():
-        if request is not None:
-            request.checkpoint("base_ready", repository=str(repo_root.resolve()),
-                               base_oid=verify.stdout.strip())
-        return "origin/main", False
-    if request is not None:
-        request.cancel("base_ref_unavailable")
-        raise _required_policy.RequiredPolicyError("Required workspace cannot fall back to HEAD.")
-    return "HEAD", True
+            if not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise _required_policy.RequiredPolicyError("Required workspace base is unavailable.") from exc
+        else:
+            _workspace_policy.current_request(boundary="base_failed")
+        raise
+
+
+class WorktreeContractError(RuntimeError):
+    """A compact failure plus bounded, structured ownership details."""
+
+    def __init__(self, code: str, target: Path, branch: str, *, actual_branch: Optional[str] = None, owner: Optional[str] = None):
+        self.details = {"code": code, "path": str(target)[:4096], "requested_branch": branch[:1024]}
+        if actual_branch is not None:
+            self.details["actual_branch"] = actual_branch[:1024]
+        if owner is not None:
+            self.details["owner_worktree"] = owner[:4096]
+        def short(value: str, limit: int) -> str:
+            return value if len(value) <= limit else value[:limit // 2] + "..." + value[-limit // 2:]
+        super().__init__(
+            f"worktree_{code}: requested branch {short(branch, 80)!r}; "
+            f"actual {short(actual_branch or 'unknown', 80)!r}; "
+            f"path {short(str(target), 130)!r}; owner {short(owner or 'none', 100)!r}"
+        )
+
+
+def _assert_worktree_base(repo_root: Path, branch_name: str, base_sha: Optional[str]) -> Optional[str]:
+    if base_sha is None:
+        return None
+    _validate_worktree_base_sha(base_sha)
+    if _resolve_worktree_commit(repo_root, base_sha) != base_sha:
+        raise RuntimeError("worktree_base_unavailable: requested SHA is not a commit")
+    if _git_branch_exists(repo_root, branch_name):
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", base_sha, f"refs/heads/{branch_name}"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("worktree_base_mismatch: existing branch does not contain the requested creation base")
+    return base_sha
 
 
 def _capture_created_worktree(
@@ -10419,12 +10502,13 @@ def _ensure_git_worktree(
     branch_name: str,
     *,
     materialization: Optional[_WorkspaceMaterialization] = None,
+    base_sha: Optional[str] = None,
 ) -> bool:
     """Materialize ``target`` as a linked git worktree under ``repo_root``.
 
-    Returns True when a NEW branch had to be based on ``HEAD`` because no
-    ``origin/main`` ref was available (the caller records that as a
-    ``worktree_base_fallback`` event). Raises ``WorkspaceBusyError`` when
+    Returns True when a NEW branch used local main in a repository without
+    origin. An explicit base bypasses refresh and must exist as a commit.
+    Existing branches must retain that base as an ancestor. Raises ``WorkspaceBusyError`` when
     the tree already exists and a live hermes process holds its lock.
     """
     request = _workspace_policy.current_request(boundary="before_materialize")
@@ -10440,12 +10524,20 @@ def _ensure_git_worktree(
     except OSError:
         pass
     repo_common = _git_common_dir(repo_root)
+    selected_base = _assert_worktree_base(repo_root, branch_name, base_sha)
+    if request is not None and selected_base is not None:
+        request.checkpoint("base_ready", repository=str(repo_root.resolve()), base_oid=selected_base)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            actual_branch = _git_current_branch(target)
+            if actual_branch != branch_name or not _is_linked_worktree_checkout(target):
+                raise WorktreeContractError("branch_conflict", target, branch_name, actual_branch=actual_branch or "detached")
             _assert_worktree_not_busy(repo_root, target)
             if request is not None:
                 request.checkpoint("worktree_reused", workspace=str(target), branch=branch_name)
+            if materialization is not None:
+                materialization.selected_base_sha = selected_base
             return False
     target.parent.mkdir(parents=True, exist_ok=True)
     fell_back = False
@@ -10453,10 +10545,11 @@ def _ensure_git_worktree(
     if branch_existed:
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
-        base_ref, fell_back = _worktree_base_ref(repo_root)
+        if selected_base is None:
+            selected_base, fell_back = _worktree_base_ref(repo_root)
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), base_ref,
+            str(target), selected_base,
         ]
     try:
         if request is not None:
@@ -10483,26 +10576,41 @@ def _ensure_git_worktree(
             target_was_missing=target_was_missing,
         )
     if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(
-            f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
+        owner = None
+        listing = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=30, check=False,
         )
+        current = None
+        for line in (listing.stdout or "").splitlines():
+            if line.startswith("worktree "):
+                current = line[9:]
+            elif line == f"branch refs/heads/{branch_name}":
+                owner = current
+        raise WorktreeContractError("add_failed", target, branch_name, owner=owner)
+    if _git_current_branch(target) != branch_name:
+        raise WorktreeContractError("branch_conflict", target, branch_name, actual_branch=_git_current_branch(target) or "detached")
+    if not branch_existed and _resolve_worktree_commit(target, "HEAD") != selected_base:
+        raise WorktreeContractError("base_changed", target, branch_name)
+    _assert_worktree_base(repo_root, branch_name, selected_base)
+    if materialization is not None:
+        materialization.selected_base_sha = selected_base
     if materialization is not None and fell_back:
         materialization.base_fell_back = True
     return fell_back
 
 
 def _note_worktree_base_fallback(
-    conn: Optional[sqlite3.Connection], task_id: str, branch_name: str,
+    conn: Optional[sqlite3.Connection], task_id: str, branch_name: str, base_sha: Optional[str] = None,
 ) -> None:
-    """Record that a task branch was cut from HEAD, not origin/main."""
+    """Record local-main selection using the legacy event name."""
     if conn is None:
         return
     try:
         with write_txn(conn):
             _append_event(
                 conn, task_id, "worktree_base_fallback",
-                {"branch": branch_name, "base": "HEAD"},
+                {"branch": branch_name, "base": "refs/heads/main", "base_sha": base_sha},
             )
     except Exception:
         _log.debug("could not record worktree_base_fallback for %s", task_id, exc_info=True)
@@ -10527,6 +10635,17 @@ def _resolve_worktree_workspace(
     anywhere, we fail loudly rather than guess.
     """
     branch_name = (task.branch_name or "").strip() or default_task_branch_name(task.id, board=board)
+    resolved_materialization = materialization or _WorkspaceMaterialization()
+
+    def ensure(repo: Path, path: Path) -> bool:
+        local_base = _ensure_git_worktree(
+            repo, path, branch_name,
+            materialization=resolved_materialization,
+            base_sha=task.worktree_base_sha,
+        )
+        if materialization is None and resolved_materialization.selected_base_sha is not None:
+            task.worktree_base_sha = resolved_materialization.selected_base_sha
+        return local_base
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -10553,10 +10672,8 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        if _ensure_git_worktree(
-            repo_root, target, branch_name, materialization=materialization
-        ) and materialization is None:
-            _note_worktree_base_fallback(conn, task.id, branch_name)
+        if ensure(repo_root, target) and materialization is None:
+            _note_worktree_base_fallback(conn, task.id, branch_name, task.worktree_base_sha)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -10574,7 +10691,7 @@ def _resolve_worktree_workspace(
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
             # Another live hermes process may still own this checkout.
-            _assert_worktree_not_busy(requested, requested)
+            ensure(requested, requested)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -10587,30 +10704,22 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                if _ensure_git_worktree(
-                    fallback_root,
-                    fallback,
-                    branch_name,
-                    materialization=materialization,
-                ) and materialization is None:
-                    _note_worktree_base_fallback(conn, task.id, branch_name)
+                if ensure(fallback_root, fallback) and materialization is None:
+                    _note_worktree_base_fallback(conn, task.id, branch_name, task.worktree_base_sha)
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
         if request is not None:
             request.cancel("worktree_branch_mismatch")
             raise _required_policy.RequiredPolicyError("Required workspace branch does not match.")
-        _assert_worktree_not_busy(requested, requested)
-        return requested_resolved, actual_branch or branch_name
+        raise WorktreeContractError(
+            "branch_conflict", requested, branch_name,
+            actual_branch=actual_branch or "detached",
+        )
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        if _ensure_git_worktree(
-            repo_root, target, branch_name, materialization=materialization
-        ) and materialization is None:
-            _note_worktree_base_fallback(conn, task.id, branch_name)
+        if ensure(repo_root, target) and materialization is None:
+            _note_worktree_base_fallback(conn, task.id, branch_name, task.worktree_base_sha)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -10619,10 +10728,8 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    if _ensure_git_worktree(
-        repo_root, requested, branch_name, materialization=materialization
-    ) and materialization is None:
-        _note_worktree_base_fallback(conn, task.id, branch_name)
+    if ensure(repo_root, requested) and materialization is None:
+        _note_worktree_base_fallback(conn, task.id, branch_name, task.worktree_base_sha)
     return requested, branch_name
 
 
@@ -10703,13 +10810,26 @@ def resolve_workspace(
 
 
 def set_workspace_path(
-    conn: sqlite3.Connection, task_id: str, path: Path | str
+    conn: sqlite3.Connection, task_id: str, path: Path | str,
+    *, worktree_base_sha: Optional[str] = None,
 ) -> None:
     request = _workspace_policy.current_request(conn=conn, task_id=task_id, boundary="set_workspace")
     if request is not None:
-        _persist_required_workspace(conn, request, str(path), request.stored_workspace[1])
+        _persist_required_workspace(conn, request, str(path), request.stored_workspace[1],
+                                    base_sha=worktree_base_sha)
         return
     with write_txn(conn):
+        if worktree_base_sha is not None:
+            _validate_worktree_base_sha(worktree_base_sha)
+            updated = conn.execute(
+                "UPDATE tasks SET workspace_path = ?, worktree_base_sha = ? "
+                "WHERE id = ? AND workspace_kind = 'worktree' "
+                "AND (worktree_base_sha IS NULL OR worktree_base_sha = ?)",
+                (str(path), worktree_base_sha, task_id, worktree_base_sha),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("worktree creation base cannot be changed")
+            return
         conn.execute(
             "UPDATE tasks SET workspace_path = ? WHERE id = ?",
             (str(path), task_id),
@@ -10730,32 +10850,46 @@ def set_branch_name(
         )
 
 
-def _persist_required_workspace(conn, request, workspace, branch) -> None:
+def _persist_required_workspace(conn, request, workspace, branch, *, base_sha=None) -> None:
     """Only mutate the request's exact run; caller owns compensating cleanup."""
     if conn is not request.connection:
         request.cancel("connection_mismatch")
         raise _required_policy.RequiredPolicyError("Required workspace connection does not match.")
+    selected_base_sha = request.stored_base_sha if base_sha is None else base_sha
+    if selected_base_sha is not None:
+        try:
+            _validate_worktree_base_sha(selected_base_sha)
+        except ValueError as exc:
+            request.cancel("invalid_worktree_base")
+            raise _required_policy.RequiredPolicyError("Required workspace base is invalid.") from exc
+        fields = dict(zip(_workspace_policy._LAUNCH_FIELDS, request.claim.launch_fields))
+        if (fields["workspace_kind"] != "worktree"
+                or request.stored_base_sha not in (None, selected_base_sha)):
+            request.cancel("worktree_base_changed")
+            raise _required_policy.RequiredPolicyError("Required workspace creation base cannot change.")
     proposed = (workspace, branch)
-    request.checkpoint("before_persist", workspace=workspace, branch=branch)
+    request.checkpoint("before_persist", workspace=workspace, branch=branch, base_oid=selected_base_sha)
     request.pending_workspace = proposed
+    request.pending_base_sha = selected_base_sha
     with write_txn(conn):
         _raise_if_dispatch_paused()
-        request.checkpoint("persist_locked", workspace=workspace, branch=branch)
+        request.checkpoint("persist_locked", workspace=workspace, branch=branch, base_oid=selected_base_sha)
         changed = conn.execute(
-            "UPDATE tasks SET workspace_path = ?, branch_name = ? "
+            "UPDATE tasks SET workspace_path = ?, branch_name = ?, worktree_base_sha = ? "
             "WHERE id = ? AND status = 'running' AND current_run_id = ? AND claim_lock = ? "
-            "AND workspace_path IS ? AND branch_name IS ?",
-            (*proposed, request.claim.task_id, request.claim.run_id,
-             request.claim.claim_lock, *request.stored_workspace),
+            "AND workspace_path IS ? AND branch_name IS ? AND worktree_base_sha IS ?",
+            (*proposed, selected_base_sha, request.claim.task_id, request.claim.run_id,
+             request.claim.claim_lock, *request.stored_workspace, request.stored_base_sha),
         )
         if changed.rowcount != 1:
             request.cancel("workspace_compare_failed")
             raise _required_policy.RequiredPolicyError("Required workspace changed before persistence.")
         request.checkpoint("before_persist_commit", expected_workspace=proposed,
-                           workspace=workspace, branch=branch)
+                           expected_base_sha=selected_base_sha, workspace=workspace,
+                           branch=branch, base_oid=selected_base_sha)
         _raise_if_dispatch_paused()
     _raise_if_dispatch_paused()
-    request.workspace_persisted(proposed)
+    request.workspace_persisted(proposed, base_sha=selected_base_sha)
 
 
 def _restore_required_workspace(conn, request) -> bool:
@@ -10765,7 +10899,7 @@ def _restore_required_workspace(conn, request) -> bool:
         if _controlled_worker_pending(conn, claim.task_id):
             return False
         row = conn.execute(
-            "SELECT status, current_run_id, claim_lock, workspace_path, branch_name, worker_pid "
+            "SELECT status, current_run_id, claim_lock, workspace_path, branch_name, worker_pid, worktree_base_sha "
             "FROM tasks WHERE id = ?", (claim.task_id,),
         ).fetchone()
         run = conn.execute(
@@ -10780,15 +10914,17 @@ def _restore_required_workspace(conn, request) -> bool:
                 or run["worker_pid"] is not None):
             return False
         current = (row["workspace_path"], row["branch_name"])
-        if current == claim.original_workspace:
+        if current == claim.original_workspace and row["worktree_base_sha"] == claim.original_base_sha:
             return True
-        if request.pending_workspace is None or current != request.pending_workspace:
+        if (request.pending_workspace is None or current != request.pending_workspace
+                or row["worktree_base_sha"] != request.pending_base_sha):
             return False
         return conn.execute(
-            "UPDATE tasks SET workspace_path = ?, branch_name = ? "
+            "UPDATE tasks SET workspace_path = ?, branch_name = ?, worktree_base_sha = ? "
             "WHERE id = ? AND status = 'running' AND current_run_id = ? AND claim_lock = ? "
-            "AND workspace_path IS ? AND branch_name IS ?",
-            (*claim.original_workspace, claim.task_id, claim.run_id, claim.claim_lock, *current),
+            "AND workspace_path IS ? AND branch_name IS ? AND worktree_base_sha IS ?",
+            (*claim.original_workspace, claim.original_base_sha, claim.task_id, claim.run_id,
+             claim.claim_lock, *current, request.pending_base_sha),
         ).rowcount == 1
 
 
@@ -11032,11 +11168,17 @@ def _persist_dispatch_workspace(
     if request is not None:
         request.check_task(claimed)
         branch = resolved_branch_name if claimed.workspace_kind == "worktree" else claimed.branch_name
-        _persist_required_workspace(conn, request, str(workspace), branch)
+        _persist_required_workspace(
+            conn, request, str(workspace), branch,
+            base_sha=materialization.selected_base_sha or claimed.worktree_base_sha,
+        )
         claimed.workspace_path, claimed.branch_name = request.stored_workspace
+        claimed.worktree_base_sha = request.stored_base_sha
         return
     original_workspace_path = claimed.workspace_path
     original_branch_name = claimed.branch_name
+    original_base_sha = claimed.worktree_base_sha
+    selected_base_sha = materialization.selected_base_sha or original_base_sha
     branch_name: Optional[str] = None
     fallback_event_id: Optional[int] = None
     if claimed.workspace_kind == "worktree":
@@ -11050,16 +11192,19 @@ def _persist_dispatch_workspace(
             (str(workspace), claimed.id),
         )
         if branch_name is not None:
-            conn.execute(
-                "UPDATE tasks SET branch_name = ? WHERE id = ?",
-                (branch_name, claimed.id),
+            updated = conn.execute(
+                "UPDATE tasks SET branch_name = ?, worktree_base_sha = ? "
+                "WHERE id = ? AND worktree_base_sha IS ?",
+                (branch_name, selected_base_sha, claimed.id, original_base_sha),
             )
+            if updated.rowcount != 1:
+                raise RuntimeError("worktree creation base changed during resolution")
         if materialization.base_fell_back and branch_name is not None:
             _append_event(
                 conn,
                 claimed.id,
                 "worktree_base_fallback",
-                {"branch": branch_name, "base": "HEAD"},
+                {"branch": branch_name, "base": "refs/heads/main", "base_sha": selected_base_sha},
             )
             fallback_event_id = int(
                 conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -11085,18 +11230,20 @@ def _persist_dispatch_workspace(
         try:
             with write_txn(conn):
                 restored = conn.execute(
-                    "UPDATE tasks SET workspace_path = ?, branch_name = ? "
+                    "UPDATE tasks SET workspace_path = ?, branch_name = ?, worktree_base_sha = ? "
                     "WHERE id = ? AND status = 'running' "
                     "AND current_run_id IS ? AND claim_lock IS ? "
-                    "AND workspace_path IS ? AND branch_name IS ?",
+                    "AND workspace_path IS ? AND branch_name IS ? AND worktree_base_sha IS ?",
                     (
                         original_workspace_path,
                         original_branch_name,
+                        original_base_sha,
                         claimed.id,
                         claimed.current_run_id,
                         claimed.claim_lock,
                         str(workspace),
                         persisted_branch_name,
+                        selected_base_sha,
                     ),
                 ).rowcount == 1
                 if restored and fallback_event_id is not None:
@@ -11122,6 +11269,7 @@ def _persist_dispatch_workspace(
     claimed.workspace_path = str(workspace)
     if branch_name is not None:
         claimed.branch_name = branch_name
+        claimed.worktree_base_sha = selected_base_sha
 
 
 # ---------------------------------------------------------------------------
@@ -12549,6 +12697,7 @@ def _record_task_failure(
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
                         "retry_status": retry_status,
+                        **(event_payload_extra or {}),
                     },
                 )
             payload = {
@@ -12593,6 +12742,7 @@ def _record_task_failure(
                 run_metadata = {
                     "failures": failures,
                     "retry_status": retry_status,
+                    **(event_payload_extra or {}),
                 }
                 _annotate_parked_retry_payload(
                     run_metadata,
@@ -12610,6 +12760,7 @@ def _record_task_failure(
                     "error": error[:500],
                     "failures": failures,
                     "retry_status": retry_status,
+                    **(event_payload_extra or {}),
                 }
                 _annotate_parked_retry_payload(
                     event_payload,
@@ -12644,7 +12795,7 @@ def _record_task_failure(
                 )
             # Timeout/crash path's caller already emitted its own event.
     _park_retry_transitions_after_commit(conn, post_commit_transitions)
-    if blocked:
+    if blocked and not (event_payload_extra or {}).get("workspace"):
         # The card is parked for a human: reap the worker's leftovers so a
         # gave-up task never keeps a tmux pane, a lock, or a clean worktree
         # around. The worktree predicates still preserve dirty/unpushed work.
@@ -12666,13 +12817,21 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
+    workspace_error: Optional[Exception] = None,
 ) -> bool:
+    extra = None
+    if workspace_error is not None:
+        extra = {"workspace": (
+            workspace_error.details if isinstance(workspace_error, WorktreeContractError)
+            else {"code": "resolution_failed", "exception_type": type(workspace_error).__name__}
+        )}
     return _record_task_failure(
         conn, task_id, error,
         outcome="spawn_failed",
         failure_limit=failure_limit,
         release_claim=True,
         end_run=True,
+        event_payload_extra=extra,
     )
 
 
@@ -13502,7 +13661,7 @@ def dispatch_kwargs_from_config(board: Optional[str] = None) -> dict:
     }
 
 
-def count_running_tasks(conn: sqlite3.Connection) -> int:
+def count_running_tasks(conn: sqlite3.Connection, *, strict: bool = False) -> int:
     """Return the number of tasks currently in ``status='running'``.
 
     Used by the gateway's multi-board sweep to account for workers on
@@ -13518,7 +13677,9 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
             ).fetchone()[0]
         )
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise RuntimeError("host_capacity_unavailable: cannot count running tasks") from exc
         return 0
 
 
@@ -13533,17 +13694,16 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
 
     Boards are matched by resolved DB path, so the ``HERMES_KANBAN_DB``
     override (which pins every board to one file) naturally yields 0.
-    Fails open per board: one broken/corrupt board must not brick dispatch
-    on the healthy ones.
+    An unreadable board makes the shared budget unknown and refuses admission.
     """
     try:
         current_path = str(kanban_db_path(board=board).expanduser().resolve())
-    except Exception:
-        current_path = None
+    except Exception as exc:
+        raise RuntimeError("host_capacity_unavailable: cannot resolve the current board") from exc
     try:
         boards = list_boards(include_archived=False)
-    except Exception:
-        return 0
+    except Exception as exc:
+        raise RuntimeError("host_capacity_unavailable: cannot enumerate boards") from exc
     total = 0
     for meta in boards:
         slug = meta.get("slug") or DEFAULT_BOARD
@@ -13556,14 +13716,14 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
                 continue
             other = connect(board=slug)
             try:
-                total += count_running_tasks(other)
+                total += count_running_tasks(other, strict=True)
             finally:
                 try:
                     other.close()
                 except Exception:
                     pass
-        except Exception:
-            continue
+        except Exception as exc:
+            raise RuntimeError(f"host_capacity_unavailable: cannot count board {slug!r}") from exc
     return total
 
 
@@ -13616,9 +13776,10 @@ def dispatch_once(
     ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
     the holder is already making progress on the same board.
 
-    The lock is keyed off the board's resolved DB path, so unrelated
-    boards tick in parallel. See :func:`_dispatch_tick_lock` for the
-    cross-process / cross-platform mechanics.
+    A shared-home admission lock covers the host-budget read through worker
+    admission across boards. The board lock remains nested inside it. Both
+    locks are non-blocking and are released before observer hooks. Missing
+    lock paths refuse admission. See :func:`_dispatch_tick_lock`.
     """
     try:
         _raise_if_dispatch_paused()
@@ -13629,28 +13790,15 @@ def dispatch_once(
         return result
     try:
         db_path = kanban_db_path(board=board)
+        host_lock_path = kanban_home().resolve() / "host-admission"
     except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
-        result = _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-            reconcile_orphans=reconcile_orphans,
-        )
+        result = DispatchResult(skipped_locked=True)
         if _emit_tick_hook:
             _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
-    with _dispatch_tick_lock(db_path) as held:
+    with contextlib.ExitStack() as locks:
+        host_held = locks.enter_context(_dispatch_tick_lock(host_lock_path))
+        held = host_held and locks.enter_context(_dispatch_tick_lock(db_path))
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
@@ -13787,7 +13935,7 @@ def _dispatch_once_locked(
     running_count = 0
     spawn_budget: Optional[int] = None
     if max_spawn is not None or max_in_progress is not None:
-        running_count = count_running_tasks(conn)
+        running_count = count_running_tasks(conn, strict=True)
 
     # Convert any concurrency caps into a shared additional-spawns budget
     # for this tick. Both ready and review loops consume from the same
@@ -14140,6 +14288,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                workspace_error=exc,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -14313,6 +14462,7 @@ def _dispatch_once_locked(
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                workspace_error=exc,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
