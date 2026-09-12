@@ -7898,7 +7898,8 @@ def reclaim_task(
         )
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL "
+            "claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ? AND worker_pid IS ? AND current_run_id IS ?",
             (landing_status, task_id, prev_lock, row["worker_pid"], row["current_run_id"]),
@@ -7940,11 +7941,8 @@ def reclaim_task(
         conn,
         ((task_id, retry_status, "reclaimed"),),
     )
-    # Operator intervention — they've looked at the task, so the
-    # consecutive-failures counter is now stale. Give the next retry
-    # a fresh budget. (_clear_failure_counter opens its own write_txn,
-    # so it runs after the enclosing one commits.)
-    _clear_failure_counter(conn, task_id)
+    # The exact reclaimed attempt's failure budget was reset in its transition
+    # transaction. A later task-ID-only reset could erase a successor's failure.
     # Release the worktree lock only if the worker really died; a survivor
     # keeps its lock so the retry defers as ``workspace_busy``.
     _unlock_task_worktree(conn, task_id)
@@ -10295,7 +10293,9 @@ def complete_task(
                    claim_expires= NULL,
                    worker_pid   = NULL,
                    block_kind   = NULL,
-                   block_recurrences = 0
+                   block_recurrences = 0,
+                   consecutive_failures = 0,
+                   last_failure_error = NULL
              WHERE id = ?
                AND status = ?
                AND current_run_id IS ?
@@ -10429,11 +10429,8 @@ def complete_task(
                     },
                     run_id=run_id,
                 )
-    # Successful completion — wipe the consecutive-failures counter.
-    # Failure history stays on the event log for audit; the counter
-    # just tracks "is there a current pathology the breaker should
-    # care about", and a success resets that question.
-    _clear_failure_counter(conn, task_id)
+    # Failure counters were reset atomically with the exact completed attempt;
+    # an already-started successor owns any failure recorded after that commit.
     # Recompute ready status for dependents (separate txn so children see done).
     _recompute_ready_after_committed_mutation(conn)
     # Release the finished worker's worktree lock, then clean up the
@@ -15921,9 +15918,9 @@ def _required_policy_present_or_invalid() -> bool:
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     """Reset the unified consecutive-failures counter.
 
-    Called from ``complete_task`` on successful completion — a fresh
-    success means the task + profile combination is working and any
-    past failures are history. NOT called on spawn success anymore:
+    Compatibility helper for explicit standalone resets. Completion and manual
+    reclaim reset inside their exact transition transaction instead. NOT called
+    on spawn success:
     a successful spawn proves the worker could start but says nothing
     about whether the run will succeed, so we need to let timeouts and
     crashes accumulate across spawn boundaries.

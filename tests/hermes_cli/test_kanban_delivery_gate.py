@@ -1188,6 +1188,10 @@ def test_rate_limited_review_retry_obeys_respawn_cooldown(
     monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
     now = int(time.time())
+    # Keep setup in the same clock epoch as the injected reviewer exit. If a
+    # second ticks during setup, the older builder can otherwise appear to
+    # have ended after that reviewer and this tests the wrong latest run.
+    monkeypatch.setattr(kb.time, "time", lambda: now)
     with kb.connect() as conn:
         task_id, builder_run = _create_claimed_code_task(conn)
         review_run = _submit_and_claim_review(conn, task_id, builder_run)
