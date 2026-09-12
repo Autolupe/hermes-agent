@@ -10408,6 +10408,8 @@ def complete_task(
                 task_id=task_id,
                 run_id=int(expected_run_id),
             )
+        cleanup_snapshot = _workspace_cleanup_snapshot(conn, task_id)
+        cleanup_parents = _workspace_cleanup_parents(conn, task_id)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -10435,8 +10437,8 @@ def complete_task(
     _recompute_ready_after_committed_mutation(conn)
     # Release the finished worker's worktree lock, then clean up the
     # scratch workspace and any stale tmux session for the worker.
-    _unlock_task_worktree(conn, task_id, _prior_pid)
-    _cleanup_workspace(conn, task_id)
+    _cleanup_workspace(conn, task_id, expected_snapshot=cleanup_snapshot,
+                       parent_snapshots=cleanup_parents, prior_pid=_prior_pid)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_kanban_lifecycle_hook(
@@ -10733,7 +10735,71 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return is_managed
 
 
-def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+def _workspace_cleanup_snapshot(conn: sqlite3.Connection, task_id: str) -> Optional[tuple]:
+    """Bind cleanup data to a terminal task, its latest attempt and event.
+
+    This is a cleanup comparison token, not worker or delivery authorization.
+    Capture it inside the terminal transaction; compare it again under the
+    cleanup write lock so a reopened/reassigned task cannot inherit cleanup.
+    """
+    row = conn.execute(
+        "SELECT status, workspace_kind, workspace_path, branch_name, worker_pid, "
+        "claim_lock, current_run_id, completed_at, assignee, worktree_base_sha, "
+        "project_id, tenant FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
+    if (row is None or row[0] not in {"done", "archived"}
+            or any(value is not None for value in row[4:7])):
+        return None
+    run_id = conn.execute("SELECT MAX(id) FROM task_runs WHERE task_id=?", (task_id,)).fetchone()[0]
+    event_id = conn.execute(
+        "SELECT MAX(id) FROM task_events WHERE task_id=? AND kind IN ('completed','archived')",
+        (task_id,),
+    ).fetchone()[0]
+    if event_id is None:
+        return None
+    directory = None
+    if row[2]:
+        try:
+            metadata = Path(row[2]).expanduser().lstat()
+            directory = (metadata.st_dev, metadata.st_ino, metadata.st_mode)
+        except OSError:
+            pass
+    return tuple(row), run_id, event_id, directory
+
+
+def _workspace_cleanup_parents(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Capture only the parents linked at the child's terminal commit."""
+    return {
+        row[0]: _workspace_cleanup_snapshot(conn, row[0])
+        for row in conn.execute("SELECT parent_id FROM task_links WHERE child_id=?", (task_id,))
+    }
+
+
+def _cleanup_workspace(
+    conn: sqlite3.Connection, task_id: str, *, expected_snapshot=None,
+    parent_snapshots=None, prior_pid=None,
+) -> None:
+    """Serialize exact-terminal cleanup with cooperating board writers.
+
+    No caller-owned transaction is accepted. Failure preserves the workspace;
+    cleanup never rolls back the already committed terminal result. Existing
+    Git/tmux command timeouts still apply while this write lock is held.
+    """
+    if expected_snapshot is None:
+        return
+    try:
+        with write_txn(conn):
+            if (_workspace_cleanup_snapshot(conn, task_id) != expected_snapshot
+                    or _controlled_worker_pending(conn, task_id)
+                    or _active_delivery_operation(conn, task_id) is not None):
+                return
+            _unlock_task_worktree(conn, task_id, prior_pid)
+            _cleanup_workspace_locked(conn, task_id, parent_snapshots=parent_snapshots or {})
+    except Exception:
+        _log.debug("Workspace cleanup deferred for %s", task_id, exc_info=True)
+
+
+def _cleanup_workspace_locked(conn: sqlite3.Connection, task_id: str, *, parent_snapshots: dict) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
@@ -10742,6 +10808,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     when provably free of work (clean tree, every commit reachable from a
     remote-tracking ref); ``dir`` workspaces are intentionally preserved.
     """
+    if not conn.in_transaction:
+        return
     try:
         if (_controlled_worker_pending(conn, task_id)
                     or _active_delivery_operation(conn, task_id) is not None):
@@ -10758,7 +10826,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
             # (e.g. a 'dir' child whose scratch parent was waiting on it). #33774
-            _try_cleanup_parent_workspaces(conn, task_id)
+            _try_cleanup_parent_workspaces(conn, task_id, expected_snapshots=parent_snapshots)
             return
         # Check if this task has children that still need the workspace.
         # If any child is not yet done/archived, defer cleanup so the
@@ -10785,7 +10853,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             _cleanup_worker_tmux(conn, task_id)
             _unlock_task_worktree(conn, task_id)
             _cleanup_worktree_workspace(task_id, path, row["branch_name"])
-            _try_cleanup_parent_workspaces(conn, task_id)
+            _try_cleanup_parent_workspaces(conn, task_id, expected_snapshots=parent_snapshots)
             return
         import shutil
         wp = Path(path)
@@ -10811,7 +10879,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # After cleaning up this task's workspace, check if any parent
         # tasks now have all children done — their deferred cleanup can
         # proceed (#33774).
-        _try_cleanup_parent_workspaces(conn, task_id)
+        _try_cleanup_parent_workspaces(conn, task_id, expected_snapshots=parent_snapshots)
     except Exception:
         pass
 
@@ -10884,7 +10952,9 @@ def _cleanup_worktree_workspace(
         pass  # best-effort — never block completion
 
 
-def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
+def _try_cleanup_parent_workspaces(
+    conn: sqlite3.Connection, task_id: str, *, expected_snapshots: dict,
+) -> None:
     """Clean up parent scratch workspaces now that *task_id* completed.
 
     When a parent task's cleanup was deferred because it had active children,
@@ -10892,12 +10962,19 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
     parent are now done/archived/failed/cancelled, the parent's scratch
     workspace is removed (#33774).
     """
+    if not conn.in_transaction:
+        return
     try:
         parents = conn.execute(
             "SELECT parent_id FROM task_links WHERE child_id = ?",
             (task_id,),
         ).fetchall()
         for (parent_id,) in parents:
+            expected = expected_snapshots.get(parent_id)
+            if (expected is None or _workspace_cleanup_snapshot(conn, parent_id) != expected
+                    or _controlled_worker_pending(conn, parent_id)
+                    or _active_delivery_operation(conn, parent_id) is not None):
+                continue
             row = conn.execute(
                 "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?",
                 (parent_id,),
@@ -12580,13 +12657,16 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
+        cleanup_snapshot = _workspace_cleanup_snapshot(conn, task_id)
+        cleanup_parents = _workspace_cleanup_parents(conn, task_id)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     _recompute_ready_after_committed_mutation(conn)
     # Reap the workspace on archive too — tasks archived without ever
     # completing previously kept their scratch dir / worktree forever.
-    _cleanup_workspace(conn, task_id)
+    _cleanup_workspace(conn, task_id, expected_snapshot=cleanup_snapshot,
+                       parent_snapshots=cleanup_parents)
     return True
 
 
