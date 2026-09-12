@@ -127,7 +127,11 @@ def test_descendant_invalidation_preserves_every_held_status(board, status, monk
             _hold(conn, task_id, request.run_id)
         before = _snapshot(conn)
         monkeypatch.setattr(kb, "_terminate_reclaimed_worker", lambda *_a: pytest.fail("guessed worker cleanup"))
-        with pytest.raises(kb._required_policy.RequiredPolicyError):
+        # Shipping is now refused even without an operation row, before the
+        # narrower held-worker check. Both paths preserve the whole graph.
+        refusal = (kb.DeliveryOperationInProgressError if status == "shipping"
+                   else kb._required_policy.RequiredPolicyError)
+        with pytest.raises(refusal):
             kb.invalidate_descendants_for_parent_reopen(conn, ancestor, author="fixture")
         assert _snapshot(conn) == before
 

@@ -20,6 +20,8 @@ import json
 import os
 import re
 import shlex
+import sqlite3
+import stat
 import sys
 import time
 from pathlib import Path
@@ -634,6 +636,24 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_submit_review.add_argument("--summary", default=None, help="Short implementation and verification handoff.")
     p_submit_review.add_argument("--metadata", default=None, help="JSON object with structured reviewer handoff facts.")
 
+    p_reconcile = sub.add_parser(
+        "reconcile-delivery",
+        help="Preview historical delivery-record repairs, or apply an explicitly saved manifest",
+    )
+    p_reconcile.add_argument(
+        "--limit", type=int, default=None, metavar="1..1000",
+        help="Maximum preview candidates (default: 1000); preview only.",
+    )
+    reconcile_mode = p_reconcile.add_mutually_exclusive_group()
+    reconcile_mode.add_argument(
+        "--manifest-out", default=None, metavar="PATH",
+        help="Save the preview JSON to a new file; never overwrite an existing path.",
+    )
+    reconcile_mode.add_argument(
+        "--apply-manifest", default=None, metavar="PATH",
+        help="Apply this bounded, validated manifest to its original existing board.",
+    )
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -1087,6 +1107,17 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
+    if action == "reconcile-delivery":
+        # Reject every worker capability before board resolution, manifest
+        # path handling, database access, or the normal schema initializer.
+        from hermes_cli.kanban_delivery_reconcile import require_operator
+
+        try:
+            require_operator()
+        except (PermissionError, RuntimeError) as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 1
+
     if (
         os.environ.get("HERMES_KANBAN_TERMINAL_SANDBOX") == "systemd-v1"
         or os.environ.get("HERMES_KANBAN_DELIVERY_CONTROL") == "clauseye-v1"
@@ -1103,6 +1134,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "init", "boards", "repair", "claim", "assign", "set-model", "reclaim",
             "reassign", "edit", "unblock", "reopen-review", "promote",
             "archive", "dispatch", "daemon", "gc", "specify", "decompose",
+            "reconcile-delivery",
         }
         if action in operator_actions:
             print("kanban: this action requires an operator outside a worker run", file=sys.stderr)
@@ -1167,6 +1199,12 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
+        if action == "reconcile-delivery":
+            try:
+                return _cmd_reconcile_delivery(args)
+            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 1
         try:
             kb.init_db()
         except Exception as exc:
@@ -1263,6 +1301,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach",
     "attach-rm",
     "complete",
+    "reconcile-delivery",
     "submit-for-review",
     "request-review",
     "request-changes",
@@ -2394,6 +2433,120 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
             exc_info=True,
         )
     return reason if verdict != "done" else None
+
+
+def _read_delivery_repair_manifest(path: str) -> dict:
+    from hermes_cli import kanban_delivery_reconcile as repair
+
+    from hermes_cli.sqlite_safe_read import offline_file_access
+
+    repair.require_operator()
+    # A mistyped manifest path must not cancel another tracked database's
+    # process locks by opening and closing its raw file.
+    with offline_file_access(path, what="read a delivery repair manifest from"):
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("delivery repair manifest must be a regular file")
+            if info.st_size > repair.MAX_MANIFEST_BYTES:
+                raise ValueError("delivery repair manifest is too large")
+            with os.fdopen(fd, "rb") as manifest_file:
+                fd = None
+                raw = manifest_file.read(repair.MAX_MANIFEST_BYTES + 1)
+            if len(raw) > repair.MAX_MANIFEST_BYTES:
+                raise ValueError("delivery repair manifest is too large")
+            manifest = json.loads(raw)
+            if not isinstance(manifest, dict):
+                raise ValueError("delivery repair manifest must be a JSON object")
+            return manifest
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def _write_delivery_repair_manifest(path: str, manifest: dict) -> None:
+    from hermes_cli import kanban_delivery_reconcile as repair
+
+    repair.require_operator()
+    data = (json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+    if len(data) > repair.MAX_MANIFEST_BYTES:
+        raise ValueError("delivery repair manifest is too large to save; select fewer tasks")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as manifest_file:
+        manifest_file.write(data)
+        manifest_file.flush()
+        os.fsync(manifest_file.fileno())
+
+
+def _open_delivery_repair_board(board: str, *, writable: bool = False):
+    """Open only an existing tracked database; never initialize or migrate."""
+    from hermes_cli.kanban_delivery_reconcile import require_operator
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    require_operator()
+    path = kb.kanban_db_path(board=board).expanduser().absolute()
+    mode = "rw" if writable else "ro"
+    conn = connect_tracked(
+        path.as_uri() + f"?mode={mode}",
+        uri=True,
+        isolation_level=None,
+        timeout=kb._resolve_busy_timeout_ms() / 1000.0,
+    )
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        if not writable:
+            conn.execute("PRAGMA query_only=ON")
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
+def _cmd_reconcile_delivery(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_delivery_reconcile as repair
+    from hermes_cli.kanban_board_identity import BoardIdentityError, read_board_identity
+
+    repair.require_operator()
+    board = kb._normalize_board_slug(getattr(args, "board", None)) or kb.get_current_board()
+    apply_path = getattr(args, "apply_manifest", None)
+    manifest_out = getattr(args, "manifest_out", None)
+    limit = getattr(args, "limit", None)
+    if limit is not None and (type(limit) is not int or not 1 <= limit <= repair.MAX_ENTRIES):
+        raise ValueError("--limit must be between 1 and 1000")
+    if apply_path is not None and (manifest_out is not None or limit is not None):
+        raise ValueError("--manifest-out and --limit are preview options; omit them when applying a manifest")
+
+    manifest = None
+    if apply_path is not None:
+        manifest = _read_delivery_repair_manifest(apply_path)
+        # Validate bounded structure, digest, and board before opening SQLite.
+        repair._validate_manifest(manifest, board=board)
+    try:
+        with contextlib.closing(_open_delivery_repair_board(board, writable=manifest is not None)) as conn:
+            if read_board_identity(conn) is None:
+                raise ValueError(
+                    "delivery repair requires an updated board schema; this command does not initialize or migrate it"
+                )
+            if manifest is not None:
+                result = repair.apply_delivery_repair(conn, manifest, board=board)
+            else:
+                result = repair.preview_delivery_repair(
+                    conn, board=board, limit=limit if limit is not None else repair.MAX_ENTRIES,
+                )
+    except BoardIdentityError as exc:
+        if "no persisted identity" in str(exc):
+            raise ValueError(
+                "delivery repair requires an updated board schema; this command does not initialize or migrate it"
+            ) from exc
+        raise
+    if manifest_out is not None:
+        _write_delivery_repair_manifest(manifest_out, result)
+    print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
+    return 0
 
 
 def _delivery_json_argument(raw: Optional[str], flag: str) -> Optional[dict]:

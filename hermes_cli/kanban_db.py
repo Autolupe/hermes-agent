@@ -95,6 +95,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli import kanban_policy as _required_policy
 from hermes_cli import kanban_workspace_policy as _workspace_policy
+from hermes_cli import kanban_board_identity as _board_identity
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -2908,31 +2909,91 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
+    if d.is_symlink() or not d.is_dir():
+        raise ValueError("board removal requires its real directory")
+    directory_stat = d.stat()
+    path = d / "kanban.db"
+    token = secrets.token_hex(16)
+    archive_root = boards_root() / "_archived"
+    archive_root.mkdir(parents=True, exist_ok=True)
+    target = archive_root / f"{normed}-{int(time.time())}-{token}"
+    # Bind the directory being removed, ignoring a process-wide DB override.
+    with connect_closing(path) as conn:
+        with write_txn(conn):
+            binding = _board_identity.board_binding(conn)
+            if conn.execute(
+                "SELECT 1 FROM tasks WHERE status IN ('running', 'shipping') "
+                "OR current_run_id IS NOT NULL OR claim_lock IS NOT NULL "
+                "OR claim_expires IS NOT NULL OR worker_pid IS NOT NULL LIMIT 1"
+            ).fetchone() is not None or conn.execute(
+                "SELECT 1 FROM task_runs WHERE ended_at IS NULL LIMIT 1"
+            ).fetchone() is not None:
+                raise ValueError("board has an owned or unfinished worker run")
+            if conn.execute(
+                "SELECT 1 FROM delivery_control_operations "
+                "WHERE state NOT IN ('committed', 'rejected') LIMIT 1"
+            ).fetchone() is not None:
+                raise ValueError("board has an unresolved delivery operation")
+            held_tasks = conn.execute(
+                "SELECT DISTINCT task_id FROM task_events WHERE kind='controlled_worker_held'"
+            ).fetchall()
+            if any(_controlled_worker_pending(conn, row[0]) for row in held_tasks):
+                raise ValueError("board still has a held worker")
+            _board_identity.retire_board_identity(conn, token)
+
+        # Retirement is durable before the filesystem moves: already-open
+        # connections and writers racing this rename now refuse write_txn.
+        try:
+            observed = d.stat()
+            current_binding = _board_identity.board_binding(conn)
+            if (
+                (observed.st_dev, observed.st_ino)
+                != (directory_stat.st_dev, directory_stat.st_ino)
+                or any(current_binding[key] != binding[key]
+                       for key in ("board_uuid", "db_path", "device", "inode"))
+            ):
+                raise ValueError("board path changed during retirement")
+            d.rename(target)
+        except BaseException:
+            # Only a failed pre-move rename may restore this exact identity.
+            # A replaced path or partial deletion stays retired for recovery.
+            try:
+                observed = d.stat()
+                current_binding = _board_identity.board_binding(conn)
+                same_path = (
+                    (observed.st_dev, observed.st_ino)
+                    == (directory_stat.st_dev, directory_stat.st_ino)
+                    and all(current_binding[key] == binding[key]
+                            for key in ("board_uuid", "db_path", "device", "inode"))
+                )
+                if same_path:
+                    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+                    try:
+                        _board_identity.restore_board_identity(
+                            conn, board_uuid=binding["board_uuid"], retirement_token=token,
+                        )
+                        _execute_boundary_with_retry(conn, "COMMIT")
+                    except BaseException:
+                        conn.rollback()
+                        raise
+            except BaseException:
+                _log.warning("failed board removal remains retired; inspect %s", d)
+            raise
+        finally:
+            _INITIALIZED_PATHS.discard(str(path.resolve()))
+
     if get_current_board() == normed:
         clear_current_board()
-
-    # A concurrent connect(board=normed) after the rename/delete recreates
-    # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
-    # dropped first so the schema init pass re-runs on that fresh file.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
-
     if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        # Avoid collision on rapid double-archives.
-        suffix = 1
-        while target.exists():
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
         return {"slug": normed, "action": "archived", "new_path": str(target)}
-    else:
-        import shutil
-        shutil.rmtree(d)
-        return {"slug": normed, "action": "deleted", "new_path": ""}
+    try:
+        # Delete the retired staging directory, never a newly recreated slug.
+        shutil.rmtree(target)
+    except OSError as exc:
+        raise ValueError(
+            f"board was retired but deletion failed; recover remaining data at {target}"
+        ) from exc
+    return {"slug": normed, "action": "deleted", "new_path": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -3222,7 +3283,7 @@ class Event:
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA_SQL = """
+SCHEMA_SQL = _board_identity.SCHEMA_SQL + """
 CREATE TABLE IF NOT EXISTS tasks (
     id                   TEXT PRIMARY KEY,
     title                TEXT NOT NULL,
@@ -4226,11 +4287,8 @@ def repair_db(
 def _schema_is_present(conn: sqlite3.Connection) -> bool:
     """Whether an open connection actually sees the kanban schema.
 
-    ``tasks`` is the sentinel: :data:`SCHEMA_SQL` always creates it, and
-    SQLite loses tables all-or-nothing (a file is either the one we
-    initialized or a fresh one created by this very open), so one
-    ``sqlite_master`` lookup on the already-resident page 1 is enough. Cheap
-    by design — it runs on every steady-state :func:`connect`.
+    Both the tasks table and durable identity must survive a path replacement.
+    This uses the already-open connection, never a raw database descriptor.
     """
     try:
         row = conn.execute(
@@ -4240,7 +4298,7 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
         # Unreadable schema table is not this guard's call — let the full init
         # path's header/integrity probes classify and quarantine it.
         return False
-    return row is not None
+    return row is not None and _board_identity.read_board_identity(conn) is not None
 
 
 def connect(
@@ -4373,9 +4431,12 @@ def connect(
                     # process are cheap. The lock prevents same-process dispatcher
                     # threads from racing through the additive ALTER TABLE pass with
                     # stale PRAGMA snapshots during gateway startup.
-                    conn.executescript(SCHEMA_SQL)
-                    _migrate_add_optional_columns(conn)
-                    _migrate_delivery_control_summary(conn)
+                    identity = _board_identity.read_board_identity(conn)
+                    if identity is None or identity["state"] == "active":
+                        conn.executescript(SCHEMA_SQL)
+                        _migrate_add_optional_columns(conn)
+                        _migrate_delivery_control_summary(conn)
+                        _board_identity.initialize_board_identity(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
             conn.close()
@@ -4985,6 +5046,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     error, including a SQLite auto-rollback which leaves no active transaction.
     """
     _assert_not_delegated_child_mutation()
+    _board_identity.assert_board_writable(conn)
     if getattr(conn, "in_transaction", False):
         if not allow_nested:
             raise RuntimeError(
@@ -4996,6 +5058,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
         savepoint = f"hermes_nested_{secrets.token_hex(8)}"
         try:
             conn.execute(f"SAVEPOINT {savepoint}")
+            _board_identity.assert_board_writable(conn)
             yield conn
             conn.execute(f"RELEASE {savepoint}")
         except BaseException:
@@ -5009,6 +5072,7 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
     try:
         _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+        _board_identity.assert_board_writable(conn)
         yield conn
     except BaseException:
         try:
@@ -6085,6 +6149,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
+        if _controlled_worker_pending(conn, task_id):
+            return False
         _refuse_active_delivery_operation(conn, task_id)
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
@@ -6203,6 +6269,8 @@ def set_model_override(
     if not model:
         provider = None
     with write_txn(conn):
+        if _controlled_worker_pending(conn, task_id):
+            return False
         _refuse_active_delivery_operation(conn, task_id)
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -6243,6 +6311,8 @@ def set_reasoning_effort(
     """
     effort = normalize_reasoning_effort(effort)
     with write_txn(conn):
+        if _controlled_worker_pending(conn, task_id):
+            return False
         _refuse_active_delivery_operation(conn, task_id)
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (task_id,)
@@ -6273,6 +6343,8 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
+        if any(_controlled_worker_pending(conn, tid) for tid in (parent_id, child_id)):
+            raise RuntimeError("held worker cleanup is pending; dependency edits are paused")
         _refuse_active_delivery_operation(conn, parent_id)
         _refuse_active_delivery_operation(conn, child_id)
         missing = _find_missing_parents(conn, [parent_id, child_id])
@@ -6327,6 +6399,8 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
+        if any(_controlled_worker_pending(conn, tid) for tid in (parent_id, child_id)):
+            raise RuntimeError("held worker cleanup is pending; dependency edits are paused")
         _refuse_active_delivery_operation(conn, parent_id)
         _refuse_active_delivery_operation(conn, child_id)
         cur = conn.execute(
@@ -6945,11 +7019,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'terminal_reconciled', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'terminal_reconciled', 'legacy_delivery_gap', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] in {"blocked", "terminal_reconciled"}
+    return bool(row) and row["kind"] in {"blocked", "terminal_reconciled", "legacy_delivery_gap"}
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
@@ -6963,7 +7037,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     row = conn.execute(
         "SELECT payload FROM task_events "
         "WHERE task_id = ? AND kind IN ("
-        "'blocked', 'terminal_reconciled', 'block_loop_detected', 'dependency_wait', 'gave_up', "
+        "'blocked', 'terminal_reconciled', 'legacy_delivery_gap', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_requested', 'review_reopened', "
         "'status', 'reclaimed', 'reconciled', 'dispatch_parked', "
         "'dispatch_paused', 'workspace_busy', 'stale', 'timed_out', 'scheduled', "
@@ -7774,6 +7848,7 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and restore its source phase.
 
@@ -7784,16 +7859,21 @@ def reclaim_task(
     for the TTL to expire (e.g. after seeing a hallucination warning).
 
     Returns True if a reclaim happened, False if the task isn't in a
-    reclaimable state (not running, or doesn't exist).
+    reclaimable state (not running, or doesn't exist). A run-specific caller
+    must supply ``expected_run_id`` so a stale request cannot target a newer run.
     """
     _refuse_active_delivery_operation(conn, task_id)
     if _controlled_worker_pending(conn, task_id):
         return False
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT id, status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
+        return False
+    if expected_run_id is not None and row["current_run_id"] != expected_run_id:
+        return False
+    if row["current_run_id"] is not None and not _recovery_run_matches(conn, row):
         return False
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
@@ -7810,6 +7890,8 @@ def reclaim_task(
         _refuse_active_delivery_operation(conn, task_id)
         if _controlled_worker_pending(conn, task_id):
             return False
+        if row["current_run_id"] is not None and not _recovery_run_matches(conn, row):
+            return False
         retry_status = _retry_status_for_run(conn, task_id)
         landing_status, parked_by_dispatch_brake = (
             _park_runnable_status_if_dispatch_paused(retry_status)
@@ -7818,8 +7900,8 @@ def reclaim_task(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (landing_status, task_id, prev_lock),
+            "AND claim_lock IS ? AND worker_pid IS ? AND current_run_id IS ?",
+            (landing_status, task_id, prev_lock, row["worker_pid"], row["current_run_id"]),
         )
         if cur.rowcount != 1:
             return False
@@ -8196,7 +8278,10 @@ def _refuse_active_delivery_operation(
 ) -> None:
     """Raise before an ordinary writer can invalidate a broker operation."""
 
-    if _active_delivery_operation(conn, task_id, run_id) is not None:
+    shipping = conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ? AND status = 'shipping'", (task_id,),
+    ).fetchone()
+    if shipping is not None or _active_delivery_operation(conn, task_id, run_id) is not None:
         raise DeliveryOperationInProgressError(
             "trusted delivery is in progress; retry after control-plane reconciliation"
         )
@@ -12133,6 +12218,9 @@ def specify_triage_task(
     # waiting behind another SQLite writer.
     _raise_if_dispatch_paused()
     with write_txn(conn):
+        if _controlled_worker_pending(conn, task_id):
+            return False
+        _refuse_active_delivery_operation(conn, task_id)
         _raise_if_dispatch_paused()
         existing = conn.execute(
             "SELECT title, body, assignee, workspace_kind, branch_name FROM tasks "
@@ -12313,6 +12401,9 @@ def decompose_triage_task(
     now = int(time.time())
     child_ids: list[str] = []
     with write_txn(conn):
+        if _controlled_worker_pending(conn, task_id):
+            return None
+        _refuse_active_delivery_operation(conn, task_id)
         # BEGIN IMMEDIATE may have waited on another writer. A halt or ESTOP
         # engaged during that wait must win before any child, link, comment,
         # event, or root-status mutation.
@@ -12472,6 +12563,8 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        if _controlled_worker_pending(conn, task_id):
+            return False
         _refuse_active_delivery_operation(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
