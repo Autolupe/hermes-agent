@@ -3,6 +3,7 @@
 import contextlib
 from contextvars import copy_context
 from dataclasses import FrozenInstanceError, fields, is_dataclass
+import json
 import os
 import sqlite3
 from types import SimpleNamespace
@@ -288,7 +289,7 @@ def test_denial_at_capture_boundaries_cancels_without_retaining_partial_context(
         request.capture_database_context()
 
 
-@pytest.mark.parametrize("operation", ["collect_worker_context", "render_worker_context"])
+@pytest.mark.parametrize("operation", ["collect_worker_context", "render_worker_context", "collect_task_show"])
 @pytest.mark.parametrize("error", [OSError, KeyboardInterrupt, SystemExit])
 def test_capture_error_or_interrupt_rolls_back_own_transaction_and_cancels(
     native, monkeypatch, operation, error,
@@ -468,3 +469,165 @@ def test_ordinary_dispatch_skill_and_callback_behavior_unchanged(native, monkeyp
     assert result.spawned == [(task.id, "default", str(native.workspace))]
     assert native.provider.requests == []
     assert kb.get_task(native.conn, task.id).skills == ["domain"]
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_initial_show_and_comment_watermark_share_original_request_snapshot(native, monkeypatch, lane):
+    task = make_task(native, lane)
+    other = make_task(native)
+    for comment_id, task_id, timestamp in [(5, task.id, 300), (7, task.id, 100),
+                                            (9, task.id, 200), (500, other.id, 400)]:
+        native.conn.execute(
+            "INSERT INTO task_comments(id, task_id, author, body, created_at) VALUES (?, ?, ?, ?, ?)",
+            (comment_id, task_id, "fixture", f"comment {comment_id}", timestamp),
+        )
+    native.conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (task.id, other.id))
+    native.conn.execute(
+        "INSERT INTO task_events(task_id, kind, payload, created_at, run_id) VALUES (?, ?, ?, ?, ?)",
+        (task.id, "fixture", '{"nested": {"values": [1, 2]}}', 1_700_000_000, task.current_run_id),
+    )
+    native.conn.commit()
+    with request_for(native, task, lane) as request:
+        persist(native, request)
+        captured = request.capture_database_context()
+        show = captured.initial_show
+        data = json.loads(show.response_json)
+        assert data["worker_context"] == captured.text
+        assert data["task"]["id"] == task.id
+        assert data["task"]["current_run_id"] == request.claim.run_id
+        assert data["children"] == [other.id]
+        assert show.child_ids == (other.id,)
+        assert show.parent_ids == ()
+        assert show.comment_ids == (7, 9, 5)
+        assert show.comment_watermark == 9
+        assert [item["body"] for item in data["comments"]] == ["comment 7", "comment 9", "comment 5"]
+        assert show.run_ids == (request.claim.run_id,)
+        assert show.event_ids == tuple(event.id for event in kb.list_events(native.conn, task.id)[-50:])
+        # The explicit marker sees same-second/newer-ID notes even when their
+        # display timestamps precede comments in the initial view.
+        with monkeypatch.context() as clock:
+            clock.setattr(kb.time, "time", lambda: 200)
+            added = kb.add_comment(native.conn, task.id, author="fixture", body="next note")
+        assert [comment.id for comment in kb.list_comments_after(
+            native.conn, task.id, after_id=show.comment_watermark,
+        )] == [added]
+        assert kb.list_comments(native.conn, task.id)[-1].id == 5
+        assert captured.initial_show is show
+        assert "next note" not in show.response_json
+        data["events"][0]["payload"]["nested"]["values"].append("mutated decoded copy")
+        assert "mutated decoded copy" not in show.response_json
+    with pytest.raises(FrozenInstanceError):
+        show.comment_watermark = 500
+
+
+def test_empty_comment_watermark_is_zero(native):
+    task = make_task(native)
+    with request_for(native, task) as request:
+        persist(native, request)
+        captured = request.capture_database_context()
+        assert captured.initial_show.comment_ids == ()
+        assert captured.initial_show.comment_watermark == 0
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_initial_show_retains_parent_and_exact_displayed_event_tail_ids(native, lane):
+    task = make_task(native, lane)
+    parent = make_task(native)
+    native.conn.execute("INSERT INTO task_links(parent_id, child_id) VALUES (?, ?)", (parent.id, task.id))
+    for index in range(64):
+        native.conn.execute(
+            "INSERT INTO task_events(task_id, kind, payload, created_at, run_id) VALUES (?, ?, ?, ?, ?)",
+            (task.id, f"fixture_{index}", "{}", 1_700_000_000 + 64 - index, task.current_run_id),
+        )
+    native.conn.commit()
+    with request_for(native, task, lane) as request:
+        persist(native, request)
+        captured = request.capture_database_context()
+        show = captured.initial_show
+        data = json.loads(show.response_json)
+        events = kb.list_events(native.conn, task.id)
+        assert len(events) > 50
+        assert len(show.event_ids) == len(data["events"]) == 50
+        assert show.event_ids == tuple(event.id for event in events[-50:])
+        assert show.event_ids != tuple(sorted(show.event_ids))
+        assert [event["kind"] for event in data["events"]] == [event.kind for event in events[-50:]]
+        assert show.parent_ids == (parent.id,)
+        assert data["parents"] == [parent.id]
+
+
+def test_initial_show_reuses_captured_text_without_another_clock_or_renderer(native, monkeypatch):
+    task = make_task(native)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("initial show rebuilt the captured display")
+
+    with request_for(native, task) as request:
+        persist(native, request)
+        monkeypatch.setattr(kb, "build_worker_context", forbidden)
+        captured = request.capture_database_context()
+        assert json.loads(captured.initial_show.response_json)["worker_context"] == captured.text
+
+
+def test_initial_show_readers_hold_original_transaction_and_block_other_writer(native, monkeypatch):
+    task = make_task(native)
+    seen = []
+    with contextlib.closing(sqlite3.connect(native.path, timeout=0)) as other:
+        for name in ("list_events", "parent_ids", "child_ids"):
+            original = getattr(kb, name)
+
+            def read(conn, task_id, _original=original, _name=name):
+                assert conn is native.conn and conn.in_transaction
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    other.execute(
+                        "INSERT INTO task_comments(task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                        (task.id, "fixture", "must not slip between reads", 1),
+                    )
+                other.rollback()
+                seen.append(_name)
+                return _original(conn, task_id)
+
+            monkeypatch.setattr(kb, name, read)
+        with request_for(native, task) as request:
+            persist(native, request)
+            captured = request.capture_database_context()
+            assert captured.initial_show.comment_ids == ()
+    assert seen == ["list_events", "parent_ids", "child_ids"]
+
+
+def test_missing_initial_view_cancels_without_publishing_context(native, monkeypatch):
+    task = make_task(native)
+    with refusal():
+        with request_for(native, task) as request:
+            persist(native, request)
+            monkeypatch.setattr(kb, "collect_task_show", lambda *args, **kwargs: None)
+            request.capture_database_context()
+    assert request.cancelled and request.database_context is None
+
+
+def test_initial_show_collection_cannot_reenter_capture(native, monkeypatch):
+    task = make_task(native)
+    with refusal():
+        with request_for(native, task) as request:
+            persist(native, request)
+            monkeypatch.setattr(kb, "collect_task_show", lambda *args, **kwargs: request.capture_database_context())
+            request.capture_database_context()
+    assert request.cancelled and request.database_context is None
+    assert not native.conn.in_transaction
+
+
+def test_data_only_initial_show_preserves_caller_rollback_and_retains_no_connection(native):
+    task = make_task(native)
+    native.conn.execute("BEGIN IMMEDIATE")
+    native.conn.execute("UPDATE tasks SET result = 'pending result' WHERE id = ?", (task.id,))
+    captured = kb.collect_task_show(native.conn, task.id)
+    assert native.conn.in_transaction
+    assert json.loads(captured.response_json)["task"]["result"] == "pending result"
+    native.conn.rollback()
+    assert kb.get_task(native.conn, task.id).result is None
+    native.conn.close()
+    assert json.loads(captured.response_json)["task"]["result"] == "pending result"
+    for item in fields(captured):
+        value = getattr(captured, item.name)
+        assert type(value) in (str, int, tuple)
+        if type(value) is tuple:
+            assert all(type(entry) in (str, int) for entry in value)

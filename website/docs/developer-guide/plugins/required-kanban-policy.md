@@ -147,6 +147,35 @@ these reads. The request retains the frozen inputs and exact rendered text only
 after the final check succeeds. Review skill names include `sdlc-review` without
 changing the immutable claim or the stored task skills.
 
+The same capture now retains `initial_show`, a frozen `TaskShowSnapshot` from
+the shared `collect_task_show` helper. Its `response_json` is the existing
+`kanban_show` response: the task fields, parent/child IDs, full comments and run
+history, the last 50 events and the already-captured worker context. Ordinary
+`kanban_show` calls use this helper too, preserving their response format and
+connection cleanup. Required capture supplies its existing rendered text, so
+this second view does not choose a new clock or rebuild the display.
+
+This preserves the existing display counts, including potentially large full
+comment and run histories. It is not a size-bounded child-transfer payload.
+Future controlled transport must enforce its own size limit by refusing launch
+when exceeded, not by silently truncating this snapshot or treating it as ready
+for transport today.
+
+The snapshot also retains ordered parent/child/comment/run/event ID tuples.
+Event IDs correspond only to the same 50-event tail in the response. The
+`comment_watermark` is the highest ID among this task's captured comments, or
+zero when there are none. It is not the final displayed comment: display order
+uses timestamps, which may differ from ID order. Comments from other tasks do
+not advance it. A future controlled worker can use this explicit starting point
+without silently discarding notes that arrive between capture and its first
+poll. This change does not yet install that watermark into a child or change
+the existing ordinary comment poller.
+
+The response string and ID tuples retain no mutable nested metadata or open
+database handle. Decoding a copy of the JSON does not change the retained
+snapshot. Both collections run inside the same original request transaction,
+and failures during either collection cancel without publishing partial data.
+
 Capture follows the transaction helper's existing default: it refuses when a
 caller already owns an open transaction. It cancels the request without
 committing or rolling back that caller's writes. The ordinary ready and review
@@ -201,6 +230,7 @@ Run through the canonical test wrapper, for example:
 scripts/run_tests.sh -j 3 --file-retries 0 \
   tests/hermes_cli/test_kanban_worker_context_capture.py \
   tests/hermes_cli/test_kanban_worker_context_render.py \
+  tests/tools/test_kanban_initial_show_compatibility.py \
   tests/hermes_cli/test_kanban_required_policy.py \
   tests/hermes_cli/test_kanban_required_workspace.py \
   tests/hermes_cli/test_kanban_unenrolled_fetch_baseline.py \

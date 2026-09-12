@@ -24,7 +24,7 @@ import uuid
 from hermes_cli import kanban_policy as policy
 
 if TYPE_CHECKING:
-    from hermes_cli.kanban_db import WorkerContextInputs
+    from hermes_cli.kanban_db import TaskShowSnapshot, WorkerContextInputs
 
 
 _CURRENT: ContextVar[WorkspaceRequest | None] = ContextVar(
@@ -74,6 +74,7 @@ class WorkerDatabaseContext:
     inputs: WorkerContextInputs = field(repr=False)
     text: str = field(repr=False)
     effective_skills: tuple
+    initial_show: TaskShowSnapshot = field(repr=False)
 
 
 class WorkspaceRequest:
@@ -240,11 +241,16 @@ class WorkspaceRequest:
                 self.checkpoint("context_capture_locked")
                 inputs = kb.collect_worker_context(self.connection, self.claim.task_id)
                 text = kb.render_worker_context(inputs)
+                initial_show = kb.collect_task_show(
+                    self.connection, self.claim.task_id, worker_context=text,
+                )
+                if initial_show is None:
+                    raise policy.RequiredPolicyError("Required worker initial task view is missing.")
                 skills = json.loads(dict(zip(_LAUNCH_FIELDS, self.claim.launch_fields))["skills"] or "[]")
                 if type(skills) is not list or any(type(skill) is not str for skill in skills):
                     raise policy.RequiredPolicyError("Required worker skill names are not immutable strings.")
                 captured = WorkerDatabaseContext(
-                    inputs, text, effective_worker_skills(skills, self.claim.lane),
+                    inputs, text, effective_worker_skills(skills, self.claim.lane), initial_show,
                 )
                 self.checkpoint("before_context_capture_commit")
                 kb._raise_if_dispatch_paused()

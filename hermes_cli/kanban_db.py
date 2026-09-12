@@ -15419,6 +15419,78 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     return render_worker_context(collect_worker_context(conn, task_id))
 
 
+@dataclass(frozen=True)
+class TaskShowSnapshot:
+    """Initial tool-response bytes and matching row IDs, never live admission.
+
+    The JSON string keeps the existing response format without retaining mutable
+    nested metadata. ID tuples use the response's display order; the comment
+    watermark is the highest ID, not the last displayed timestamp. Event IDs
+    describe only the same last 50 events included in the tool response.
+    """
+
+    response_json: str = field(repr=False)
+    parent_ids: tuple[str, ...]
+    child_ids: tuple[str, ...]
+    comment_ids: tuple[int, ...]
+    run_ids: tuple[int, ...]
+    event_ids: tuple[int, ...]
+    comment_watermark: int
+
+
+def collect_task_show(
+    conn: sqlite3.Connection, task_id: str, *, worker_context: Optional[str] = None,
+) -> Optional[TaskShowSnapshot]:
+    """Collect the existing kanban_show response on the supplied connection.
+
+    No database is reopened and no transaction is begun or ended here. Required
+    request capture calls this inside its original transaction and supplies its
+    already-rendered context. Ordinary tool calls keep their existing reads and
+    byte format. Supplied text and returned JSON are data, never authority.
+    """
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    comments = list_comments(conn, task_id)
+    events = list_events(conn, task_id)
+    runs = list_runs(conn, task_id)
+    parents = parent_ids(conn, task_id)
+    children = child_ids(conn, task_id)
+    shown_events = events[-50:]
+    task_fields = (
+        "id", "title", "body", "assignee", "status", "tenant", "priority",
+        "workspace_kind", "workspace_path", "created_by", "created_at",
+        "started_at", "completed_at", "result", "current_run_id",
+        "model_override", "provider_override",
+    )
+    run_fields = (
+        "id", "profile", "status", "outcome", "summary", "error", "metadata",
+        "started_at", "ended_at",
+    )
+    response = json.dumps({
+        "task": {name: getattr(task, name) for name in task_fields},
+        "parents": parents,
+        "children": children,
+        "comments": [
+            {"author": comment.author, "body": comment.body, "created_at": comment.created_at}
+            for comment in comments
+        ],
+        "events": [
+            {"kind": event.kind, "payload": event.payload,
+             "created_at": event.created_at, "run_id": event.run_id}
+            for event in shown_events
+        ],
+        "runs": [{name: getattr(run, name) for name in run_fields} for run in runs],
+        "worker_context": build_worker_context(conn, task_id) if worker_context is None else worker_context,
+    })
+    comment_ids = tuple(comment.id for comment in comments)
+    return TaskShowSnapshot(
+        response, tuple(parents), tuple(children), comment_ids,
+        tuple(run.id for run in runs), tuple(event.id for event in shown_events),
+        max(comment_ids, default=0),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Stats + SLA helpers
 # ---------------------------------------------------------------------------
